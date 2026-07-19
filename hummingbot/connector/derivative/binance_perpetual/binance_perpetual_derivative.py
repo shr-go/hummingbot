@@ -1,8 +1,9 @@
 import asyncio
+import math
 import time
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any, AsyncIterable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterable, Collection, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -15,6 +16,21 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_api_ord
     BinancePerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_auth import BinancePerpetualAuth
+from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_risk_data import (
+    BinancePerpetualAccountConfig,
+    BinancePerpetualAccountRiskSnapshot,
+    BinancePerpetualInstrumentInfo,
+    BinancePerpetualLeverageBrackets,
+    BinancePerpetualLeverageChangeResult,
+    BinancePerpetualMarginType,
+    BinancePerpetualMultiAssetsMode,
+    BinancePerpetualPositionMode,
+    BinancePerpetualPositionRiskSnapshot,
+    BinancePerpetualPreflightError,
+    BinancePerpetualPreflightSnapshot,
+    BinancePerpetualRiskDataError,
+    BinancePerpetualSymbolConfig,
+)
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_user_stream_data_source import (
     BinancePerpetualUserStreamDataSource,
 )
@@ -57,6 +73,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_pairs = trading_pairs
         self._domain = domain
         self._position_mode = None
+        self._leverage_bracket_cache: Dict[str, BinancePerpetualLeverageBrackets] = {}
         self._last_trade_history_timestamp = None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -132,6 +149,441 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     def get_sell_collateral_token(self, trading_pair: str) -> str:
         trading_rule: TradingRule = self._trading_rules[trading_pair]
         return trading_rule.sell_order_collateral_token
+
+    async def get_instrument_info(self, trading_pair: str) -> BinancePerpetualInstrumentInfo:
+        response = await self._api_get(path_url=CONSTANTS.EXCHANGE_INFO_URL)
+        return BinancePerpetualInstrumentInfo.from_exchange_info(
+            payload=response,
+            trading_pair=trading_pair,
+            data_time=self.current_timestamp,
+        )
+
+    async def get_account_risk_snapshot(self) -> BinancePerpetualAccountRiskSnapshot:
+        response = await self._api_get(
+            path_url=CONSTANTS.ACCOUNT_INFO_V3_URL,
+            is_auth_required=True,
+        )
+        return BinancePerpetualAccountRiskSnapshot.from_payload(response, self.current_timestamp)
+
+    async def get_position_risk_snapshots(
+            self,
+            trading_pair: Optional[str] = None,
+    ) -> Tuple[BinancePerpetualPositionRiskSnapshot, ...]:
+        params = None
+        if trading_pair is not None:
+            params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair)}
+        response = await self._api_get(
+            path_url=CONSTANTS.POSITION_INFORMATION_V3_URL,
+            params=params,
+            is_auth_required=True,
+        )
+        if not isinstance(response, list):
+            raise BinancePerpetualRiskDataError("Position Information V3 response must be an array")
+        data_time = self.current_timestamp
+        return tuple(
+            BinancePerpetualPositionRiskSnapshot.from_payload(position, data_time)
+            for position in response
+        )
+
+    async def get_account_config(self) -> BinancePerpetualAccountConfig:
+        response = await self._api_get(
+            path_url=CONSTANTS.ACCOUNT_CONFIG_URL,
+            is_auth_required=True,
+        )
+        return BinancePerpetualAccountConfig.from_payload(response, self.current_timestamp)
+
+    async def get_symbol_config(self, trading_pair: str) -> BinancePerpetualSymbolConfig:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.SYMBOL_CONFIG_URL,
+            params={"symbol": symbol},
+            is_auth_required=True,
+        )
+        records = response if isinstance(response, list) else [response]
+        matches = [
+            record for record in records
+            if isinstance(record, dict) and record.get("symbol") == symbol
+        ]
+        if len(matches) != 1:
+            raise BinancePerpetualRiskDataError(
+                f"symbol configuration must contain exactly one record for symbol {symbol}"
+            )
+        return BinancePerpetualSymbolConfig.from_payload(matches[0], self.current_timestamp)
+
+    async def get_multi_assets_mode(self) -> BinancePerpetualMultiAssetsMode:
+        response = await self._api_get(
+            path_url=CONSTANTS.MULTI_ASSETS_MODE_URL,
+            is_auth_required=True,
+        )
+        return BinancePerpetualMultiAssetsMode.from_payload(response, self.current_timestamp)
+
+    async def get_position_mode_snapshot(self) -> BinancePerpetualPositionMode:
+        response = await self._api_get(
+            path_url=CONSTANTS.CHANGE_POSITION_MODE_URL,
+            is_auth_required=True,
+            limit_id=CONSTANTS.GET_POSITION_MODE_LIMIT_ID,
+        )
+        return BinancePerpetualPositionMode.from_payload(response, self.current_timestamp)
+
+    async def get_leverage_brackets(
+            self,
+            trading_pair: str,
+            refresh: bool = False,
+    ) -> BinancePerpetualLeverageBrackets:
+        cached = self._leverage_bracket_cache.get(trading_pair)
+        if cached is not None and not refresh:
+            return cached
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.LEVERAGE_BRACKET_URL,
+            params={"symbol": symbol},
+            is_auth_required=True,
+        )
+        data_time = self.current_timestamp
+        brackets = BinancePerpetualLeverageBrackets.from_payload(
+            payload=response,
+            expected_symbol=symbol,
+            data_time=data_time,
+            cache_time=data_time,
+        )
+        self._leverage_bracket_cache[trading_pair] = brackets
+        return brackets
+
+    async def set_leverage_with_result(
+            self,
+            trading_pair: str,
+            leverage: int,
+    ) -> BinancePerpetualLeverageChangeResult:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._api_post(
+            path_url=CONSTANTS.SET_LEVERAGE_URL,
+            data={"symbol": symbol, "leverage": leverage},
+            is_auth_required=True,
+        )
+        result = BinancePerpetualLeverageChangeResult.from_payload(response, self.current_timestamp)
+        if result.symbol != symbol:
+            raise BinancePerpetualRiskDataError(
+                f"change leverage response symbol {result.symbol} does not match requested symbol {symbol}"
+            )
+        return result
+
+    async def strict_account_preflight(
+            self,
+            trading_pairs: Collection[str],
+            related_trading_pairs: Optional[Collection[str]] = None,
+            known_position_trading_pairs: Optional[Collection[str]] = None,
+            max_age_seconds: float = 5.0,
+            consistency_tolerance: Decimal = Decimal("0"),
+    ) -> BinancePerpetualPreflightSnapshot:
+        """Fetches and validates account state without changing any exchange account setting."""
+        active_values = tuple(trading_pairs)
+        if not active_values:
+            raise BinancePerpetualPreflightError("preflight trading_pairs must be non-empty and unique")
+        if any(not isinstance(pair, str) or pair == "" for pair in active_values):
+            raise BinancePerpetualPreflightError("preflight trading_pairs must contain non-empty strings")
+        if len(set(active_values)) != len(active_values):
+            raise BinancePerpetualPreflightError("preflight trading_pairs must be non-empty and unique")
+        active_pairs = tuple(sorted(active_values))
+
+        related_values = tuple(active_pairs if related_trading_pairs is None else related_trading_pairs)
+        known_values = tuple(known_position_trading_pairs or ())
+        if any(not isinstance(pair, str) or pair == "" for pair in related_values):
+            raise BinancePerpetualPreflightError(
+                "related_trading_pairs must contain non-empty strings"
+            )
+        if any(not isinstance(pair, str) or pair == "" for pair in known_values):
+            raise BinancePerpetualPreflightError(
+                "known_position_trading_pairs must contain non-empty strings"
+            )
+        related_pairs = tuple(sorted(set(related_values)))
+        known_pairs = tuple(sorted(set(known_values)))
+        if not set(active_pairs).issubset(related_pairs):
+            raise BinancePerpetualPreflightError("related_trading_pairs must include every active trading pair")
+        if not set(known_pairs).issubset(related_pairs):
+            raise BinancePerpetualPreflightError("known positions must be a subset of related trading pairs")
+        try:
+            max_age = float(max_age_seconds)
+        except (TypeError, ValueError) as exc:
+            raise BinancePerpetualPreflightError("max_age_seconds must be finite and non-negative") from exc
+        if not math.isfinite(max_age) or max_age < 0:
+            raise BinancePerpetualPreflightError("max_age_seconds must be finite and non-negative")
+        if (
+                not isinstance(consistency_tolerance, Decimal)
+                or not consistency_tolerance.is_finite()
+                or consistency_tolerance < 0
+        ):
+            raise BinancePerpetualPreflightError(
+                "consistency_tolerance must be a finite non-negative Decimal"
+            )
+
+        async def authoritative_fetch(source: str, awaitable):
+            try:
+                return await awaitable
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise BinancePerpetualPreflightError(f"authoritative {source} fetch failed") from exc
+
+        account = await authoritative_fetch(
+            "Account Information V3", self.get_account_risk_snapshot()
+        )
+        positions = await authoritative_fetch(
+            "Position Information V3", self.get_position_risk_snapshots()
+        )
+        account_config = await authoritative_fetch(
+            "account configuration", self.get_account_config()
+        )
+        multi_assets_mode = await authoritative_fetch(
+            "Multi-Assets mode", self.get_multi_assets_mode()
+        )
+        position_mode = await authoritative_fetch(
+            "position mode", self.get_position_mode_snapshot()
+        )
+
+        instruments = []
+        for trading_pair in related_pairs:
+            instrument = await authoritative_fetch(
+                f"exchange metadata for {trading_pair}",
+                self.get_instrument_info(trading_pair),
+            )
+            instruments.append(instrument)
+        instrument_by_pair = {instrument.trading_pair: instrument for instrument in instruments}
+        if len(instrument_by_pair) != len(instruments):
+            raise BinancePerpetualPreflightError("exchange metadata contains duplicate trading pairs")
+
+        symbol_configs = []
+        for trading_pair in related_pairs:
+            symbol_config = await authoritative_fetch(
+                f"symbol configuration for {trading_pair}",
+                self.get_symbol_config(trading_pair),
+            )
+            symbol_configs.append(symbol_config)
+        symbol_config_by_symbol = {config.symbol: config for config in symbol_configs}
+        if len(symbol_config_by_symbol) != len(symbol_configs):
+            raise BinancePerpetualPreflightError("symbol configuration contains duplicate symbols")
+
+        leverage_brackets = []
+        for trading_pair in active_pairs:
+            brackets = await authoritative_fetch(
+                f"leverage brackets for {trading_pair}",
+                self.get_leverage_brackets(trading_pair, refresh=True),
+            )
+            leverage_brackets.append(brackets)
+
+        now = self.current_timestamp
+        freshness_sources = [
+            ("Account Information V3", account.data_time),
+            ("account configuration", account_config.data_time),
+            ("Multi-Assets mode", multi_assets_mode.data_time),
+            ("position mode", position_mode.data_time),
+        ]
+        freshness_sources.extend(
+            (f"Position Information V3 {position.symbol}", position.data_time)
+            for position in positions
+        )
+        freshness_sources.extend(
+            (f"exchange metadata {instrument.symbol}", instrument.data_time)
+            for instrument in instruments
+        )
+        freshness_sources.extend(
+            (f"symbol configuration {config.symbol}", config.data_time)
+            for config in symbol_configs
+        )
+        for brackets in leverage_brackets:
+            freshness_sources.append((f"leverage brackets {brackets.symbol}", brackets.data_time))
+            freshness_sources.append((f"leverage bracket cache {brackets.symbol}", brackets.cache_time))
+        for source, source_time in freshness_sources:
+            age = now - source_time
+            if not math.isfinite(age) or age < 0 or age > max_age:
+                raise BinancePerpetualPreflightError(f"{source} snapshot is stale or future-dated")
+
+        if not account_config.can_trade:
+            raise BinancePerpetualPreflightError("account canTrade is false")
+        if not multi_assets_mode.enabled:
+            raise BinancePerpetualPreflightError("account is not in Multi-Assets mode")
+        if not position_mode.is_one_way:
+            raise BinancePerpetualPreflightError("account is not in authoritative One-way mode")
+        if account_config.multi_assets_margin != multi_assets_mode.enabled:
+            raise BinancePerpetualPreflightError("account configuration disagrees with Multi-Assets mode")
+        if account_config.dual_side_position != position_mode.dual_side_position:
+            raise BinancePerpetualPreflightError("account configuration disagrees with position mode")
+
+        active_symbols = set()
+        for trading_pair in active_pairs:
+            instrument = instrument_by_pair[trading_pair]
+            active_symbols.add(instrument.symbol)
+            if instrument.contract_type != "TRADIFI_PERPETUAL":
+                raise BinancePerpetualPreflightError(
+                    f"{trading_pair} contract type is not TRADIFI_PERPETUAL"
+                )
+            if instrument.status != "TRADING":
+                raise BinancePerpetualPreflightError(f"{trading_pair} status is not TRADING")
+            if instrument.quote_asset != "USDT" or instrument.margin_asset != "USDT":
+                raise BinancePerpetualPreflightError(f"{trading_pair} quote and margin assets must be USDT")
+            if instrument.contract_multiplier <= 0:
+                raise BinancePerpetualPreflightError(f"{trading_pair} contract multiplier must be positive")
+            rule = self._trading_rules.get(trading_pair)
+            if rule is None:
+                raise BinancePerpetualPreflightError(f"{trading_pair} trading rule is not initialized")
+            rule_fields = (
+                ("min_order_size", rule.min_order_size, instrument.min_order_size),
+                ("min_base_amount_increment", rule.min_base_amount_increment, instrument.step_size),
+                ("min_price_increment", rule.min_price_increment, instrument.tick_size),
+                ("min_notional_size", rule.min_notional_size, instrument.min_notional),
+            )
+            for field, actual, expected in rule_fields:
+                if (
+                        not isinstance(actual, Decimal)
+                        or not actual.is_finite()
+                        or actual <= 0
+                        or actual != expected
+                ):
+                    raise BinancePerpetualPreflightError(
+                        f"{trading_pair} trading rule {field} is invalid or inconsistent"
+                    )
+
+        related_symbols = {instrument.symbol for instrument in instruments}
+        known_symbols = {instrument_by_pair[pair].symbol for pair in known_pairs}
+        for instrument in instruments:
+            config = symbol_config_by_symbol.get(instrument.symbol)
+            if config is None:
+                raise BinancePerpetualPreflightError(
+                    f"missing symbol configuration for {instrument.symbol}"
+                )
+            if config.margin_type != BinancePerpetualMarginType.CROSSED:
+                raise BinancePerpetualPreflightError(
+                    f"{instrument.trading_pair} is not in Cross margin mode"
+                )
+
+        position_by_key = {}
+        for position in positions:
+            key = (position.symbol, position.position_side)
+            if key in position_by_key:
+                raise BinancePerpetualPreflightError(f"duplicate position snapshot for {key}")
+            position_by_key[key] = position
+            if position.symbol in related_symbols:
+                if position.position_side != "BOTH":
+                    raise BinancePerpetualPreflightError(
+                        f"related position {position.symbol} is not in BOTH/One-way state"
+                    )
+                if position.margin_asset != "USDT":
+                    raise BinancePerpetualPreflightError(
+                        f"related position {position.symbol} margin asset is not USDT"
+                    )
+                if position.has_activity and position.symbol not in known_symbols:
+                    raise BinancePerpetualPreflightError(
+                        f"related unknown position or open order exists for {position.symbol}"
+                    )
+
+        account_position_by_key = {}
+        for position in account.positions:
+            key = (position.symbol, position.position_side)
+            if key in account_position_by_key:
+                raise BinancePerpetualPreflightError(f"duplicate Account V3 position for {key}")
+            account_position_by_key[key] = position
+            if position.symbol in related_symbols:
+                if position.position_side != "BOTH":
+                    raise BinancePerpetualPreflightError(
+                        f"related Account V3 position {position.symbol} is not in BOTH/One-way state"
+                    )
+                if position.has_activity and position.symbol not in known_symbols:
+                    raise BinancePerpetualPreflightError(
+                        f"related unknown position or open order exists for {position.symbol}"
+                    )
+
+        def reconciles(left: Decimal, right: Decimal) -> bool:
+            return abs(left - right) <= consistency_tolerance
+
+        if set(account_position_by_key) != set(position_by_key):
+            raise BinancePerpetualPreflightError(
+                "Account V3 and Position V3 position sets do not reconcile"
+            )
+        for key, account_position in account_position_by_key.items():
+            position = position_by_key[key]
+            comparisons = (
+                (account_position.position_amount, position.position_amount),
+                (account_position.unrealized_profit, position.unrealized_profit),
+                (account_position.initial_margin, position.initial_margin),
+                (account_position.maint_margin, position.maint_margin),
+            )
+            if any(not reconciles(left, right) for left, right in comparisons):
+                raise BinancePerpetualPreflightError(
+                    f"Account V3 and Position V3 values do not reconcile for {key}"
+                )
+
+        total_position_initial_margin = sum(
+            (position.position_initial_margin for position in positions),
+            Decimal("0"),
+        )
+        total_open_order_initial_margin = sum(
+            (position.open_order_initial_margin for position in positions),
+            Decimal("0"),
+        )
+        total_initial_margin = sum(
+            (position.initial_margin for position in positions),
+            Decimal("0"),
+        )
+        total_maint_margin = sum(
+            (position.maint_margin for position in positions),
+            Decimal("0"),
+        )
+        total_unrealized_profit = sum(
+            (position.unrealized_profit for position in positions),
+            Decimal("0"),
+        )
+        account_reconciliations = (
+            (account.total_position_initial_margin, total_position_initial_margin),
+            (account.total_open_order_initial_margin, total_open_order_initial_margin),
+            (account.total_initial_margin, total_initial_margin),
+            (account.total_maint_margin, total_maint_margin),
+            (account.total_unrealized_profit, total_unrealized_profit),
+            (account.total_initial_margin,
+             account.total_position_initial_margin + account.total_open_order_initial_margin),
+            (account.total_margin_balance,
+             account.total_wallet_balance + account.total_unrealized_profit),
+        )
+        if any(not reconciles(left, right) for left, right in account_reconciliations):
+            raise BinancePerpetualPreflightError("account and per-symbol risk totals do not reconcile")
+        if account.available_balance > account.total_margin_balance + consistency_tolerance:
+            raise BinancePerpetualPreflightError("availableBalance exceeds totalMarginBalance")
+
+        bracket_by_symbol = {brackets.symbol: brackets for brackets in leverage_brackets}
+        if len(bracket_by_symbol) != len(leverage_brackets):
+            raise BinancePerpetualPreflightError("duplicate leverage bracket symbols")
+        for symbol in active_symbols:
+            if symbol not in bracket_by_symbol:
+                raise BinancePerpetualPreflightError(f"missing leverage brackets for {symbol}")
+            config = symbol_config_by_symbol[symbol]
+            current_notional = max(
+                (
+                    abs(position.notional)
+                    for position in positions
+                    if position.symbol == symbol
+                ),
+                default=Decimal("0"),
+            )
+            if current_notional > config.max_notional_value:
+                raise BinancePerpetualPreflightError(
+                    f"current notional exceeds maxNotionalValue for {symbol}"
+                )
+            try:
+                bracket_by_symbol[symbol].bracket_for_notional(current_notional)
+            except BinancePerpetualRiskDataError as exc:
+                raise BinancePerpetualPreflightError(
+                    f"current notional is outside leverage brackets for {symbol}"
+                ) from exc
+
+        return BinancePerpetualPreflightSnapshot(
+            account=account,
+            positions=tuple(positions),
+            account_config=account_config,
+            multi_assets_mode=multi_assets_mode,
+            position_mode=position_mode,
+            instruments=tuple(instruments),
+            symbol_configs=tuple(symbol_configs),
+            leverage_brackets=tuple(leverage_brackets),
+            data_time=min(source_time for _, source_time in freshness_sources),
+        )
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
@@ -726,12 +1178,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 self._order_tracker.process_order_update(new_order_update)
 
     async def _fetch_account_position_mode(self) -> Optional[PositionMode]:
-        response = await self._api_get(
-            path_url=CONSTANTS.CHANGE_POSITION_MODE_URL,
-            is_auth_required=True,
-            limit_id=CONSTANTS.GET_POSITION_MODE_LIMIT_ID,
-        )
-        self._position_mode = PositionMode.HEDGE if response.get("dualSidePosition") else PositionMode.ONEWAY
+        mode_snapshot = await self.get_position_mode_snapshot()
+        self._position_mode = PositionMode.HEDGE if mode_snapshot.dual_side_position else PositionMode.ONEWAY
         return self._position_mode
 
     async def _get_position_mode(self) -> Optional[PositionMode]:
@@ -762,20 +1210,13 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         return success, msg
 
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
-        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        params = {'symbol': symbol, 'leverage': leverage}
-        set_leverage = await self._api_post(
-            path_url=CONSTANTS.SET_LEVERAGE_URL,
-            data=params,
-            is_auth_required=True,
-        )
-        success = False
-        msg = ""
-        if set_leverage["leverage"] == leverage:
-            success = True
-        else:
-            msg = 'Unable to set leverage'
-        return success, msg
+        try:
+            result = await self.set_leverage_with_result(trading_pair, leverage)
+        except BinancePerpetualRiskDataError:
+            return False, "Unable to set leverage"
+        if result.leverage == leverage:
+            return True, ""
+        return False, "Unable to set leverage"
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)

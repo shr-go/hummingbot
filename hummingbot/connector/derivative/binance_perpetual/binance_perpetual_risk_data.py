@@ -1,0 +1,678 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from typing import Any, Mapping, Optional, Sequence, Tuple
+
+
+class BinancePerpetualRiskDataError(ValueError):
+    """Raised when Binance returns incomplete or internally invalid risk data."""
+
+
+class BinancePerpetualPreflightError(BinancePerpetualRiskDataError):
+    """Raised when authoritative account preflight cannot prove a safe state."""
+
+
+def _mapping(value: Any, context: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BinancePerpetualRiskDataError(f"{context} must be an object")
+    return value
+
+
+def _sequence(value: Any, context: str) -> Sequence[Any]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise BinancePerpetualRiskDataError(f"{context} must be an array")
+    return value
+
+
+def _required(payload: Mapping[str, Any], field: str, context: str) -> Any:
+    if field not in payload:
+        raise BinancePerpetualRiskDataError(f"{context} is missing required field {field}")
+    return payload[field]
+
+
+def _string(payload: Mapping[str, Any], field: str, context: str) -> str:
+    value = _required(payload, field, context)
+    if not isinstance(value, str) or value == "":
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be a non-empty string")
+    return value
+
+
+def _decimal(payload: Mapping[str, Any], field: str, context: str) -> Decimal:
+    value = _required(payload, field, context)
+    if isinstance(value, bool):
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be a finite decimal")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be a finite decimal") from exc
+    if not parsed.is_finite():
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be a finite decimal")
+    return parsed
+
+
+def _integer(payload: Mapping[str, Any], field: str, context: str) -> int:
+    value = _required(payload, field, context)
+    if isinstance(value, bool):
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be an integer") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be an integer")
+    if isinstance(value, str) and str(parsed) != value.strip():
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be an integer")
+    return parsed
+
+
+def _boolean(payload: Mapping[str, Any], field: str, context: str) -> bool:
+    value = _required(payload, field, context)
+    if type(value) is not bool:
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be a boolean")
+    return value
+
+
+def _timestamp_ms(payload: Mapping[str, Any], field: str, context: str) -> int:
+    timestamp = _integer(payload, field, context)
+    if timestamp < 0:
+        raise BinancePerpetualRiskDataError(f"{context}.{field} must be non-negative")
+    return timestamp
+
+
+def _data_time(value: Any) -> float:
+    if isinstance(value, bool):
+        raise BinancePerpetualRiskDataError("data_time must be a finite non-negative timestamp")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BinancePerpetualRiskDataError("data_time must be a finite non-negative timestamp") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise BinancePerpetualRiskDataError("data_time must be a finite non-negative timestamp")
+    return parsed
+
+
+@dataclass(frozen=True)
+class BinancePerpetualInstrumentInfo:
+    symbol: str
+    trading_pair: str
+    contract_type: str
+    status: str
+    base_asset: str
+    quote_asset: str
+    margin_asset: str
+    contract_multiplier: Decimal
+    min_order_size: Decimal
+    step_size: Decimal
+    tick_size: Decimal
+    min_notional: Decimal
+    source_time_ms: Optional[int]
+    data_time: float
+
+    @classmethod
+    def from_exchange_info(
+            cls,
+            payload: Mapping[str, Any],
+            trading_pair: str,
+            data_time: float,
+    ) -> "BinancePerpetualInstrumentInfo":
+        context = "exchangeInfo"
+        payload = _mapping(payload, context)
+        symbols = _sequence(_required(payload, "symbols", context), f"{context}.symbols")
+        matches = []
+        for index, raw_symbol in enumerate(symbols):
+            symbol = _mapping(raw_symbol, f"{context}.symbols[{index}]")
+            base_asset = _string(symbol, "baseAsset", f"{context}.symbols[{index}]")
+            quote_asset = _string(symbol, "quoteAsset", f"{context}.symbols[{index}]")
+            if f"{base_asset}-{quote_asset}" == trading_pair:
+                matches.append(symbol)
+        if len(matches) != 1:
+            raise BinancePerpetualRiskDataError(
+                f"exchangeInfo must contain exactly one record for trading pair {trading_pair}"
+            )
+
+        symbol = matches[0]
+        symbol_context = f"exchangeInfo[{trading_pair}]"
+        contract_type = _string(symbol, "contractType", symbol_context)
+        multiplier_field = next(
+            (field for field in ("contractSize", "contractMultiplier") if field in symbol),
+            None,
+        )
+        if multiplier_field is None:
+            if contract_type == "PERPETUAL":
+                contract_multiplier = Decimal("1")
+            else:
+                raise BinancePerpetualRiskDataError(
+                    f"{symbol_context} is missing an explicit contract multiplier"
+                )
+        else:
+            contract_multiplier = _decimal(symbol, multiplier_field, symbol_context)
+        if contract_multiplier <= 0:
+            raise BinancePerpetualRiskDataError(f"{symbol_context} contract multiplier must be positive")
+
+        filters_raw = _sequence(_required(symbol, "filters", symbol_context), f"{symbol_context}.filters")
+        filters = {}
+        for index, raw_filter in enumerate(filters_raw):
+            filter_payload = _mapping(raw_filter, f"{symbol_context}.filters[{index}]")
+            filter_type = _string(filter_payload, "filterType", f"{symbol_context}.filters[{index}]")
+            if filter_type in filters:
+                raise BinancePerpetualRiskDataError(f"{symbol_context} contains duplicate {filter_type} filters")
+            filters[filter_type] = filter_payload
+
+        try:
+            lot_filter = filters["LOT_SIZE"]
+            price_filter = filters["PRICE_FILTER"]
+            notional_filter = filters.get("MIN_NOTIONAL") or filters["NOTIONAL"]
+        except KeyError as exc:
+            raise BinancePerpetualRiskDataError(
+                f"{symbol_context} must contain PRICE_FILTER, LOT_SIZE, and MIN_NOTIONAL/NOTIONAL filters"
+            ) from exc
+
+        min_order_size = _decimal(lot_filter, "minQty", f"{symbol_context}.LOT_SIZE")
+        step_size = _decimal(lot_filter, "stepSize", f"{symbol_context}.LOT_SIZE")
+        tick_size = _decimal(price_filter, "tickSize", f"{symbol_context}.PRICE_FILTER")
+        if "notional" in notional_filter:
+            min_notional = _decimal(notional_filter, "notional", f"{symbol_context}.MIN_NOTIONAL")
+        else:
+            min_notional = _decimal(notional_filter, "minNotional", f"{symbol_context}.NOTIONAL")
+        for field, value in (
+            ("minQty", min_order_size),
+            ("stepSize", step_size),
+            ("tickSize", tick_size),
+            ("minNotional", min_notional),
+        ):
+            if value <= 0:
+                raise BinancePerpetualRiskDataError(f"{symbol_context}.{field} must be positive")
+
+        source_time_ms = None
+        if "serverTime" in payload:
+            source_time_ms = _timestamp_ms(payload, "serverTime", context)
+        return cls(
+            symbol=_string(symbol, "symbol", symbol_context),
+            trading_pair=trading_pair,
+            contract_type=contract_type,
+            status=_string(symbol, "status", symbol_context),
+            base_asset=_string(symbol, "baseAsset", symbol_context),
+            quote_asset=_string(symbol, "quoteAsset", symbol_context),
+            margin_asset=_string(symbol, "marginAsset", symbol_context),
+            contract_multiplier=contract_multiplier,
+            min_order_size=min_order_size,
+            step_size=step_size,
+            tick_size=tick_size,
+            min_notional=min_notional,
+            source_time_ms=source_time_ms,
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualAccountAsset:
+    asset: str
+    wallet_balance: Decimal
+    unrealized_profit: Decimal
+    margin_balance: Decimal
+    maint_margin: Decimal
+    initial_margin: Decimal
+    position_initial_margin: Decimal
+    open_order_initial_margin: Decimal
+    cross_wallet_balance: Decimal
+    cross_unrealized_profit: Decimal
+    available_balance: Decimal
+    max_withdraw_amount: Decimal
+    update_time_ms: int
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], context: str) -> "BinancePerpetualAccountAsset":
+        payload = _mapping(payload, context)
+        return cls(
+            asset=_string(payload, "asset", context),
+            wallet_balance=_decimal(payload, "walletBalance", context),
+            unrealized_profit=_decimal(payload, "unrealizedProfit", context),
+            margin_balance=_decimal(payload, "marginBalance", context),
+            maint_margin=_decimal(payload, "maintMargin", context),
+            initial_margin=_decimal(payload, "initialMargin", context),
+            position_initial_margin=_decimal(payload, "positionInitialMargin", context),
+            open_order_initial_margin=_decimal(payload, "openOrderInitialMargin", context),
+            cross_wallet_balance=_decimal(payload, "crossWalletBalance", context),
+            cross_unrealized_profit=_decimal(payload, "crossUnPnl", context),
+            available_balance=_decimal(payload, "availableBalance", context),
+            max_withdraw_amount=_decimal(payload, "maxWithdrawAmount", context),
+            update_time_ms=_timestamp_ms(payload, "updateTime", context),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualAccountPosition:
+    symbol: str
+    position_side: str
+    position_amount: Decimal
+    unrealized_profit: Decimal
+    isolated_margin: Decimal
+    notional: Decimal
+    isolated_wallet: Decimal
+    initial_margin: Decimal
+    maint_margin: Decimal
+    update_time_ms: int
+
+    @property
+    def has_activity(self) -> bool:
+        return any(value != 0 for value in (
+            self.position_amount,
+            self.isolated_margin,
+            self.notional,
+            self.isolated_wallet,
+            self.initial_margin,
+            self.maint_margin,
+        ))
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], context: str) -> "BinancePerpetualAccountPosition":
+        payload = _mapping(payload, context)
+        return cls(
+            symbol=_string(payload, "symbol", context),
+            position_side=_string(payload, "positionSide", context),
+            position_amount=_decimal(payload, "positionAmt", context),
+            unrealized_profit=_decimal(payload, "unrealizedProfit", context),
+            isolated_margin=_decimal(payload, "isolatedMargin", context),
+            notional=_decimal(payload, "notional", context),
+            isolated_wallet=_decimal(payload, "isolatedWallet", context),
+            initial_margin=_decimal(payload, "initialMargin", context),
+            maint_margin=_decimal(payload, "maintMargin", context),
+            update_time_ms=_timestamp_ms(payload, "updateTime", context),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualAccountRiskSnapshot:
+    total_initial_margin: Decimal
+    total_maint_margin: Decimal
+    total_wallet_balance: Decimal
+    total_unrealized_profit: Decimal
+    total_margin_balance: Decimal
+    total_position_initial_margin: Decimal
+    total_open_order_initial_margin: Decimal
+    total_cross_wallet_balance: Decimal
+    total_cross_unrealized_profit: Decimal
+    available_balance: Decimal
+    max_withdraw_amount: Decimal
+    assets: Tuple[BinancePerpetualAccountAsset, ...]
+    positions: Tuple[BinancePerpetualAccountPosition, ...]
+    data_time: float
+
+    @classmethod
+    def from_payload(
+            cls,
+            payload: Mapping[str, Any],
+            data_time: float,
+    ) -> "BinancePerpetualAccountRiskSnapshot":
+        context = "Account Information V3"
+        payload = _mapping(payload, context)
+        assets = tuple(
+            BinancePerpetualAccountAsset.from_payload(item, f"{context}.assets[{index}]")
+            for index, item in enumerate(
+                _sequence(_required(payload, "assets", context), f"{context}.assets")
+            )
+        )
+        positions = tuple(
+            BinancePerpetualAccountPosition.from_payload(item, f"{context}.positions[{index}]")
+            for index, item in enumerate(
+                _sequence(_required(payload, "positions", context), f"{context}.positions")
+            )
+        )
+        return cls(
+            total_initial_margin=_decimal(payload, "totalInitialMargin", context),
+            total_maint_margin=_decimal(payload, "totalMaintMargin", context),
+            total_wallet_balance=_decimal(payload, "totalWalletBalance", context),
+            total_unrealized_profit=_decimal(payload, "totalUnrealizedProfit", context),
+            total_margin_balance=_decimal(payload, "totalMarginBalance", context),
+            total_position_initial_margin=_decimal(payload, "totalPositionInitialMargin", context),
+            total_open_order_initial_margin=_decimal(payload, "totalOpenOrderInitialMargin", context),
+            total_cross_wallet_balance=_decimal(payload, "totalCrossWalletBalance", context),
+            total_cross_unrealized_profit=_decimal(payload, "totalCrossUnPnl", context),
+            available_balance=_decimal(payload, "availableBalance", context),
+            max_withdraw_amount=_decimal(payload, "maxWithdrawAmount", context),
+            assets=assets,
+            positions=positions,
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualPositionRiskSnapshot:
+    symbol: str
+    position_side: str
+    position_amount: Decimal
+    entry_price: Decimal
+    break_even_price: Decimal
+    mark_price: Decimal
+    unrealized_profit: Decimal
+    liquidation_price: Decimal
+    isolated_margin: Decimal
+    notional: Decimal
+    margin_asset: str
+    isolated_wallet: Decimal
+    initial_margin: Decimal
+    maint_margin: Decimal
+    position_initial_margin: Decimal
+    open_order_initial_margin: Decimal
+    adl: int
+    bid_notional: Decimal
+    ask_notional: Decimal
+    update_time_ms: int
+    data_time: float
+
+    @property
+    def has_activity(self) -> bool:
+        return any(value != 0 for value in (
+            self.position_amount,
+            self.isolated_margin,
+            self.notional,
+            self.isolated_wallet,
+            self.initial_margin,
+            self.maint_margin,
+            self.position_initial_margin,
+            self.open_order_initial_margin,
+        ))
+
+    @classmethod
+    def from_payload(
+            cls,
+            payload: Mapping[str, Any],
+            data_time: float,
+    ) -> "BinancePerpetualPositionRiskSnapshot":
+        context = "Position Information V3"
+        payload = _mapping(payload, context)
+        return cls(
+            symbol=_string(payload, "symbol", context),
+            position_side=_string(payload, "positionSide", context),
+            position_amount=_decimal(payload, "positionAmt", context),
+            entry_price=_decimal(payload, "entryPrice", context),
+            break_even_price=_decimal(payload, "breakEvenPrice", context),
+            mark_price=_decimal(payload, "markPrice", context),
+            unrealized_profit=_decimal(payload, "unRealizedProfit", context),
+            liquidation_price=_decimal(payload, "liquidationPrice", context),
+            isolated_margin=_decimal(payload, "isolatedMargin", context),
+            notional=_decimal(payload, "notional", context),
+            margin_asset=_string(payload, "marginAsset", context),
+            isolated_wallet=_decimal(payload, "isolatedWallet", context),
+            initial_margin=_decimal(payload, "initialMargin", context),
+            maint_margin=_decimal(payload, "maintMargin", context),
+            position_initial_margin=_decimal(payload, "positionInitialMargin", context),
+            open_order_initial_margin=_decimal(payload, "openOrderInitialMargin", context),
+            adl=_integer(payload, "adl", context),
+            bid_notional=_decimal(payload, "bidNotional", context),
+            ask_notional=_decimal(payload, "askNotional", context),
+            update_time_ms=_timestamp_ms(payload, "updateTime", context),
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualAccountConfig:
+    can_trade: bool
+    can_deposit: bool
+    can_withdraw: bool
+    dual_side_position: bool
+    multi_assets_margin: bool
+    update_time_ms: int
+    data_time: float
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], data_time: float) -> "BinancePerpetualAccountConfig":
+        context = "account configuration"
+        payload = _mapping(payload, context)
+        return cls(
+            can_trade=_boolean(payload, "canTrade", context),
+            can_deposit=_boolean(payload, "canDeposit", context),
+            can_withdraw=_boolean(payload, "canWithdraw", context),
+            dual_side_position=_boolean(payload, "dualSidePosition", context),
+            multi_assets_margin=_boolean(payload, "multiAssetsMargin", context),
+            update_time_ms=_timestamp_ms(payload, "updateTime", context),
+            data_time=_data_time(data_time),
+        )
+
+
+class BinancePerpetualMarginType(str, Enum):
+    CROSSED = "CROSSED"
+    ISOLATED = "ISOLATED"
+
+
+@dataclass(frozen=True)
+class BinancePerpetualSymbolConfig:
+    symbol: str
+    margin_type: BinancePerpetualMarginType
+    is_auto_add_margin: bool
+    leverage: int
+    max_notional_value: Decimal
+    data_time: float
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], data_time: float) -> "BinancePerpetualSymbolConfig":
+        context = "symbol configuration"
+        payload = _mapping(payload, context)
+        raw_margin_type = _string(payload, "marginType", context).upper()
+        if raw_margin_type in ("CROSS", "CROSSED"):
+            margin_type = BinancePerpetualMarginType.CROSSED
+        elif raw_margin_type == "ISOLATED":
+            margin_type = BinancePerpetualMarginType.ISOLATED
+        else:
+            raise BinancePerpetualRiskDataError(
+                f"{context}.marginType has unsupported value {raw_margin_type}"
+            )
+        leverage = _integer(payload, "leverage", context)
+        max_notional_value = _decimal(payload, "maxNotionalValue", context)
+        if leverage <= 0:
+            raise BinancePerpetualRiskDataError(f"{context}.leverage must be positive")
+        if max_notional_value <= 0:
+            raise BinancePerpetualRiskDataError(f"{context}.maxNotionalValue must be positive")
+        return cls(
+            symbol=_string(payload, "symbol", context),
+            margin_type=margin_type,
+            is_auto_add_margin=_boolean(payload, "isAutoAddMargin", context),
+            leverage=leverage,
+            max_notional_value=max_notional_value,
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualMultiAssetsMode:
+    enabled: bool
+    data_time: float
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], data_time: float) -> "BinancePerpetualMultiAssetsMode":
+        context = "Multi-Assets mode"
+        payload = _mapping(payload, context)
+        return cls(
+            enabled=_boolean(payload, "multiAssetsMargin", context),
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualPositionMode:
+    dual_side_position: bool
+    data_time: float
+
+    @property
+    def is_one_way(self) -> bool:
+        return not self.dual_side_position
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], data_time: float) -> "BinancePerpetualPositionMode":
+        context = "position mode"
+        payload = _mapping(payload, context)
+        return cls(
+            dual_side_position=_boolean(payload, "dualSidePosition", context),
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualLeverageBracket:
+    bracket: int
+    initial_leverage: int
+    notional_cap: Decimal
+    notional_floor: Decimal
+    maint_margin_ratio: Decimal
+    cum: Decimal
+    notional_coef: Decimal
+
+    @property
+    def adjusted_notional_cap(self) -> Decimal:
+        return self.notional_cap * self.notional_coef
+
+    @property
+    def adjusted_notional_floor(self) -> Decimal:
+        return self.notional_floor * self.notional_coef
+
+    @property
+    def adjusted_cum(self) -> Decimal:
+        return self.cum * self.notional_coef
+
+    def contains(self, notional: Decimal) -> bool:
+        absolute_notional = abs(notional)
+        return self.adjusted_notional_floor <= absolute_notional < self.adjusted_notional_cap
+
+
+@dataclass(frozen=True)
+class BinancePerpetualLeverageBrackets:
+    symbol: str
+    notional_coef: Decimal
+    brackets: Tuple[BinancePerpetualLeverageBracket, ...]
+    data_time: float
+    cache_time: float
+
+    @classmethod
+    def from_payload(
+            cls,
+            payload: Any,
+            expected_symbol: str,
+            data_time: float,
+            cache_time: float,
+    ) -> "BinancePerpetualLeverageBrackets":
+        context = "leverage brackets"
+        if isinstance(payload, Mapping):
+            candidates = [payload]
+        else:
+            candidates = list(_sequence(payload, context))
+        matches = []
+        for index, raw_candidate in enumerate(candidates):
+            candidate = _mapping(raw_candidate, f"{context}[{index}]")
+            if _string(candidate, "symbol", f"{context}[{index}]") == expected_symbol:
+                matches.append(candidate)
+        if len(matches) != 1:
+            raise BinancePerpetualRiskDataError(
+                f"{context} must contain exactly one record for symbol {expected_symbol}"
+            )
+        record = matches[0]
+        notional_coef = _decimal(record, "notionalCoef", context) if "notionalCoef" in record else Decimal("1")
+        if notional_coef <= 0:
+            raise BinancePerpetualRiskDataError(f"{context}.notionalCoef must be positive")
+        raw_brackets = _sequence(_required(record, "brackets", context), f"{context}.brackets")
+        if len(raw_brackets) == 0:
+            raise BinancePerpetualRiskDataError(f"{context}.brackets must not be empty")
+
+        parsed_brackets = []
+        previous = None
+        for index, raw_bracket in enumerate(raw_brackets):
+            bracket_context = f"{context}.brackets[{index}]"
+            raw_bracket = _mapping(raw_bracket, bracket_context)
+            bracket_number = _integer(raw_bracket, "bracket", bracket_context)
+            initial_leverage = _integer(raw_bracket, "initialLeverage", bracket_context)
+            notional_cap = _decimal(raw_bracket, "notionalCap", bracket_context)
+            notional_floor = _decimal(raw_bracket, "notionalFloor", bracket_context)
+            maint_margin_ratio = _decimal(raw_bracket, "maintMarginRatio", bracket_context)
+            cum = _decimal(raw_bracket, "cum", bracket_context)
+            if bracket_number <= 0 or initial_leverage <= 0:
+                raise BinancePerpetualRiskDataError(f"{bracket_context} bracket and leverage must be positive")
+            if notional_floor < 0 or notional_cap <= notional_floor:
+                raise BinancePerpetualRiskDataError(f"{bracket_context} has invalid notional bounds")
+            if maint_margin_ratio < 0 or cum < 0:
+                raise BinancePerpetualRiskDataError(f"{bracket_context} margin values must be non-negative")
+            if previous is None and notional_floor != 0:
+                raise BinancePerpetualRiskDataError(f"{context} first bracket must start at zero")
+            if previous is not None:
+                if bracket_number <= previous.bracket:
+                    raise BinancePerpetualRiskDataError(f"{context} bracket identifiers must be increasing")
+                if notional_floor != previous.notional_cap:
+                    raise BinancePerpetualRiskDataError(f"{context} notional bounds must be contiguous")
+            parsed = BinancePerpetualLeverageBracket(
+                bracket=bracket_number,
+                initial_leverage=initial_leverage,
+                notional_cap=notional_cap,
+                notional_floor=notional_floor,
+                maint_margin_ratio=maint_margin_ratio,
+                cum=cum,
+                notional_coef=notional_coef,
+            )
+            parsed_brackets.append(parsed)
+            previous = parsed
+
+        return cls(
+            symbol=expected_symbol,
+            notional_coef=notional_coef,
+            brackets=tuple(parsed_brackets),
+            data_time=_data_time(data_time),
+            cache_time=_data_time(cache_time),
+        )
+
+    def bracket_for_notional(self, notional: Decimal) -> BinancePerpetualLeverageBracket:
+        if not isinstance(notional, Decimal) or not notional.is_finite():
+            raise BinancePerpetualRiskDataError("notional must be a finite Decimal")
+        for bracket in self.brackets:
+            if bracket.contains(notional):
+                return bracket
+        raise BinancePerpetualRiskDataError(
+            f"absolute notional {abs(notional)} is outside the returned leverage brackets for {self.symbol}"
+        )
+
+    def maintenance_margin(self, notional: Decimal) -> Decimal:
+        absolute_notional = abs(notional)
+        bracket = self.bracket_for_notional(absolute_notional)
+        return max(Decimal("0"), absolute_notional * bracket.maint_margin_ratio - bracket.adjusted_cum)
+
+
+@dataclass(frozen=True)
+class BinancePerpetualLeverageChangeResult:
+    symbol: str
+    leverage: int
+    max_notional_value: Decimal
+    data_time: float
+
+    @classmethod
+    def from_payload(
+            cls,
+            payload: Mapping[str, Any],
+            data_time: float,
+    ) -> "BinancePerpetualLeverageChangeResult":
+        context = "change leverage response"
+        payload = _mapping(payload, context)
+        leverage = _integer(payload, "leverage", context)
+        max_notional_value = _decimal(payload, "maxNotionalValue", context)
+        if leverage <= 0:
+            raise BinancePerpetualRiskDataError(f"{context}.leverage must be positive")
+        if max_notional_value <= 0:
+            raise BinancePerpetualRiskDataError(f"{context}.maxNotionalValue must be positive")
+        return cls(
+            symbol=_string(payload, "symbol", context),
+            leverage=leverage,
+            max_notional_value=max_notional_value,
+            data_time=_data_time(data_time),
+        )
+
+
+@dataclass(frozen=True)
+class BinancePerpetualPreflightSnapshot:
+    account: BinancePerpetualAccountRiskSnapshot
+    positions: Tuple[BinancePerpetualPositionRiskSnapshot, ...]
+    account_config: BinancePerpetualAccountConfig
+    multi_assets_mode: BinancePerpetualMultiAssetsMode
+    position_mode: BinancePerpetualPositionMode
+    instruments: Tuple[BinancePerpetualInstrumentInfo, ...]
+    symbol_configs: Tuple[BinancePerpetualSymbolConfig, ...]
+    leverage_brackets: Tuple[BinancePerpetualLeverageBrackets, ...]
+    data_time: float
