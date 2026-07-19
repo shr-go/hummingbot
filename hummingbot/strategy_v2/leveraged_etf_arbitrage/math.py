@@ -232,12 +232,13 @@ def depth_vwap(
             if side is BookSide.SELL and level.price > previous_price:
                 raise ValueError("sell-side depth prices must be monotonic nonincreasing")
         previous_price = level.price
-        filled = min(remaining, level.quantity)
-        quote_value += filled * level.price
-        remaining -= filled
-        if remaining == 0:
-            return quote_value / quantity
-    raise InsufficientDepthError("order book cannot execute the full stock quantity")
+        if remaining > 0:
+            filled = min(remaining, level.quantity)
+            quote_value += filled * level.price
+            remaining -= filled
+    if remaining > 0:
+        raise InsufficientDepthError("order book cannot execute the full stock quantity")
+    return quote_value / quantity
 
 
 def stock_book_walk_bp(vwap: Decimal, best_quote: Decimal, side: BookSide) -> Decimal:

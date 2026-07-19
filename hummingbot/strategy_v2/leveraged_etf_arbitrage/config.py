@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -42,13 +43,38 @@ def _immutable_decimal_mapping(value: Mapping[Decimal, Decimal]) -> Mapping[Deci
     return MappingProxyType(dict(sorted(value.items())))
 
 
+def _secret_safe_validation_error(error: ValidationError) -> ValidationError:
+    sanitized_errors = []
+    for line_error in error.errors(include_url=False, include_input=False):
+        sanitized_error = {
+            "type": line_error["type"],
+            "loc": line_error["loc"],
+        }
+        if "ctx" in line_error:
+            sanitized_error["ctx"] = line_error["ctx"]
+        sanitized_errors.append(sanitized_error)
+    return ValidationError.from_exception_data(
+        title=error.title,
+        line_errors=sanitized_errors,
+        hide_input=True,
+    )
+
+
 NonNegativeDecimal = Annotated[Decimal, BeforeValidator(_parse_decimal), Field(ge=Decimal("0"))]
 PositiveDecimal = Annotated[Decimal, BeforeValidator(_parse_decimal), Field(gt=Decimal("0"))]
 PositiveInt = Annotated[int, Field(gt=0)]
 
 
 class StrictFrozenModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True, strict=True)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def sanitize_validation_errors(cls, value: object, handler):
+        try:
+            return handler(value)
+        except ValidationError as error:
+            raise _secret_safe_validation_error(error) from None
 
 
 class SessionName(str, Enum):
@@ -241,6 +267,19 @@ class SessionConfig(StrictFrozenModel):
     position_tiers: Mapping[NonNegativeDecimal, PositiveDecimal]
     reduce_bp_by_current_target: Mapping[PositiveDecimal, NonNegativeDecimal]
 
+    @field_validator("position_tiers", "reduce_bp_by_current_target", mode="before")
+    @classmethod
+    def reject_normalized_decimal_key_collisions(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        normalized_keys: set[Decimal] = set()
+        for raw_key in value:
+            normalized_key = _parse_decimal(raw_key)
+            if normalized_key in normalized_keys:
+                raise ValueError("duplicate normalized Decimal key")
+            normalized_keys.add(normalized_key)
+        return value
+
     @field_validator("position_tiers", "reduce_bp_by_current_target", mode="after")
     @classmethod
     def freeze_decimal_maps(cls, value: Mapping[Decimal, Decimal]) -> Mapping[Decimal, Decimal]:
@@ -376,6 +415,14 @@ class EquityLeveragedEtfArbitrageConfig(StrictFrozenModel):
         if enabled_count == 0:
             raise ValueError("at least one whitelisted pair must be enabled")
         return self
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def sanitize_root_validation_errors(cls, value: object, handler):
+        try:
+            return handler(value)
+        except ValidationError as error:
+            raise _secret_safe_validation_error(error) from None
 
     @property
     def enabled_pairs(self) -> tuple[PairConfig, ...]:

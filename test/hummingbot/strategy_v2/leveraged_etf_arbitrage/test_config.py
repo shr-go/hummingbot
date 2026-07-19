@@ -1,4 +1,5 @@
 import copy
+import json
 import tomllib
 from collections.abc import Mapping
 from decimal import Decimal
@@ -55,6 +56,19 @@ def _assert_model_fields_come_from_input(model: BaseModel, raw: Mapping) -> None
             assert len(value) == len(raw_value)
             for key, nested_model in value.items():
                 _assert_model_fields_come_from_input(nested_model, _raw_mapping_value(raw_value, key))
+
+
+def _assert_validation_error_is_secret_safe(error: ValidationError, forbidden_fragments: tuple[str, ...]) -> None:
+    structured_errors = error.errors(include_url=False)
+    renderings = (
+        str(error),
+        repr(error),
+        repr(structured_errors),
+        json.dumps(structured_errors, default=repr),
+        error.json(),
+    )
+    if any(fragment in rendering for fragment in forbidden_fragments for rendering in renderings):
+        pytest.fail("validation error exposed a forbidden secret fragment")
 
 
 def test_committed_example_parses_with_tomllib_and_full_pydantic_validation(example_data: dict):
@@ -361,6 +375,59 @@ not-a-key
 -----END PRIVATE KEY-----"""
 
     with pytest.raises(ValidationError, match="Ed25519"):
+        EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+
+
+def test_malformed_private_key_validation_error_hides_all_secret_inputs(example_data: dict):
+    api_key_sentinel = "api-key-sentinel-83f3d9"
+    private_key_sentinel = "private-key-sentinel-7ac441"
+    example_data["binance"]["api_key"] = api_key_sentinel
+    example_data["binance"]["private_key"] = (
+        "-----BEGIN PRIVATE KEY-----\n" + private_key_sentinel + "\n-----END PRIVATE KEY-----"
+    )
+
+    with pytest.raises(ValidationError) as error_info:
+        EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+
+    _assert_validation_error_is_secret_safe(
+        error_info.value,
+        (api_key_sentinel, private_key_sentinel, "-----BEGIN PRIVATE KEY-----"),
+    )
+
+
+def test_unrelated_root_validation_error_hides_api_key_and_valid_pem(example_data: dict):
+    api_key_sentinel = "api-key-sentinel-e2c59b"
+    public_test_key_fragment = "MC4CAQAwBQYDK2VwBCIEILcA8v5gDH7X"
+    example_data["binance"]["api_key"] = api_key_sentinel
+    for pair in example_data["pairs"]:
+        pair["enabled"] = False
+
+    with pytest.raises(ValidationError) as error_info:
+        EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+
+    _assert_validation_error_is_secret_safe(
+        error_info.value,
+        (api_key_sentinel, public_test_key_fragment, "-----BEGIN PRIVATE KEY-----"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("map_name", "colliding_key", "colliding_value"),
+    [
+        ("position_tiers", "22.290", "3"),
+        ("reduce_bp_by_current_target", "3.0", "17"),
+    ],
+)
+def test_raw_tier_map_keys_must_not_collide_after_decimal_normalization(
+    example_data: dict,
+    map_name: str,
+    colliding_key: str,
+    colliding_value: str,
+):
+    regular = example_data["pairs"][0]["sessions"]["regular"]
+    regular[map_name][colliding_key] = colliding_value
+
+    with pytest.raises(ValidationError, match="duplicate normalized Decimal key"):
         EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
 
 

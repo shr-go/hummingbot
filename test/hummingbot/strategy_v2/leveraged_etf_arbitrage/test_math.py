@@ -259,6 +259,26 @@ def test_depth_vwap_rejects_non_monotonic_book_sides(side: BookSide, levels: tup
 
 
 @pytest.mark.parametrize(
+    ("side", "trailing_level"),
+    [
+        (BookSide.BUY, object()),
+        (BookSide.SELL, object()),
+        (BookSide.BUY, DepthLevel(D("9"), D("1"))),
+        (BookSide.SELL, DepthLevel(D("11"), D("1"))),
+    ],
+)
+def test_depth_vwap_rejects_invalid_trailing_levels_after_requested_quantity_is_filled(
+    side: BookSide,
+    trailing_level: object,
+):
+    levels = (DepthLevel(D("10"), D("1")), trailing_level)
+    expected_error = TypeError if not isinstance(trailing_level, DepthLevel) else ValueError
+
+    with pytest.raises(expected_error):
+        depth_vwap(levels, D("1"), side)
+
+
+@pytest.mark.parametrize(
     ("vwap", "best_quote", "side", "expected"),
     [
         (D("101"), D("100"), BookSide.BUY, D("100")),
