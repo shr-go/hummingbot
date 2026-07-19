@@ -8,7 +8,17 @@ from decimal import Decimal
 from enum import Enum
 from typing import Annotated, Any, Literal, Mapping, Optional, Tuple
 
-from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    StrictInt,
+    WithJsonSchema,
+    model_validator,
+)
 
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
 
@@ -76,6 +86,21 @@ CanonicalDecimal = Annotated[
 ]
 CanonicalNonNegativeDecimal = Annotated[CanonicalDecimal, AfterValidator(_validate_non_negative)]
 CanonicalPositiveDecimal = Annotated[CanonicalDecimal, AfterValidator(_validate_positive)]
+
+
+def _validate_schema_version_v1(value: int) -> int:
+    if value != 1:
+        raise ValueError("schema_version must be exactly 1")
+    return value
+
+
+SchemaVersionV1 = Annotated[
+    StrictInt,
+    AfterValidator(_validate_schema_version_v1),
+    WithJsonSchema({"type": "integer", "const": 1}),
+]
+StrictNonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+StrictPositiveInt = Annotated[StrictInt, Field(ge=1)]
 
 
 def _validate_canonical_utc(value: Any) -> datetime:
@@ -187,7 +212,7 @@ class LeveragedEtfPairState(str, Enum):
 
 
 class OrderReferenceV1(CanonicalWireModel):
-    sequence: int = Field(ge=0)
+    sequence: StrictNonNegativeInt
     client_order_id: StableIdentifier
     exchange_order_id: Optional[StableIdentifier]
 
@@ -195,8 +220,8 @@ class OrderReferenceV1(CanonicalWireModel):
 class LeverageReservationV1(CanonicalWireModel):
     etf_quantity: CanonicalNonNegativeDecimal
     stock_quantity: CanonicalNonNegativeDecimal
-    etf_leverage: int = Field(ge=1)
-    stock_leverage: int = Field(ge=1)
+    etf_leverage: StrictPositiveInt
+    stock_leverage: StrictPositiveInt
     etf_notional_cap: CanonicalPositiveDecimal
     stock_notional_cap: CanonicalPositiveDecimal
 
@@ -225,7 +250,7 @@ class LeveragedEtfPairExecutorConfig(ExecutorConfigBase):
     id: StableIdentifier
     timestamp: float = Field(allow_inf_nan=False)
     controller_id: StableIdentifier
-    schema_version: Literal[1] = 1
+    schema_version: SchemaVersionV1 = 1
     pair_id: StableIdentifier
     nav_cycle_id: StableIdentifier
     operation: LeveragedEtfPairOperation
@@ -282,7 +307,7 @@ class LeveragedEtfPairExecutorConfig(ExecutorConfigBase):
 class LeveragedEtfPairExecutorStateV1(CanonicalWireModel):
     """Mutable executor facts represented as an immutable versioned wire value."""
 
-    schema_version: Literal[1] = 1
+    schema_version: SchemaVersionV1 = 1
     executor_id: StableIdentifier
     state: LeveragedEtfPairState
     etf_submitted_quantity: CanonicalNonNegativeDecimal
@@ -297,7 +322,7 @@ class LeveragedEtfPairExecutorStateV1(CanonicalWireModel):
     leverage_reservation: LeverageReservationV1
     updated_at_utc: CanonicalUtcInstant
     close_reason: Optional[CloseReason]
-    last_journal_sequence: int = Field(ge=0)
+    last_journal_sequence: StrictNonNegativeInt
 
     @model_validator(mode="after")
     def validate_order_references(self) -> LeveragedEtfPairExecutorStateV1:
@@ -309,7 +334,7 @@ class LeveragedEtfPairExecutorStateV1(CanonicalWireModel):
 class LeveragedEtfPairExecutorSnapshotV1(CanonicalWireModel):
     """Exact F001 LeveragedEtfPairExecutorSnapshotV1 persistence envelope."""
 
-    schema_version: Literal[1]
+    schema_version: SchemaVersionV1
     executor_id: StableIdentifier
     controller_id: StableIdentifier
     pair_id: StableIdentifier
@@ -343,7 +368,7 @@ class LeveragedEtfPairExecutorSnapshotV1(CanonicalWireModel):
     created_at_utc: CanonicalUtcInstant
     updated_at_utc: CanonicalUtcInstant
     close_reason: Optional[CloseReason]
-    last_journal_sequence: int = Field(ge=0)
+    last_journal_sequence: StrictNonNegativeInt
 
     @model_validator(mode="after")
     def validate_semantics(self) -> LeveragedEtfPairExecutorSnapshotV1:
@@ -407,7 +432,7 @@ class LeveragedEtfPairExecutorSnapshotV1(CanonicalWireModel):
 class LeveragedEtfPairExecutorReportV1(CanonicalWireModel):
     """Optional performance values; missing values remain valid for historical rows."""
 
-    schema_version: Literal[1] = 1
+    schema_version: SchemaVersionV1 = 1
     net_pnl_pct: Optional[CanonicalDecimal] = None
     net_pnl_quote: Optional[CanonicalDecimal] = None
     realized_pnl_quote: Optional[CanonicalDecimal] = None
@@ -419,6 +444,6 @@ class LeveragedEtfPairExecutorReportV1(CanonicalWireModel):
 class LeveragedEtfPairExecutorCustomInfoV1(CanonicalWireModel):
     """Typed content stored in Hummingbot ExecutorInfo.custom_info."""
 
-    schema_version: Literal[1] = 1
+    schema_version: SchemaVersionV1 = 1
     state: LeveragedEtfPairExecutorStateV1
     report: LeveragedEtfPairExecutorReportV1 = Field(default_factory=LeveragedEtfPairExecutorReportV1)

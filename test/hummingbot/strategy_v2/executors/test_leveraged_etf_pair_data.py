@@ -18,6 +18,7 @@ from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types imp
     LeveragedEtfPairOperation,
     LeveragedEtfPairState,
     LeverageReservationV1,
+    OrderReferenceV1,
 )
 
 
@@ -271,3 +272,101 @@ def test_decimal_datetime_and_hash_fields_use_native_types(vectors: dict):
     assert isinstance(snapshot.leverage_reservation, LeverageReservationV1)
     assert snapshot.operation is LeveragedEtfPairOperation.OPEN
     assert snapshot.direction is LeveragedEtfPairDirection.SHORT_ETF_LONG_STOCK
+
+
+@pytest.mark.parametrize("coercive_value", [True, "1"])
+def test_schema_version_rejects_boolean_and_numeric_string(vectors: dict, coercive_value):
+    fixture = vectors["fixtures"]["executor_active"]
+    state = _state_from_fixture(fixture)
+    versioned_payloads = [
+        (LeveragedEtfPairExecutorConfig, _config_from_fixture(fixture).model_dump(mode="json")),
+        (LeveragedEtfPairExecutorStateV1, state.model_dump(mode="json")),
+        (LeveragedEtfPairExecutorSnapshotV1, copy.deepcopy(fixture)),
+        (LeveragedEtfPairExecutorReportV1, LeveragedEtfPairExecutorReportV1().model_dump(mode="json")),
+        (
+            LeveragedEtfPairExecutorCustomInfoV1,
+            LeveragedEtfPairExecutorCustomInfoV1(state=state).model_dump(mode="json"),
+        ),
+    ]
+
+    for model, payload in versioned_payloads:
+        payload["schema_version"] = coercive_value
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+
+
+@pytest.mark.parametrize("coercive_value", [True, "1"])
+def test_order_reference_sequence_rejects_boolean_and_numeric_string(coercive_value):
+    with pytest.raises(ValidationError):
+        OrderReferenceV1.model_validate(
+            {
+                "sequence": coercive_value,
+                "client_order_id": "exec-maker-1",
+                "exchange_order_id": "123",
+            }
+        )
+
+
+@pytest.mark.parametrize("field", ["etf_leverage", "stock_leverage"])
+@pytest.mark.parametrize("coercive_value", [True, "20"])
+def test_leverage_reservation_integers_reject_boolean_and_numeric_string(
+    vectors: dict,
+    field: str,
+    coercive_value,
+):
+    payload = copy.deepcopy(vectors["fixtures"]["executor_active"]["leverage_reservation"])
+    payload[field] = coercive_value
+
+    with pytest.raises(ValidationError):
+        LeverageReservationV1.model_validate(payload)
+
+
+@pytest.mark.parametrize("coercive_value", [True, "17"])
+def test_last_journal_sequence_rejects_boolean_and_numeric_string_in_state_and_snapshot(
+    vectors: dict,
+    coercive_value,
+):
+    fixture = vectors["fixtures"]["executor_active"]
+    state_payload = _state_from_fixture(fixture).model_dump(mode="json")
+    snapshot_payload = copy.deepcopy(fixture)
+    state_payload["last_journal_sequence"] = coercive_value
+    snapshot_payload["last_journal_sequence"] = coercive_value
+
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorStateV1.model_validate(state_payload)
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorSnapshotV1.model_validate(snapshot_payload)
+
+
+@pytest.mark.parametrize("coercive_value", [True, "20"])
+def test_nested_config_state_and_snapshot_reject_coercive_reservation_leverage(
+    vectors: dict,
+    coercive_value,
+):
+    fixture = vectors["fixtures"]["executor_active"]
+    config_payload = _config_from_fixture(fixture).model_dump(mode="json")
+    state_payload = _state_from_fixture(fixture).model_dump(mode="json")
+    snapshot_payload = copy.deepcopy(fixture)
+    for payload in (config_payload, state_payload, snapshot_payload):
+        payload["leverage_reservation"]["etf_leverage"] = coercive_value
+
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorConfig.model_validate(config_payload)
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorStateV1.model_validate(state_payload)
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorSnapshotV1.model_validate(snapshot_payload)
+
+
+@pytest.mark.parametrize("coercive_value", [True, "0"])
+def test_nested_state_and_snapshot_reject_coercive_order_sequence(vectors: dict, coercive_value):
+    fixture = vectors["fixtures"]["executor_active"]
+    state_payload = _state_from_fixture(fixture).model_dump(mode="json")
+    snapshot_payload = copy.deepcopy(fixture)
+    state_payload["maker_order_ids"][0]["sequence"] = coercive_value
+    snapshot_payload["maker_order_ids"][0]["sequence"] = coercive_value
+
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorStateV1.model_validate(state_payload)
+    with pytest.raises(ValidationError):
+        LeveragedEtfPairExecutorSnapshotV1.model_validate(snapshot_payload)
