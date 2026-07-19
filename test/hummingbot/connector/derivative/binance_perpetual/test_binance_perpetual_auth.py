@@ -3,8 +3,10 @@ import copy
 import hashlib
 import hmac
 import json
+import logging
+import traceback
 import unittest
-from typing import Awaitable
+from typing import Awaitable, Callable, Iterable, Tuple
 from urllib.parse import urlencode
 
 from cryptography.hazmat.primitives import serialization
@@ -52,6 +54,35 @@ class BinancePerpetualAuthUnitTests(unittest.TestCase):
     def async_run_with_timeout(self, coroutine: Awaitable, timeout: float = 1):
         ret = self.ev_loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
         return ret
+
+    def _capture_value_error(self, action: Callable[[], object]) -> Tuple[ValueError, str]:
+        captured_error = None
+        with self.assertLogs(level=logging.DEBUG) as captured_logs:
+            try:
+                action()
+            except ValueError as error:
+                captured_error = error
+            logging.getLogger(__name__).debug("Captured expected Binance authentication rejection.")
+
+        self.assertIsNotNone(captured_error, "ValueError not raised")
+        return captured_error, "\n".join(captured_logs.output)
+
+    def _assert_error_surfaces_are_redacted(
+        self,
+        error: ValueError,
+        captured_logs: str,
+        sensitive_values: Iterable[str],
+    ) -> None:
+        rendered_traceback = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__, chain=True)
+        )
+        surfaces = (str(error), repr(error), rendered_traceback, captured_logs)
+
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        for sensitive_value in sensitive_values:
+            for surface in surfaces:
+                self.assertNotIn(sensitive_value, surface)
 
     def time(self):
         # Implemented to emulate a TimeSynchronizer
@@ -164,6 +195,116 @@ class BinancePerpetualAuthUnitTests(unittest.TestCase):
         self.assertNotIn(api_key, error)
         self.assertNotIn(private_key, error)
         self.assertNotIn("PRIVATE_KEY_BODY_MUST_NOT_LEAK", error)
+
+    def test_non_ascii_pem_error_does_not_retain_sensitive_data(self):
+        api_key = "NON_ASCII_PEM_API_KEY_SENTINEL"
+        private_key = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "NON_ASCII_PEM_SECRET_SENTINEL_\u5bc6\n"
+            "-----END PRIVATE KEY-----"
+        )
+
+        error, captured_logs = self._capture_value_error(
+            lambda: BinancePerpetualAuth(
+                api_key=api_key,
+                api_secret=private_key,
+                time_provider=self,
+            )
+        )
+
+        self._assert_error_surfaces_are_redacted(
+            error,
+            captured_logs,
+            (api_key, private_key, "NON_ASCII_PEM_SECRET_SENTINEL"),
+        )
+
+    def test_unencodable_hmac_secret_error_does_not_retain_sensitive_data(self):
+        api_key = "HMAC_API_KEY_SENTINEL"
+        secret = "HMAC_SECRET_SENTINEL_\ud800"
+        auth = BinancePerpetualAuth(
+            api_key=api_key,
+            api_secret=secret,
+            time_provider=self,
+        )
+
+        error, captured_logs = self._capture_value_error(
+            lambda: auth.generate_signature_from_payload(self._get_test_payload())
+        )
+
+        self._assert_error_surfaces_are_redacted(
+            error,
+            captured_logs,
+            (api_key, secret, "HMAC_SECRET_SENTINEL"),
+        )
+
+    def test_non_ascii_payload_error_does_not_retain_sensitive_data(self):
+        api_key = "PAYLOAD_API_KEY_SENTINEL"
+        secret = "PAYLOAD_HMAC_SECRET_SENTINEL"
+        payload = "symbol=PAYLOAD_SECRET_SENTINEL_\u5bc6"
+        auth = BinancePerpetualAuth(
+            api_key=api_key,
+            api_secret=secret,
+            time_provider=self,
+        )
+
+        error, captured_logs = self._capture_value_error(
+            lambda: auth.generate_signature_from_payload(payload)
+        )
+
+        self._assert_error_surfaces_are_redacted(
+            error,
+            captured_logs,
+            (api_key, secret, payload, "PAYLOAD_SECRET_SENTINEL"),
+        )
+
+    def test_malformed_pem_error_does_not_retain_sensitive_data(self):
+        api_key = "MALFORMED_PEM_API_KEY_SENTINEL"
+        private_key = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MALFORMED_PEM_SECRET_SENTINEL\n"
+            "-----END PRIVATE KEY-----"
+        )
+
+        error, captured_logs = self._capture_value_error(
+            lambda: BinancePerpetualAuth(
+                api_key=api_key,
+                api_secret=private_key,
+                time_provider=self,
+            )
+        )
+
+        self._assert_error_surfaces_are_redacted(
+            error,
+            captured_logs,
+            (api_key, private_key, "MALFORMED_PEM_SECRET_SENTINEL"),
+        )
+
+    def test_encrypted_pem_error_does_not_retain_sensitive_data(self):
+        api_key = "ENCRYPTED_PEM_API_KEY_SENTINEL"
+        private_key = serialization.load_pem_private_key(
+            ED25519_PKCS8_PRIVATE_KEY.encode("ascii"),
+            password=None,
+        )
+        encrypted_private_key = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(b"encrypted-key-password"),
+        ).decode("ascii")
+        encrypted_body_sentinel = encrypted_private_key.splitlines()[1]
+
+        error, captured_logs = self._capture_value_error(
+            lambda: BinancePerpetualAuth(
+                api_key=api_key,
+                api_secret=encrypted_private_key,
+                time_provider=self,
+            )
+        )
+
+        self._assert_error_surfaces_are_redacted(
+            error,
+            captured_logs,
+            (api_key, encrypted_private_key, encrypted_body_sentinel),
+        )
 
     def test_generate_signature_from_payload_rejects_unicode(self):
         for secret in (self.secret_key, ED25519_PKCS8_PRIVATE_KEY):

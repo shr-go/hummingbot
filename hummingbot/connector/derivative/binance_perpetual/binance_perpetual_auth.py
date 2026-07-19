@@ -32,20 +32,22 @@ class BinancePerpetualAuth(AuthBase):
         self._time_provider: TimeSynchronizer = time_provider
 
     def generate_signature_from_payload(self, payload: str) -> str:
-        try:
-            encoded_payload = payload.encode("ascii")
-        except UnicodeEncodeError:
-            raise ValueError(self._NON_ASCII_PAYLOAD_ERROR) from None
+        if not payload.isascii():
+            raise ValueError(self._NON_ASCII_PAYLOAD_ERROR)
+        encoded_payload = payload.encode("ascii")
 
         if self._ed25519_private_key is not None:
             signature = self._ed25519_private_key.sign(encoded_payload)
             return base64.b64encode(signature).decode("ascii")
 
-        try:
-            secret = self._api_secret.encode("utf-8")
-        except UnicodeEncodeError:
-            raise ValueError("Binance API secret must be valid UTF-8 text.") from None
+        if self._contains_unicode_surrogate(self._api_secret):
+            raise ValueError("Binance API secret must be valid UTF-8 text.")
+        secret = self._api_secret.encode("utf-8")
         return hmac.new(secret, encoded_payload, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _contains_unicode_surrogate(value: str) -> bool:
+        return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
 
     @classmethod
     def _load_ed25519_private_key(cls, api_secret: str) -> Optional[Ed25519PrivateKey]:
@@ -60,16 +62,19 @@ class BinancePerpetualAuth(AuthBase):
             or normalized_secret.count("-----END PRIVATE KEY-----") != 1
         ):
             raise ValueError(cls._INVALID_ED25519_KEY_ERROR)
+        if not normalized_secret.isascii():
+            raise ValueError(cls._INVALID_ED25519_KEY_ERROR)
 
+        private_key = None
         try:
             private_key = serialization.load_pem_private_key(
                 normalized_secret.encode("ascii"),
                 password=None,
             )
         except (TypeError, ValueError, UnicodeEncodeError, UnsupportedAlgorithm):
-            raise ValueError(cls._INVALID_ED25519_KEY_ERROR) from None
+            pass
 
-        if not isinstance(private_key, Ed25519PrivateKey):
+        if private_key is None or not isinstance(private_key, Ed25519PrivateKey):
             raise ValueError(cls._INVALID_ED25519_KEY_ERROR)
 
         return private_key
