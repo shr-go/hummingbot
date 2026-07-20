@@ -2434,6 +2434,402 @@ def test_multi_slice_partial_retry_fill_totals_replay_and_reopen(tmp_path: Path,
         reopened.engine.dispose()
 
 
+def test_concurrent_hedge_reverse_order_interleaved_fills_use_executor_leg_target(
+    tmp_path: Path,
+    vectors: dict,
+):
+    db_path = tmp_path / "concurrent-hedge-fills.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+
+    maker = {
+        "logical_quantity": "2",
+        "order_quantity": "2",
+        "intent_id": "intent-concurrent-maker",
+        "client_order_id": "client-concurrent-maker",
+    }
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-concurrent-maker-prepared", **maker),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-concurrent-maker-created",
+            exchange_order_id="exchange-concurrent-maker",
+            **maker,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-maker-fill",
+            exchange_order_id="exchange-concurrent-maker",
+            exchange_trade_id="trade-concurrent-maker",
+            fill_quantity="2",
+            order_cumulative_filled_quantity="2",
+            leg_cumulative_filled_quantity="2",
+            outcome="FILLED",
+            **maker,
+        ),
+    )
+
+    older_hedge = {
+        "action": "STOCK_HEDGE",
+        "leg": "STOCK",
+        "logical_quantity": "1.2449",
+        "order_quantity": "1.2449",
+        "attempt": 1,
+        "intent_id": "intent-concurrent-hedge-older",
+        "client_order_id": "client-concurrent-hedge-older",
+    }
+    newer_hedge = {
+        "action": "STOCK_HEDGE",
+        "leg": "STOCK",
+        "logical_quantity": "2.4898",
+        "order_quantity": "1.2449",
+        "attempt": 2,
+        "intent_id": "intent-concurrent-hedge-newer",
+        "client_order_id": "client-concurrent-hedge-newer",
+    }
+    for suffix, hedge, exchange_order_id in (
+        ("older", older_hedge, "exchange-concurrent-hedge-older"),
+        ("newer", newer_hedge, "exchange-concurrent-hedge-newer"),
+    ):
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                f"event-concurrent-hedge-{suffix}-prepared",
+                **hedge,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.HEDGE_REQUESTED,
+                f"event-concurrent-hedge-{suffix}-requested",
+                **hedge,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.ORDER_CREATED,
+                f"event-concurrent-hedge-{suffix}-created",
+                exchange_order_id=exchange_order_id,
+                **hedge,
+            ),
+        )
+
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-newer-fill-a",
+            exchange_order_id="exchange-concurrent-hedge-newer",
+            exchange_trade_id="trade-concurrent-hedge-newer-a",
+            fill_quantity="0.4",
+            order_cumulative_filled_quantity="0.4",
+            leg_cumulative_filled_quantity="0.4",
+            outcome="PARTIAL",
+            **newer_hedge,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-older-fill-a",
+            exchange_order_id="exchange-concurrent-hedge-older",
+            exchange_trade_id="trade-concurrent-hedge-older-a",
+            fill_quantity="0.5",
+            order_cumulative_filled_quantity="0.5",
+            leg_cumulative_filled_quantity="0.9",
+            outcome="PARTIAL",
+            **older_hedge,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-newer-fill-b",
+            exchange_order_id="exchange-concurrent-hedge-newer",
+            exchange_trade_id="trade-concurrent-hedge-newer-b",
+            fill_quantity="0.8449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="1.7449",
+            outcome="FILLED",
+            **newer_hedge,
+        ),
+    )
+
+    def assert_rejected_atomically(event: JournalEventV1) -> None:
+        before_snapshot = repository.load_snapshot(initial.executor_id)
+        before_events = repository.events(initial.executor_id)
+        with pytest.raises((JournalConflictError, JournalIntegrityError)):
+            repository.append_and_reduce(initial.executor_id, event)
+        assert repository.load_snapshot(initial.executor_id) == before_snapshot
+        assert repository.events(initial.executor_id) == before_events
+
+    assert_rejected_atomically(
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-wrong-order",
+            exchange_order_id="exchange-concurrent-hedge-newer",
+            exchange_trade_id="trade-concurrent-hedge-wrong-order",
+            fill_quantity="0.7449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="2.4898",
+            outcome="FILLED",
+            **older_hedge,
+        )
+    )
+    assert_rejected_atomically(
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-wrong-intent",
+            exchange_order_id="exchange-concurrent-hedge-older",
+            exchange_trade_id="trade-concurrent-hedge-wrong-intent",
+            fill_quantity="0.1",
+            order_cumulative_filled_quantity="1.3449",
+            leg_cumulative_filled_quantity="1.8449",
+            outcome="FILLED",
+            **newer_hedge,
+        )
+    )
+    assert_rejected_atomically(
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-over-order-cap",
+            exchange_order_id="exchange-concurrent-hedge-older",
+            exchange_trade_id="trade-concurrent-hedge-over-order-cap",
+            fill_quantity="0.8",
+            order_cumulative_filled_quantity="1.3",
+            leg_cumulative_filled_quantity="2.5449",
+            outcome="FILLED",
+            **older_hedge,
+        )
+    )
+    assert_rejected_atomically(
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-false-cumulative",
+            exchange_order_id="exchange-concurrent-hedge-older",
+            exchange_trade_id="trade-concurrent-hedge-older-b",
+            fill_quantity="0.7449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="2.4",
+            outcome="FILLED",
+            **older_hedge,
+        )
+    )
+
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-concurrent-hedge-older-fill-b",
+            exchange_order_id="exchange-concurrent-hedge-older",
+            exchange_trade_id="trade-concurrent-hedge-older-b",
+            fill_quantity="0.7449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="2.4898",
+            outcome="FILLED",
+            **older_hedge,
+        ),
+    )
+
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert current.stock_submitted_quantity == Decimal("2.4898")
+    assert current.stock_filled_quantity == Decimal("2.4898")
+    assert tuple(order.exchange_order_id for order in current.stock_order_ids) == (
+        "exchange-concurrent-hedge-older",
+        "exchange-concurrent-hedge-newer",
+    )
+    assert repository.replay(initial.executor_id) == current
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        assert LeveragedEtfJournalRepository(reopened).replay(initial.executor_id) == current
+    finally:
+        reopened.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("first_fill_quantity", "first_outcome"),
+    (("0.4", "PARTIAL"), ("1", "FILLED")),
+    ids=("partial-fill-first", "full-fill-first"),
+)
+def test_fill_before_ack_and_order_created_preserves_authoritative_progress(
+    tmp_path: Path,
+    vectors: dict,
+    first_fill_quantity: str,
+    first_outcome: str,
+):
+    db_path = tmp_path / f"fill-before-order-{first_outcome.lower()}.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    maker = {
+        "logical_quantity": "1",
+        "order_quantity": "1",
+        "intent_id": f"intent-fill-before-order-{first_outcome.lower()}",
+        "client_order_id": f"client-fill-before-order-{first_outcome.lower()}",
+    }
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            f"event-fill-before-order-{first_outcome.lower()}-prepared",
+            **maker,
+        ),
+    )
+    first_fill = _fact_event(
+        initial,
+        JournalEventType.FILL,
+        f"event-fill-before-order-{first_outcome.lower()}-fill-a",
+        exchange_order_id=f"exchange-fill-before-order-{first_outcome.lower()}",
+        exchange_trade_id=f"trade-fill-before-order-{first_outcome.lower()}-a",
+        fill_quantity=first_fill_quantity,
+        order_cumulative_filled_quantity=first_fill_quantity,
+        leg_cumulative_filled_quantity=first_fill_quantity,
+        outcome=first_outcome,
+        **maker,
+    )
+    current = _append_fact(repository, current, first_fill)
+
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert current.etf_filled_quantity == Decimal(first_fill_quantity)
+    assert tuple(order.exchange_order_id for order in current.maker_order_ids) == (
+        f"exchange-fill-before-order-{first_outcome.lower()}",
+    )
+    event_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, first_fill)
+    assert len(repository.events(initial.executor_id)) == event_count
+    assert repository.load_snapshot(initial.executor_id) == current
+
+    def assert_rejected_atomically(event: JournalEventV1) -> None:
+        before_snapshot = repository.load_snapshot(initial.executor_id)
+        before_events = repository.events(initial.executor_id)
+        with pytest.raises((JournalConflictError, JournalIntegrityError)):
+            repository.append_and_reduce(initial.executor_id, event)
+        assert repository.load_snapshot(initial.executor_id) == before_snapshot
+        assert repository.events(initial.executor_id) == before_events
+
+    assert_rejected_atomically(
+        _fact_event(
+            initial,
+            JournalEventType.ACKNOWLEDGED,
+            f"event-fill-before-order-{first_outcome.lower()}-conflicting-ack",
+            client_order_id=f"{maker['client_order_id']}-conflict",
+            logical_quantity="1",
+            order_quantity="1",
+            intent_id=maker["intent_id"],
+        )
+    )
+    acknowledged = _fact_event(
+        initial,
+        JournalEventType.ACKNOWLEDGED,
+        f"event-fill-before-order-{first_outcome.lower()}-ack",
+        **maker,
+    )
+    current = _append_fact(repository, current, acknowledged)
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert current.etf_filled_quantity == Decimal(first_fill_quantity)
+    acknowledged_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, acknowledged)
+    assert len(repository.events(initial.executor_id)) == acknowledged_count
+
+    assert_rejected_atomically(
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            f"event-fill-before-order-{first_outcome.lower()}-conflicting-created",
+            exchange_order_id=f"exchange-fill-before-order-{first_outcome.lower()}-conflict",
+            **maker,
+        )
+    )
+    created = _fact_event(
+        initial,
+        JournalEventType.ORDER_CREATED,
+        f"event-fill-before-order-{first_outcome.lower()}-created",
+        exchange_order_id=f"exchange-fill-before-order-{first_outcome.lower()}",
+        **maker,
+    )
+    current = _append_fact(repository, current, created)
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert current.etf_filled_quantity == Decimal(first_fill_quantity)
+    assert len(current.maker_order_ids) == 1
+    created_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, created)
+    assert len(repository.events(initial.executor_id)) == created_count
+
+    if first_outcome == "PARTIAL":
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.FILL,
+                "event-fill-before-order-partial-fill-b",
+                exchange_order_id="exchange-fill-before-order-partial",
+                exchange_trade_id="trade-fill-before-order-partial-b",
+                fill_quantity="0.6",
+                order_cumulative_filled_quantity="1",
+                leg_cumulative_filled_quantity="1",
+                outcome="FILLED",
+                **maker,
+            ),
+        )
+
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert current.etf_filled_quantity == Decimal("1")
+    assert repository.incomplete_intents() == ()
+    assert repository.replay(initial.executor_id) == current
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.incomplete_intents() == ()
+    finally:
+        reopened.engine.dispose()
+
+
 def _opaque_final_anchor(
     *,
     official_close_utc: str,
