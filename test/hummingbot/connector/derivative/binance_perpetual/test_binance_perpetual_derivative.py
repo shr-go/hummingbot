@@ -3,7 +3,7 @@ import functools
 import json
 import re
 from dataclasses import FrozenInstanceError
-from decimal import Decimal, localcontext
+from decimal import Decimal, Overflow, ROUND_DOWN, ROUND_UP, localcontext
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -484,6 +484,123 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             tracked_order.executed_amount_quote,
             tuple(tracked_order.order_fills.items()),
             self.exchange.is_order_submission_unknown(tracked_order.client_order_id),
+            tracked_order.last_update_timestamp,
+            tracked_order.exchange_order_id_update_event.is_set(),
+            tracked_order.processed_by_exchange_event.is_set(),
+            tracked_order.completely_filled_event.is_set(),
+            tracked_order.is_pending_create,
+            tracked_order.is_open,
+            tracked_order.is_done,
+        )
+
+    @staticmethod
+    def _decimal_context_snapshot(decimal_context) -> tuple:
+        return (
+            decimal_context.prec,
+            decimal_context.Emax,
+            decimal_context.Emin,
+            decimal_context.capitals,
+            decimal_context.clamp,
+            decimal_context.rounding,
+            tuple(sorted(
+                (signal.__name__, enabled)
+                for signal, enabled in decimal_context.traps.items()
+            )),
+            tuple(sorted(
+                (signal.__name__, enabled)
+                for signal, enabled in decimal_context.flags.items()
+            )),
+        )
+
+    async def _assert_submission_unknown_stream_context_isolated(
+            self,
+            client_order_id: str,
+            overflow_trapped: bool,
+            clamp: int,
+            rounding: str,
+    ) -> None:
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(
+            client_order_id=client_order_id,
+            order_type=OrderType.MARKET,
+        )
+        fill_price = "10000000000000000000000000002"
+        exact_quote = Decimal("3000000000000000000000000000.600")
+        event = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="0.300",
+            cumulative_quantity="0.300",
+            trade_id=1,
+            fill_price=fill_price,
+            average_price=fill_price,
+            cumulative_quote=f"{exact_quote:f}",
+            order_type="MARKET",
+        )
+        expected_trade_update, expected_order_update = (
+            await self.exchange._validated_unknown_user_stream_updates(
+                event_message=event,
+                order_message=event["o"],
+                tracked_order=tracked_order,
+            )
+        )
+        self.assertIsNotNone(expected_trade_update)
+        expected_before = (
+            OrderState.PENDING_CREATE,
+            None,
+            Decimal("0"),
+            Decimal("0"),
+            (),
+            True,
+            tracked_order.creation_timestamp,
+            False,
+            False,
+            False,
+            True,
+            True,
+            False,
+        )
+        self.assertEqual(expected_before, self._submission_unknown_mutation_snapshot(tracked_order))
+
+        with localcontext() as caller_context:
+            caller_context.prec = 6
+            caller_context.Emax = 10
+            caller_context.Emin = -10
+            caller_context.capitals = 0
+            caller_context.clamp = clamp
+            caller_context.rounding = rounding
+            caller_context.traps[Overflow] = overflow_trapped
+            caller_context.clear_flags()
+            caller_context_before = self._decimal_context_snapshot(caller_context)
+            error_name = None
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except ArithmeticError as error:
+                error_name = type(error).__name__
+            caller_context_after = self._decimal_context_snapshot(caller_context)
+
+        expected_after = (
+            OrderState.PARTIALLY_FILLED,
+            expected_order_update.exchange_order_id,
+            Decimal("0.300"),
+            exact_quote,
+            ((expected_trade_update.trade_id, expected_trade_update),),
+            False,
+            expected_order_update.update_timestamp,
+            True,
+            True,
+            False,
+            False,
+            True,
+            False,
+        )
+        self.assertEqual(
+            (None, caller_context_before, expected_after),
+            (
+                error_name,
+                caller_context_after,
+                self._submission_unknown_mutation_snapshot(tracked_order),
+            ),
         )
 
     def _get_reconciliation_trade(
@@ -3530,6 +3647,61 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal(exact_quote), tracked_order.executed_amount_quote)
         self.assertEqual(Decimal(exact_quote), tracked_order.order_fills["1"].fill_quote_amount)
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_submission_unknown_stream_context_untrapped_overflow_stores_exactly(self):
+        await self._assert_submission_unknown_stream_context_isolated(
+            client_order_id="exec-sndk-snxx-0115-stock-0",
+            overflow_trapped=False,
+            clamp=1,
+            rounding=ROUND_DOWN,
+        )
+
+    async def test_submission_unknown_stream_context_trapped_overflow_stores_exactly(self):
+        await self._assert_submission_unknown_stream_context_isolated(
+            client_order_id="exec-sndk-snxx-0116-stock-0",
+            overflow_trapped=True,
+            clamp=0,
+            rounding=ROUND_UP,
+        )
+
+    async def test_submission_unknown_stream_context_rolls_back_partial_tracker_failure(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "exec-sndk-snxx-0117-stock-0"
+        tracked_order = self._track_submission_unknown_order(
+            client_order_id=client_order_id,
+            order_type=OrderType.MARKET,
+        )
+        fill_price = "10000000000000000000000000002"
+        exact_quote = "3000000000000000000000000000.600"
+        event = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="0.300",
+            cumulative_quantity="0.300",
+            trade_id=1,
+            fill_price=fill_price,
+            average_price=fill_price,
+            cumulative_quote=exact_quote,
+            order_type="MARKET",
+        )
+        before = self._submission_unknown_mutation_snapshot(tracked_order)
+
+        def partially_mutate_then_fail(trade_update):
+            tracked_order.order_fills[trade_update.trade_id] = trade_update
+            tracked_order.executed_amount_base = trade_update.fill_base_amount
+            tracked_order.last_update_timestamp = trade_update.fill_timestamp
+            tracked_order.completely_filled_event.set()
+            raise Overflow("simulated tracker arithmetic failure")
+
+        with patch.object(
+            tracked_order,
+            "update_with_trade_update",
+            side_effect=partially_mutate_then_fail,
+        ):
+            with self.assertRaises(Overflow):
+                await self.exchange._process_user_stream_event(event)
+
+        self.assertEqual(before, self._submission_unknown_mutation_snapshot(tracked_order))
 
     async def test_submission_unknown_stream_precision_rejects_sub_tick_misaligned_and_unsupported_prices(self):
         self._simulate_trading_rules_initialized()
