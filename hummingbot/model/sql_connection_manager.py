@@ -22,12 +22,16 @@ class SQLConnectionType(Enum):
     TRADE_FILLS = 1
 
 
+class DatabaseMigrationError(RuntimeError):
+    pass
+
+
 class SQLConnectionManager(TransactionBase):
     _scm_logger: Optional[HummingbotLogger] = None
     _scm_trade_fills_instance: Optional["SQLConnectionManager"] = None
 
     LOCAL_DB_VERSION_KEY = "local_db_version"
-    LOCAL_DB_VERSION_VALUE = "20230516"
+    LOCAL_DB_VERSION_VALUE = "20260719"
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -74,27 +78,41 @@ class SQLConnectionManager(TransactionBase):
         if connection_type is SQLConnectionType.TRADE_FILLS:
             self._engine: Engine = create_engine(client_config_map.db_mode.get_url(self.db_path))
             self._metadata: MetaData = self.get_declarative_base().metadata
-            self._metadata.create_all(self._engine)
-
-            # SQLite does not enforce foreign key constraint, but for others engines, we need to drop it.
-            # See: `hummingbot/market/markets_recorder.py`, at line 213.
-            with self._engine.begin() as conn:
-                inspector = inspect(conn)
-
-                for tname, fkcs in reversed(
-                        inspector.get_sorted_table_and_fkc_names()):
-                    if fkcs:
-                        if not self._engine.dialect.supports_alter:
-                            continue
-                        for fkc in fkcs:
-                            fk_constraint = ForeignKeyConstraint((), (), name=fkc)
-                            Table(tname, MetaData(), fk_constraint)
-                            conn.execute(DropConstraint(fk_constraint))
 
         self._session_cls = sessionmaker(bind=self._engine)
 
         if connection_type is SQLConnectionType.TRADE_FILLS and (not called_from_migrator):
             self.check_and_migrate_db(client_config_map)
+            self._metadata.create_all(self._engine)
+
+            from hummingbot.model.leveraged_etf_persistence import ensure_leveraged_etf_persistence_schema
+
+            with self._engine.begin() as connection:
+                ensure_leveraged_etf_persistence_schema(connection)
+
+            self._drop_foreign_key_constraints_for_supported_dialects()
+
+    def _drop_foreign_key_constraints_for_supported_dialects(self):
+        # SQLite keeps foreign-key enforcement disabled because fills may arrive before orders.
+        # Preserve the existing non-SQLite behavior for legacy recorder tables while keeping
+        # the leveraged-ETF persistence layer's explicitly managed constraints intact.
+        from hummingbot.model.leveraged_etf_persistence import LEVERAGED_ETF_PERSISTENCE_TABLES
+
+        managed_table_names = {table.name for table in LEVERAGED_ETF_PERSISTENCE_TABLES}
+        with self._engine.begin() as conn:
+            inspector = inspect(conn)
+
+            for tname, fkcs in reversed(
+                    inspector.get_sorted_table_and_fkc_names()):
+                if tname in managed_table_names:
+                    continue
+                if fkcs:
+                    if not self._engine.dialect.supports_alter:
+                        continue
+                    for fkc in fkcs:
+                        fk_constraint = ForeignKeyConstraint((), (), name=fkc)
+                        Table(tname, MetaData(), fk_constraint)
+                        conn.execute(DropConstraint(fk_constraint))
 
     @property
     def engine(self) -> Engine:
@@ -111,22 +129,29 @@ class SQLConnectionManager(TransactionBase):
 
     def check_and_migrate_db(self, client_config_map: "ClientConfigAdapter"):
         from hummingbot.model.db_migration.migrator import Migrator
+
+        if LocalMetadata.__tablename__ not in inspect(self._engine).get_table_names():
+            self._metadata.create_all(self._engine)
+
         with self.get_new_session() as session:
-            with session.begin():
-                local_db_version = self.get_local_db_version(session=session)
-                if local_db_version is None:
+            local_db_version = self.get_local_db_version(session=session)
+
+        if local_db_version is None:
+            with self.get_new_session() as session:
+                with session.begin():
                     version_info: LocalMetadata = LocalMetadata(key=self.LOCAL_DB_VERSION_KEY,
                                                                 value=self.LOCAL_DB_VERSION_VALUE)
                     session.add(version_info)
-                    session.commit()
-                else:
-                    # There's no past db version to upgrade from at this moment. So we'll just update the version value
-                    # if needed.
-                    if local_db_version.value < self.LOCAL_DB_VERSION_VALUE:
-                        was_migration_successful = Migrator().migrate_db_to_version(
-                            client_config_map, self, int(local_db_version.value), int(self.LOCAL_DB_VERSION_VALUE)
-                        )
-                        if was_migration_successful:
-                            # Cannot use variable local_db_version because reference is not valid
-                            # since Migrator changed it
-                            self.get_local_db_version(session=session).value = self.LOCAL_DB_VERSION_VALUE
+            return
+
+        current_version = int(local_db_version.value)
+        target_version = int(self.LOCAL_DB_VERSION_VALUE)
+        if current_version < target_version:
+            was_migration_successful = Migrator().migrate_db_to_version(
+                client_config_map, self, current_version, target_version
+            )
+            if not was_migration_successful:
+                self._engine.dispose()
+                raise DatabaseMigrationError(
+                    "incompatible leveraged ETF persistence schema or database migration failure"
+                )

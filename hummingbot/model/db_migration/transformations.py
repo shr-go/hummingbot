@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, Text
 
 from hummingbot.model.db_migration.base_transformation import DatabaseTransformation
 from hummingbot.model.decimal_type_decorator import SqliteDecimal
+from hummingbot.model.leveraged_etf_persistence import ensure_leveraged_etf_persistence_schema
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 
 
@@ -149,3 +150,22 @@ class AddTradeFeeInQuote(DatabaseTransformation):
     @property
     def to_version(self):
         return 20230516
+
+
+class AddLeveragedEtfPersistence(DatabaseTransformation):
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        with db_handle.engine.begin() as connection:
+            ensure_leveraged_etf_persistence_schema(connection)
+        return db_handle
+
+    @property
+    def name(self):
+        return "AddLeveragedEtfPersistence"
+
+    @property
+    def from_version(self):
+        return 20230516
+
+    @property
+    def to_version(self):
+        return 20260719

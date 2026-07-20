@@ -4,6 +4,13 @@ HummingbotBase = declarative_base()
 
 
 def get_declarative_base():
+    from .leveraged_etf_persistence import (  # noqa: F401
+        LeveragedEtfAnchorRevisionObservation,
+        LeveragedEtfAnchorState,
+        LeveragedEtfExecutorSnapshot,
+        LeveragedEtfJournalEvent,
+        LeveragedEtfStrategyReservation,
+    )
     from .market_state import MarketState  # noqa: F401
     from .metadata import Metadata  # noqa: F401
     from .order import Order  # noqa: F401

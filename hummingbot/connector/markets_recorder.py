@@ -33,6 +33,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model import leveraged_etf_persistence as leveraged_etf_persistence  # noqa: F401
 from hummingbot.model.controllers import Controllers
 from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
