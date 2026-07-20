@@ -4278,6 +4278,98 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await self.exchange._update_order_status()
 
+    async def test_feature_submit_timeout_rest_error_keeps_public_order_unknown_without_failure_event(self):
+        client_order_id = "t005-rest-timeout-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(side_effect=IOError(
+            "Error executing request POST /fapi/v1/order. HTTP status is 400. "
+            "Error: {'code': -1007, 'msg': 'TIMEOUT: execution status unknown.'}"
+        ))
+        failure_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+
+        submitted_id = self.exchange.buy(
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.MARKET,
+            price=Decimal("10000"),
+            client_order_id=client_order_id,
+            position_action=PositionAction.OPEN,
+        )
+        await asyncio.sleep(0.01)
+
+        tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+        self.assertEqual(client_order_id, submitted_id)
+        self.assertEqual(client_order_id, tracked_order.client_order_id)
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertIn(client_order_id, self.exchange.in_flight_orders)
+        self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+        self.assertIn(client_order_id, self.exchange._unknown_submission_order_intents)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual([], failure_logger.event_log)
+
+    async def test_feature_submit_timeout_payload_keeps_public_order_unknown_without_failure_event(self):
+        client_order_id = "t005-payload-timeout-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(return_value={
+            "code": -1007,
+            "msg": "Timeout waiting for response from backend server; execution status unknown.",
+        })
+        failure_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+
+        submitted_id = self.exchange.buy(
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.MARKET,
+            price=Decimal("10000"),
+            client_order_id=client_order_id,
+            position_action=PositionAction.OPEN,
+        )
+        await asyncio.sleep(0.01)
+
+        tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+        self.assertEqual(client_order_id, submitted_id)
+        self.assertEqual(client_order_id, tracked_order.client_order_id)
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertIn(client_order_id, self.exchange.in_flight_orders)
+        self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+        self.assertIn(client_order_id, self.exchange._unknown_submission_order_intents)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual([], failure_logger.event_log)
+
+    async def test_feature_authoritative_rejection_payload_still_publishes_failure(self):
+        client_order_id = "t005-definitive-reject-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(return_value={
+            "code": -2010,
+            "msg": "NEW_ORDER_REJECTED",
+        })
+        failure_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+
+        submitted_id = self.exchange.buy(
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.MARKET,
+            price=Decimal("10000"),
+            client_order_id=client_order_id,
+            position_action=PositionAction.OPEN,
+        )
+        await asyncio.sleep(0.01)
+
+        tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+        self.assertEqual(client_order_id, submitted_id)
+        self.assertEqual(OrderState.FAILED, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+        self.assertNotIn(client_order_id, self.exchange._unknown_submission_order_intents)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(1, len(failure_logger.event_log))
+        self.assertEqual(client_order_id, failure_logger.event_log[0].order_id)
+
     async def test_risk_submission_ambiguous_boundaries_preserve_exact_unknown_id(self):
         self._simulate_trading_rules_initialized()
         ambiguous_exceptions = (
