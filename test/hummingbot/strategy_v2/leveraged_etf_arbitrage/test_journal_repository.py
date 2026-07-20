@@ -350,6 +350,117 @@ def _followup_event(
     )
 
 
+def _fact_event(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    event_type: JournalEventType,
+    event_id: str,
+    *,
+    action: str = "ETF_MAKER",
+    leg: str = "ETF",
+    logical_quantity: str = "1",
+    order_quantity: str | None = None,
+    attempt: int = 1,
+    intent_id: str = "intent-maker-fact-1",
+    client_order_id: str = "exec-sndk-snxx-0001-maker-fact-1",
+    deadline_utc: str = DEADLINE_AT,
+    created_at_utc: str = UPDATED_AT,
+    exchange_order_id: str | None = None,
+    exchange_trade_id: str | None = None,
+    fill_quantity: str = "1",
+    order_cumulative_filled_quantity: str = "1",
+    leg_cumulative_filled_quantity: str = "1",
+    outcome: str | None = None,
+    target_intent_id: str | None = None,
+    target_client_order_id: str | None = None,
+    target_exchange_order_id: str | None = None,
+) -> JournalEventV1:
+    """Build a v1 journal event containing exchange facts, never a next snapshot."""
+
+    identity = _side_effect_identity(
+        snapshot,
+        action=action,
+        leg=leg,
+        logical_quantity=logical_quantity,
+        order_quantity=order_quantity,
+        attempt=attempt,
+        intent_id=intent_id,
+        client_order_id=client_order_id,
+    )
+    identity["deadline_utc"] = deadline_utc
+    payload_kind = {
+        JournalEventType.PREPARED: "PREPARED",
+        JournalEventType.ACKNOWLEDGED: "ACKNOWLEDGED",
+        JournalEventType.REJECTED: "REJECTED",
+        JournalEventType.SUBMIT_UNKNOWN: "SUBMIT_UNKNOWN",
+        JournalEventType.ORDER_CREATED: "ORDER_CREATED",
+        JournalEventType.FILL: "FILL",
+        JournalEventType.CANCEL_REQUESTED: "CANCEL",
+        JournalEventType.CANCEL_CONFIRMED: "CANCEL",
+        JournalEventType.HEDGE_REQUESTED: "HEDGE",
+        JournalEventType.HEDGE_CONFIRMED: "HEDGE",
+        JournalEventType.ROLLBACK_REQUESTED: "ROLLBACK",
+        JournalEventType.ROLLBACK_CONFIRMED: "ROLLBACK",
+        JournalEventType.RECONCILIATION: "RECONCILIATION",
+    }[event_type]
+    payload_value = {"schema_version": 1, "kind": payload_kind, "identity": identity}
+    if event_type == JournalEventType.REJECTED:
+        payload_value["reason"] = "connector rejected request"
+    elif event_type == JournalEventType.SUBMIT_UNKNOWN:
+        payload_value["uncertainty_started_at_utc"] = created_at_utc
+    elif event_type == JournalEventType.ORDER_CREATED:
+        payload_value["exchange_order_id"] = exchange_order_id
+    elif event_type == JournalEventType.FILL:
+        payload_value.update(
+            {
+                "exchange_order_id": exchange_order_id,
+                "exchange_trade_id": exchange_trade_id,
+                "price": "30",
+                "fill_quantity": fill_quantity,
+                "order_cumulative_filled_quantity": order_cumulative_filled_quantity,
+                "leg_cumulative_filled_quantity": leg_cumulative_filled_quantity,
+                "outcome": outcome or "FILLED",
+            }
+        )
+    elif event_type in {JournalEventType.CANCEL_REQUESTED, JournalEventType.CANCEL_CONFIRMED}:
+        payload_value.update(
+            {
+                "phase": "REQUESTED" if event_type == JournalEventType.CANCEL_REQUESTED else "CONFIRMED",
+                "target_intent_id": target_intent_id,
+                "target_client_order_id": target_client_order_id,
+                "target_exchange_order_id": target_exchange_order_id,
+                "final_order_cumulative_filled_quantity": order_cumulative_filled_quantity,
+            }
+        )
+    elif event_type in {JournalEventType.HEDGE_REQUESTED, JournalEventType.HEDGE_CONFIRMED}:
+        payload_value["phase"] = "REQUESTED" if event_type == JournalEventType.HEDGE_REQUESTED else "CONFIRMED"
+    elif event_type in {JournalEventType.ROLLBACK_REQUESTED, JournalEventType.ROLLBACK_CONFIRMED}:
+        payload_value["phase"] = "REQUESTED" if event_type == JournalEventType.ROLLBACK_REQUESTED else "CONFIRMED"
+    elif event_type == JournalEventType.RECONCILIATION:
+        payload_value.update(
+            {
+                "exchange_order_id": exchange_order_id,
+                "order_cumulative_filled_quantity": order_cumulative_filled_quantity,
+                "outcome": outcome or "NEW",
+            }
+        )
+    return JournalEventV1.model_validate(
+        {
+            "schema_version": 1,
+            "event_id": event_id,
+            "event_type": event_type.value,
+            "intent_id": identity["intent_id"],
+            "idempotency_key": identity["idempotency_key"],
+            "connector_name": identity["connector_name"],
+            "trading_pair": identity["trading_pair"],
+            "client_order_id": identity["client_order_id"],
+            "exchange_order_id": exchange_order_id,
+            "exchange_trade_id": exchange_trade_id,
+            "payload": payload_value,
+            "created_at_utc": created_at_utc,
+        }
+    )
+
+
 def _reservation(
     reservation_id: str = "reservation-1",
     reservation_key: str | None = None,
@@ -1684,3 +1795,769 @@ def test_anchor_concurrent_valid_and_identity_conflicting_cas_keeps_valid_state(
     assert sum(isinstance(result, AnchorPollingCheckpointV1) for result in results) == 1
     assert sum(isinstance(result, (AnchorIntegrityError, AnchorRevisionConflict)) for result in results) == 1
     assert repository.load(empty.cycle_id) == confirmed
+
+
+def _append_fact(
+    repository: LeveragedEtfJournalRepository,
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    event: JournalEventV1,
+) -> LeveragedEtfPairExecutorSnapshotV1:
+    repository.append_and_reduce(snapshot.executor_id, event)
+    reduced = repository.load_snapshot(snapshot.executor_id)
+    assert reduced is not None
+    return reduced
+
+
+def test_journal_event_facts_authoritatively_derive_snapshot(manager: SQLConnectionManager, vectors: dict):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    prepared_event = _fact_event(initial, JournalEventType.PREPARED, "event-facts-prepared")
+
+    assert "next_state" not in prepared_event.payload.model_dump(mode="json")
+    reduced = _append_fact(repository, initial, prepared_event)
+    assert reduced.state.value == "MAKER_SUBMITTING"
+    assert reduced.last_journal_sequence == 1
+    assert reduced.etf_filled_quantity == Decimal("0")
+
+    acknowledged = _fact_event(initial, JournalEventType.ACKNOWLEDGED, "event-facts-ack")
+    forged_terminal = _terminal_snapshot(reduced, 2)
+    with pytest.raises(JournalIntegrityError, match="assert|derived|snapshot|reducer"):
+        repository.append_and_reduce(initial.executor_id, acknowledged, forged_terminal)
+    assert repository.load_snapshot(initial.executor_id) == reduced
+
+
+def test_zero_fill_hedge_confirmation_cannot_terminalize_executor(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-zero-hedge-maker-prepared"),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-zero-hedge-maker-created",
+            exchange_order_id="exchange-zero-hedge-maker",
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-zero-hedge-maker-fill",
+            exchange_order_id="exchange-zero-hedge-maker",
+            exchange_trade_id="trade-zero-hedge-maker",
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            "event-zero-hedge-prepared",
+            action="STOCK_HEDGE",
+            leg="STOCK",
+            logical_quantity="1.2449",
+            intent_id="intent-zero-hedge",
+            client_order_id="exec-sndk-snxx-0001-zero-hedge",
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.HEDGE_REQUESTED,
+            "event-zero-hedge-requested",
+            action="STOCK_HEDGE",
+            leg="STOCK",
+            logical_quantity="1.2449",
+            intent_id="intent-zero-hedge",
+            client_order_id="exec-sndk-snxx-0001-zero-hedge",
+        ),
+    )
+    confirmation = _fact_event(
+        initial,
+        JournalEventType.HEDGE_CONFIRMED,
+        "event-zero-hedge-confirmed",
+        action="STOCK_HEDGE",
+        leg="STOCK",
+        logical_quantity="1.2449",
+        intent_id="intent-zero-hedge",
+        client_order_id="exec-sndk-snxx-0001-zero-hedge",
+    )
+
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="fill|hedge|confirm|exposure"):
+        repository.append_and_reduce(initial.executor_id, confirmation)
+    assert repository.load_snapshot(initial.executor_id) == current
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert current.stock_filled_quantity == Decimal("0")
+
+
+def test_cancel_request_stays_pending_until_target_maker_is_terminal(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-cancel-make-prepared"),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.ACKNOWLEDGED, "event-cancel-maker-ack"),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            "event-cancel-prepared",
+            action="CANCEL",
+            intent_id="intent-cancel-1",
+            client_order_id="exec-sndk-snxx-0001-cancel-1",
+        ),
+    )
+    requested = _fact_event(
+        initial,
+        JournalEventType.CANCEL_REQUESTED,
+        "event-cancel-requested",
+        action="CANCEL",
+        intent_id="intent-cancel-1",
+        client_order_id="exec-sndk-snxx-0001-cancel-1",
+        order_cumulative_filled_quantity="0",
+        target_intent_id="intent-maker-fact-1",
+        target_client_order_id="exec-sndk-snxx-0001-maker-fact-1",
+    )
+    current = _append_fact(repository, current, requested)
+
+    assert current.state.value == "MAKER_CANCEL_PENDING"
+    assert current.close_reason is None
+    assert tuple((intent.intent_id, intent.status.value) for intent in repository.incomplete_intents()) == (
+        ("intent-maker-fact-1", "ACKNOWLEDGED"),
+        ("intent-cancel-1", "CANCEL_REQUESTED"),
+    )
+
+
+def test_reconciliation_filled_requires_recorded_fill_facts(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-reconcile-prepared"),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-reconcile-order",
+            exchange_order_id="exchange-reconcile-order",
+        ),
+    )
+    reconciliation = _fact_event(
+        initial,
+        JournalEventType.RECONCILIATION,
+        "event-reconcile-impossible-filled",
+        exchange_order_id="exchange-reconcile-order",
+        order_cumulative_filled_quantity="0",
+        outcome="FILLED",
+    )
+
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="fill|cumulative|reconcil|outcome"):
+        repository.append_and_reduce(initial.executor_id, reconciliation)
+    assert repository.load_snapshot(initial.executor_id) == current
+    assert current.etf_filled_quantity == Decimal("0")
+
+
+def test_prepared_deadline_must_not_precede_event_time(manager: SQLConnectionManager, vectors: dict):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    expired = _fact_event(
+        initial,
+        JournalEventType.PREPARED,
+        "event-expired-prepared",
+        deadline_utc=CREATED_AT,
+        created_at_utc=UPDATED_AT,
+    )
+
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="deadline|expired|time"):
+        repository.append_and_reduce(initial.executor_id, expired)
+    assert repository.events(initial.executor_id) == ()
+
+
+def test_fill_exchange_order_must_match_intent_binding(manager: SQLConnectionManager, vectors: dict):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-bound-prepared"),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-bound-order-a",
+            exchange_order_id="exchange-bound-a",
+        ),
+    )
+    wrong_order_fill = _fact_event(
+        initial,
+        JournalEventType.FILL,
+        "event-bound-fill-b",
+        exchange_order_id="exchange-bound-b",
+        exchange_trade_id="trade-bound-b",
+    )
+
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="order|bound|intent|identity"):
+        repository.append_and_reduce(initial.executor_id, wrong_order_fill)
+    assert repository.load_snapshot(initial.executor_id) == current
+
+
+@pytest.mark.parametrize("identity_kind", ("client", "exchange_order"))
+def test_cross_executor_order_identity_race_has_one_persistent_owner(
+    manager: SQLConnectionManager,
+    vectors: dict,
+    identity_kind: str,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial_a = _initial_snapshot(vectors)
+    initial_b = _snapshot_for_executor(initial_a, "exec-sndk-snxx-race-b")
+    repository.create_executor(initial_a)
+    repository.create_executor(initial_b)
+
+    if identity_kind == "client":
+        events = (
+            _fact_event(
+                initial_a,
+                JournalEventType.PREPARED,
+                "event-client-owner-a",
+                client_order_id="globally-shared-client",
+            ),
+            _fact_event(
+                initial_b,
+                JournalEventType.PREPARED,
+                "event-client-owner-b",
+                intent_id="intent-maker-owner-b",
+                client_order_id="globally-shared-client",
+            ),
+        )
+    else:
+        prepared_a = _fact_event(initial_a, JournalEventType.PREPARED, "event-order-owner-prepared-a")
+        prepared_b = _fact_event(
+            initial_b,
+            JournalEventType.PREPARED,
+            "event-order-owner-prepared-b",
+            intent_id="intent-maker-owner-b",
+            client_order_id="exec-sndk-snxx-race-b-maker",
+        )
+        repository.append_and_reduce(initial_a.executor_id, prepared_a)
+        repository.append_and_reduce(initial_b.executor_id, prepared_b)
+        events = (
+            _fact_event(
+                initial_a,
+                JournalEventType.ORDER_CREATED,
+                "event-order-owner-a",
+                exchange_order_id="globally-shared-exchange-order",
+            ),
+            _fact_event(
+                initial_b,
+                JournalEventType.ORDER_CREATED,
+                "event-order-owner-b",
+                intent_id="intent-maker-owner-b",
+                client_order_id="exec-sndk-snxx-race-b-maker",
+                exchange_order_id="globally-shared-exchange-order",
+            ),
+        )
+
+    def append(owner: LeveragedEtfPairExecutorSnapshotV1, event: JournalEventV1):
+        try:
+            return LeveragedEtfJournalRepository(manager).append_and_reduce(owner.executor_id, event)
+        except (JournalConflictError, JournalIntegrityError) as exception:
+            return exception
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda item: append(*item), ((initial_a, events[0]), (initial_b, events[1]))))
+    assert sum(not isinstance(result, Exception) for result in results) == 1
+    assert sum(isinstance(result, Exception) for result in results) == 1
+
+
+def test_recovery_rejects_persisted_cross_executor_client_owner_conflict(tmp_path: Path, vectors: dict):
+    db_path = tmp_path / "global-owner-corruption.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial_a = _initial_snapshot(vectors)
+    initial_b = _snapshot_for_executor(initial_a, "exec-sndk-snxx-owner-b")
+    repository.create_executor(initial_a)
+    repository.create_executor(initial_b)
+    repository.append_and_reduce(
+        initial_a.executor_id,
+        _fact_event(initial_a, JournalEventType.PREPARED, "event-owner-corrupt-a"),
+    )
+    repository.append_and_reduce(
+        initial_b.executor_id,
+        _fact_event(
+            initial_b,
+            JournalEventType.PREPARED,
+            "event-owner-corrupt-b",
+            intent_id="intent-owner-corrupt-b",
+            client_order_id="exec-sndk-snxx-owner-b-maker",
+        ),
+    )
+    manager.engine.dispose()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER lepf_journal_no_update")
+        connection.execute("DROP TRIGGER lepf_journal_client_order_owner_insert")
+        row = connection.execute(
+            "SELECT payload_json FROM LeveragedEtfJournalEvent WHERE event_id = ?",
+            ("event-owner-corrupt-b",),
+        ).fetchone()
+        mutation = json.loads(row[0])
+        mutation["event"]["client_order_id"] = "exec-sndk-snxx-0001-maker-fact-1"
+        mutation["event"]["payload"]["identity"]["client_order_id"] = "exec-sndk-snxx-0001-maker-fact-1"
+        payload_json, payload_hash = _canonical_json_hash(mutation)
+        connection.execute(
+            """
+            UPDATE LeveragedEtfJournalEvent
+            SET client_order_id = ?, payload_json = ?, payload_hash = ?
+            WHERE event_id = ?
+            """,
+            ("exec-sndk-snxx-0001-maker-fact-1", payload_json, payload_hash, "event-owner-corrupt-b"),
+        )
+        connection.execute(SQLITE_GUARD_DDL["lepf_journal_client_order_owner_insert"])
+        connection.execute(SQLITE_GUARD_DDL["lepf_journal_no_update"])
+
+    reopened = _open_manager(db_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="client|owner|identity|global"):
+            LeveragedEtfJournalRepository(reopened).incomplete_executors()
+    finally:
+        reopened.engine.dispose()
+
+
+def test_multi_slice_partial_retry_fill_totals_replay_and_reopen(tmp_path: Path, vectors: dict):
+    db_path = tmp_path / "multi-slice.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    current = initial
+
+    maker_one = {
+        "logical_quantity": "1",
+        "order_quantity": "1",
+        "attempt": 1,
+        "intent_id": "intent-maker-slice-1",
+        "client_order_id": "client-maker-slice-1",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.PREPARED, "event-maker-slice-1-prepared", **maker_one),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-maker-slice-1-created",
+            exchange_order_id="exchange-maker-slice-1",
+            **maker_one,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-maker-slice-1-fill-a",
+            exchange_order_id="exchange-maker-slice-1",
+            exchange_trade_id="trade-maker-slice-1-a",
+            fill_quantity="0.4",
+            order_cumulative_filled_quantity="0.4",
+            leg_cumulative_filled_quantity="0.4",
+            outcome="PARTIAL",
+            **maker_one,
+        ),
+    )
+    final_first_fill = _fact_event(
+        initial,
+        JournalEventType.FILL,
+        "event-maker-slice-1-fill-b",
+        exchange_order_id="exchange-maker-slice-1",
+        exchange_trade_id="trade-maker-slice-1-b",
+        fill_quantity="0.6",
+        order_cumulative_filled_quantity="1",
+        leg_cumulative_filled_quantity="1",
+        outcome="FILLED",
+        **maker_one,
+    )
+    current = _append_fact(repository, current, final_first_fill)
+    committed_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, final_first_fill)
+    assert len(repository.events(initial.executor_id)) == committed_count
+
+    rejected_hedge = {
+        "action": "STOCK_HEDGE",
+        "leg": "STOCK",
+        "logical_quantity": "1.2449",
+        "order_quantity": "1.2449",
+        "attempt": 1,
+        "intent_id": "intent-stock-slice-1-rejected",
+        "client_order_id": "client-stock-slice-1-rejected",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.PREPARED, "event-stock-retry-prepared", **rejected_hedge),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.HEDGE_REQUESTED, "event-stock-retry-requested", **rejected_hedge),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.REJECTED, "event-stock-retry-rejected", **rejected_hedge),
+    )
+
+    hedge_one = {
+        **rejected_hedge,
+        "attempt": 2,
+        "intent_id": "intent-stock-slice-1",
+        "client_order_id": "client-stock-slice-1",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.PREPARED, "event-stock-slice-1-prepared", **hedge_one),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.HEDGE_REQUESTED, "event-stock-slice-1-requested", **hedge_one),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-stock-slice-1-created",
+            exchange_order_id="exchange-stock-slice-1",
+            **hedge_one,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-stock-slice-1-fill-a",
+            exchange_order_id="exchange-stock-slice-1",
+            exchange_trade_id="trade-stock-slice-1-a",
+            fill_quantity="0.5",
+            order_cumulative_filled_quantity="0.5",
+            leg_cumulative_filled_quantity="0.5",
+            outcome="PARTIAL",
+            **hedge_one,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-stock-slice-1-fill-b",
+            exchange_order_id="exchange-stock-slice-1",
+            exchange_trade_id="trade-stock-slice-1-b",
+            fill_quantity="0.7449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="1.2449",
+            outcome="FILLED",
+            **hedge_one,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.HEDGE_CONFIRMED, "event-stock-slice-1-confirmed", **hedge_one),
+    )
+    assert current.state.value == "MAKER_WORKING"
+
+    maker_two = {
+        "logical_quantity": "2",
+        "order_quantity": "1",
+        "attempt": 2,
+        "intent_id": "intent-maker-slice-2",
+        "client_order_id": "client-maker-slice-2",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.PREPARED, "event-maker-slice-2-prepared", **maker_two),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-maker-slice-2-created",
+            exchange_order_id="exchange-maker-slice-2",
+            **maker_two,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-maker-slice-2-fill",
+            exchange_order_id="exchange-maker-slice-2",
+            exchange_trade_id="trade-maker-slice-2",
+            fill_quantity="1",
+            order_cumulative_filled_quantity="1",
+            leg_cumulative_filled_quantity="2",
+            outcome="FILLED",
+            **maker_two,
+        ),
+    )
+
+    hedge_two = {
+        "action": "STOCK_HEDGE",
+        "leg": "STOCK",
+        "logical_quantity": "2.4898",
+        "order_quantity": "1.2449",
+        "attempt": 3,
+        "intent_id": "intent-stock-slice-2",
+        "client_order_id": "client-stock-slice-2",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.PREPARED, "event-stock-slice-2-prepared", **hedge_two),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.HEDGE_REQUESTED, "event-stock-slice-2-requested", **hedge_two),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-stock-slice-2-created",
+            exchange_order_id="exchange-stock-slice-2",
+            **hedge_two,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-stock-slice-2-fill",
+            exchange_order_id="exchange-stock-slice-2",
+            exchange_trade_id="trade-stock-slice-2",
+            fill_quantity="1.2449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="2.4898",
+            outcome="FILLED",
+            **hedge_two,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.HEDGE_CONFIRMED, "event-stock-slice-2-confirmed", **hedge_two),
+    )
+
+    assert current.state.value == "MAKER_WORKING"
+    assert current.etf_submitted_quantity == Decimal("2")
+    assert current.etf_filled_quantity == Decimal("2")
+    assert current.stock_submitted_quantity == Decimal("2.4898")
+    assert current.stock_filled_quantity == Decimal("2.4898")
+    assert tuple(order.exchange_order_id for order in current.maker_order_ids) == (
+        "exchange-maker-slice-1",
+        "exchange-maker-slice-2",
+    )
+    assert tuple(order.exchange_order_id for order in current.stock_order_ids) == (
+        "exchange-stock-slice-1",
+        "exchange-stock-slice-2",
+    )
+    assert repository.replay(initial.executor_id) == current
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        assert LeveragedEtfJournalRepository(reopened).replay(initial.executor_id) == current
+    finally:
+        reopened.engine.dispose()
+
+
+def _opaque_final_anchor(
+    *,
+    official_close_utc: str,
+    payload_official_close_utc: str,
+    provider_state: str = "initial",
+) -> OpaqueAnchorFinalizedV1:
+    cycle_id = "xnys-2026-07-21"
+    target_session_date = "2026-07-21"
+    deadline_utc = "2026-07-21T20:10:00.000000Z"
+    evidence_hash = "7" * 64
+    return OpaqueAnchorFinalizedV1(
+        cycle_id=cycle_id,
+        target_session_date=target_session_date,
+        official_close_utc=official_close_utc,
+        deadline_utc=deadline_utc,
+        revision=1,
+        evidence_hash=evidence_hash,
+        payload=CanonicalOpaquePayload.from_value(
+            2,
+            "ANCHOR_RECORD",
+            {
+                "schema_version": 2,
+                "cycle_id": cycle_id,
+                "target_session_date": target_session_date,
+                "official_close_utc": payload_official_close_utc,
+                "deadline_utc": deadline_utc,
+                "evidence_hash": evidence_hash,
+                "finalized_at_utc": "2026-07-21T20:05:00.000000Z",
+                "provider_state": provider_state,
+            },
+        ),
+    )
+
+
+def test_opaque_anchor_rejects_official_close_mismatch_on_absent_insert(manager: SQLConnectionManager):
+    repository = AnchorRepositoryV1(manager)
+    mismatched = _opaque_final_anchor(
+        official_close_utc="2026-07-21T20:00:00.000000Z",
+        payload_official_close_utc="2026-07-21T20:01:00.000000Z",
+    )
+
+    with pytest.raises(AnchorIntegrityError, match="official|close|identity|metadata"):
+        repository.finalize_opaque_if_absent(mismatched, expected_revision=0)
+    assert repository.load_opaque(mismatched.cycle_id) is None
+
+
+def test_opaque_anchor_rejects_official_close_mismatch_when_finalizing_checkpoint(
+    manager: SQLConnectionManager,
+):
+    repository = AnchorRepositoryV1(manager)
+    final = _opaque_final_anchor(
+        official_close_utc="2026-07-21T20:00:00.000000Z",
+        payload_official_close_utc="2026-07-21T20:01:00.000000Z",
+    )
+    checkpoint = OpaqueAnchorCheckpointV1(
+        cycle_id=final.cycle_id,
+        target_session_date=final.target_session_date,
+        official_close_utc="2026-07-21T20:00:00.000000Z",
+        deadline_utc=final.deadline_utc,
+        revision=1,
+        payload=CanonicalOpaquePayload.from_value(
+            2,
+            "ANCHOR_CHECKPOINT",
+            {
+                "schema_version": 2,
+                "cycle_id": final.cycle_id,
+                "target_session_date": final.target_session_date,
+                "official_close_utc": "2026-07-21T20:00:00.000000Z",
+                "deadline_utc": "2026-07-21T20:10:00.000000Z",
+                "revision": 1,
+            },
+        ),
+    )
+    repository.compare_and_set_opaque_checkpoint(checkpoint, expected_revision=0)
+
+    with pytest.raises(AnchorIntegrityError, match="official|close|identity|metadata"):
+        repository.finalize_opaque_if_absent(final, expected_revision=1)
+    assert repository.load_opaque(final.cycle_id) == checkpoint
+
+
+def test_opaque_anchor_rejects_official_close_mismatch_on_idempotent_retry(
+    manager: SQLConnectionManager,
+):
+    repository = AnchorRepositoryV1(manager)
+    valid = _opaque_final_anchor(
+        official_close_utc="2026-07-21T20:00:00.000000Z",
+        payload_official_close_utc="2026-07-21T20:00:00.000000Z",
+    )
+    repository.finalize_opaque_if_absent(valid, expected_revision=0)
+    mismatched = _opaque_final_anchor(
+        official_close_utc="2026-07-21T20:00:00.000000Z",
+        payload_official_close_utc="2026-07-21T20:01:00.000000Z",
+    )
+
+    with pytest.raises(AnchorIntegrityError, match="official|close|identity|metadata"):
+        repository.finalize_opaque_if_absent(mismatched, expected_revision=0)
+    assert repository.load_opaque(valid.cycle_id) == valid
+
+
+def test_opaque_anchor_reopen_rejects_persisted_official_close_mismatch(tmp_path: Path):
+    db_path = tmp_path / "anchor-close-corruption.sqlite"
+    manager = _open_manager(db_path)
+    repository = AnchorRepositoryV1(manager)
+    valid = _opaque_final_anchor(
+        official_close_utc="2026-07-21T20:00:00.000000Z",
+        payload_official_close_utc="2026-07-21T20:00:00.000000Z",
+    )
+    repository.finalize_opaque_if_absent(valid, expected_revision=0)
+    manager.engine.dispose()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER lepf_anchor_finalized_no_update")
+        payload = valid.payload.value()
+        payload["official_close_utc"] = "2026-07-21T20:01:00.000000Z"
+        payload_json, payload_hash = _canonical_json_hash(payload)
+        connection.execute(
+            "UPDATE LeveragedEtfAnchorState SET payload_json = ?, payload_hash = ? WHERE cycle_id = ?",
+            (payload_json, payload_hash, valid.cycle_id),
+        )
+        connection.execute(SQLITE_GUARD_DDL["lepf_anchor_finalized_no_update"])
+
+    reopened = _open_manager(db_path)
+    try:
+        with pytest.raises(AnchorIntegrityError, match="official|close|identity|metadata"):
+            AnchorRepositoryV1(reopened).load_opaque(valid.cycle_id)
+    finally:
+        reopened.engine.dispose()
