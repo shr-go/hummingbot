@@ -13,7 +13,15 @@ from enum import Enum
 from typing import Any, Optional
 
 from hummingbot.data_feed.yahoo_finance.parser import YahooCloseObservation
-from hummingbot.data_feed.yahoo_finance.provider import YahooChartProvider
+from hummingbot.data_feed.yahoo_finance.provider import (
+    YahooChartProvider,
+    YahooCycleBudget,
+    YahooDeadlineExceeded,
+)
+from hummingbot.strategy_v2.leveraged_etf_arbitrage.calendar import (
+    CalendarRangeError,
+    XnysNavCalendar,
+)
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import NavConfig
 
 
@@ -197,6 +205,8 @@ class AnchorPollingCheckpoint:
             raise CheckpointIntegrityError("deadline must be later than official close")
         if self.deadline_utc - self.official_close_utc > timedelta(seconds=600):
             raise CheckpointIntegrityError("deadline exceeds the 600-second anchor bound")
+        if self.next_poll_utc < self.official_close_utc:
+            raise CheckpointIntegrityError("next poll cannot precede official close")
         if self.next_poll_utc > self.deadline_utc:
             raise CheckpointIntegrityError("next poll cannot be later than the deadline")
         for value, field_name, minimum in (
@@ -232,6 +242,16 @@ class AnchorPollingCheckpoint:
         _validate_hash(self.candidate_etf_raw_response_hash, "candidate ETF raw response hash")
         _validate_utc(self.stock_received_at_utc, "stock received time")
         _validate_utc(self.etf_received_at_utc, "ETF received time")
+        for received_at, field_name in (
+            (self.stock_received_at_utc, "stock received time"),
+            (self.etf_received_at_utc, "ETF received time"),
+        ):
+            if not self.official_close_utc <= received_at < self.deadline_utc:
+                raise CheckpointIntegrityError(
+                    f"{field_name} must be inside the post-close acquisition window"
+                )
+        if self.next_poll_utc < max(self.stock_received_at_utc, self.etf_received_at_utc):
+            raise CheckpointIntegrityError("next poll cannot precede the latest candidate receive time")
 
     @classmethod
     def from_contract_fields(cls, fields: Mapping[str, Any]) -> "AnchorPollingCheckpoint":
@@ -406,6 +426,12 @@ class FinalizedAnchorAssessment:
     revision_observation: RevisionObservation | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PairLegOutcome:
+    observation: YahooCloseObservation
+    completed_monotonic: float
+
+
 class YahooAnchorAcquisition:
     """Checkpoint-driven, persistence-free Yahoo anchor state machine."""
 
@@ -424,6 +450,7 @@ class YahooAnchorAcquisition:
         self._utc_clock = utc_clock
         self._monotonic_clock = monotonic_clock
         self._sleep = sleep
+        self._calendar = XnysNavCalendar(nav_config=nav_config, clock=utc_clock)
         self._provider = provider or YahooChartProvider(
             nav_config=nav_config,
             utc_clock=utc_clock,
@@ -431,6 +458,9 @@ class YahooAnchorAcquisition:
             sleep=sleep,
             jitter=jitter,
         )
+        self._active_budget_key: tuple[str, datetime] | None = None
+        self._active_budget: YahooCycleBudget | None = None
+        self._poll_saturation_attempt = self._calculate_poll_saturation_attempt()
 
     def create_checkpoint(
         self,
@@ -438,7 +468,8 @@ class YahooAnchorAcquisition:
         target_session_date: date,
         official_close_utc: datetime,
     ) -> AnchorPollingCheckpoint:
-        return AnchorPollingCheckpoint(
+        self._validate_exact_official_close(target_session_date, official_close_utc)
+        checkpoint = AnchorPollingCheckpoint(
             schema_version=1,
             cycle_id=cycle_id,
             target_session_date=target_session_date,
@@ -455,79 +486,98 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=None,
             revision=1,
         )
+        self._active_budget_key = (checkpoint.cycle_id, checkpoint.deadline_utc)
+        self._active_budget = YahooCycleBudget.start(
+            deadline_utc=checkpoint.deadline_utc,
+            utc_clock=self._utc_clock,
+            monotonic_clock=self._monotonic_clock,
+        )
+        return checkpoint
 
     async def advance(
         self,
         checkpoint: AnchorPollingCheckpoint,
         stock_symbol: str,
         etf_symbol: str,
+        *,
+        budget: YahooCycleBudget | None = None,
     ) -> AnchorAcquisitionResult:
         self._validate_checkpoint_for_config(checkpoint)
         self._validate_symbol(stock_symbol, "stock symbol")
         self._validate_symbol(etf_symbol, "ETF symbol")
+        budget = budget or self._budget_for(checkpoint)
+        if budget.deadline_utc != checkpoint.deadline_utc:
+            raise ValueError("cycle budget does not match checkpoint deadline")
         now = _validate_utc(self._utc_clock(), "UTC clock")
+        try:
+            remaining = budget.ensure_remaining("Yahoo anchor round")
+        except YahooDeadlineExceeded:
+            return self._deadline_result(checkpoint)
         if now >= checkpoint.deadline_utc:
-            return AnchorAcquisitionResult(
-                status=AnchorAcquisitionStatus.ANCHOR_UNAVAILABLE,
-                checkpoint=checkpoint,
-                failure_reason="absolute Yahoo anchor deadline elapsed",
-            )
+            return self._deadline_result(checkpoint)
 
-        minimum_finalize_at = checkpoint.official_close_utc + timedelta(
-            seconds=self._nav_config.anchor_min_finalize_delay_seconds
-        )
-        due_at = max(checkpoint.next_poll_utc, minimum_finalize_at)
-        if now < due_at:
+        if now < checkpoint.next_poll_utc:
             return AnchorAcquisitionResult(status=AnchorAcquisitionStatus.WAITING, checkpoint=checkpoint)
-        if not self._has_conservative_budget(checkpoint, now):
+        if not self._has_conservative_budget(checkpoint, remaining):
             return AnchorAcquisitionResult(
                 status=AnchorAcquisitionStatus.ANCHOR_UNAVAILABLE,
                 checkpoint=checkpoint,
                 failure_reason="insufficient conservative budget for remaining confirmations",
             )
 
-        stock_task = asyncio.create_task(
-            self._provider.fetch_close(stock_symbol, checkpoint.target_session_date, checkpoint.deadline_utc)
-        )
-        etf_task = asyncio.create_task(
-            self._provider.fetch_close(etf_symbol, checkpoint.target_session_date, checkpoint.deadline_utc)
-        )
-        outcomes = await asyncio.gather(stock_task, etf_task, return_exceptions=True)
+        try:
+            outcomes = await budget.wait(
+                self._fetch_pair(checkpoint, stock_symbol, etf_symbol, budget),
+                "paired Yahoo gather",
+            )
+        except asyncio.CancelledError:
+            raise
+        except YahooDeadlineExceeded:
+            return self._deadline_result(checkpoint, "Yahoo pair reached the absolute deadline")
         for outcome in outcomes:
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
         failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-        successful_observations = [outcome for outcome in outcomes if isinstance(outcome, YahooCloseObservation)]
+        successful_legs = [outcome for outcome in outcomes if isinstance(outcome, _PairLegOutcome)]
         round_time = max(
             [now, _validate_utc(self._utc_clock(), "UTC clock")]
-            + [observation.received_at_utc for observation in successful_observations]
+            + [leg.observation.received_at_utc for leg in successful_legs]
         )
         if failures:
             reason = "; ".join(str(failure) or type(failure).__name__ for failure in failures)
             return self._failed_round(checkpoint, round_time, reason)
 
-        stock_observation, etf_observation = outcomes
-        if not isinstance(stock_observation, YahooCloseObservation) or not isinstance(
-            etf_observation, YahooCloseObservation
-        ):
+        stock_leg, etf_leg = outcomes
+        if not isinstance(stock_leg, _PairLegOutcome) or not isinstance(etf_leg, _PairLegOutcome):
             return self._failed_round(checkpoint, round_time, "Yahoo provider returned an invalid observation")
-        self._validate_observation(stock_observation, stock_symbol, checkpoint.target_session_date)
-        self._validate_observation(etf_observation, etf_symbol, checkpoint.target_session_date)
+        stock_observation = stock_leg.observation
+        etf_observation = etf_leg.observation
+        try:
+            self._validate_observation_window(stock_observation, stock_symbol, checkpoint)
+            self._validate_observation_window(etf_observation, etf_symbol, checkpoint)
+        except (TypeError, ValueError) as exception:
+            return self._failed_round(checkpoint, round_time, str(exception))
         round_time = max(round_time, stock_observation.received_at_utc, etf_observation.received_at_utc)
         if round_time >= checkpoint.deadline_utc:
-            failed_checkpoint = self._cleared_checkpoint(checkpoint, round_time)
-            return AnchorAcquisitionResult(
-                status=AnchorAcquisitionStatus.ANCHOR_UNAVAILABLE,
-                checkpoint=failed_checkpoint,
-                failure_reason="Yahoo pair completed at or after the absolute deadline",
-            )
+            return self._deadline_result(checkpoint, "Yahoo pair completed at or after the absolute deadline")
+        try:
+            budget.ensure_remaining("paired Yahoo validation")
+        except YahooDeadlineExceeded:
+            return self._deadline_result(checkpoint, "Yahoo pair reached the absolute deadline")
 
-        skew = abs((stock_observation.received_at_utc - etf_observation.received_at_utc).total_seconds())
-        if skew > self._nav_config.anchor_pair_fetch_max_skew_seconds:
+        utc_skew = abs((stock_observation.received_at_utc - etf_observation.received_at_utc).total_seconds())
+        if utc_skew > self._nav_config.anchor_pair_fetch_max_skew_seconds:
             return self._failed_round(
                 checkpoint,
                 round_time,
                 "paired Yahoo receive skew exceeds configured maximum",
+            )
+        monotonic_skew = abs(stock_leg.completed_monotonic - etf_leg.completed_monotonic)
+        if monotonic_skew > self._nav_config.anchor_pair_fetch_max_skew_seconds:
+            return self._failed_round(
+                checkpoint,
+                round_time,
+                "paired Yahoo monotonic completion skew exceeds configured maximum",
             )
         return self._accept_pair(checkpoint, stock_observation, etf_observation, round_time)
 
@@ -540,22 +590,24 @@ class YahooAnchorAcquisition:
     ) -> AnchorAcquisitionResult:
         self._validate_checkpoint_for_config(checkpoint)
         current = checkpoint
-        monotonic_deadline = self._monotonic_clock() + max(
-            0.0,
-            (checkpoint.deadline_utc - self._utc_clock()).total_seconds(),
-        )
+        budget = self._budget_for(checkpoint)
         while True:
-            if self._monotonic_clock() >= monotonic_deadline:
-                return AnchorAcquisitionResult(
-                    status=AnchorAcquisitionStatus.ANCHOR_UNAVAILABLE,
-                    checkpoint=current,
-                    failure_reason="absolute Yahoo anchor deadline elapsed",
-                )
-            result = await self.advance(current, stock_symbol, etf_symbol)
+            if budget.remaining_seconds() <= 0:
+                return self._deadline_result(current)
+            result = await self.advance(
+                current,
+                stock_symbol,
+                etf_symbol,
+                budget=budget,
+            )
             if result.checkpoint.revision != current.revision and on_checkpoint is not None:
-                callback_result = on_checkpoint(result.checkpoint)
-                if inspect.isawaitable(callback_result):
-                    await callback_result
+                try:
+                    await self._run_checkpoint_callback(on_checkpoint, result.checkpoint, budget)
+                except YahooDeadlineExceeded:
+                    return self._deadline_result(
+                        result.checkpoint,
+                        "checkpoint callback reached the absolute deadline",
+                    )
             current = result.checkpoint
             if result.status in {
                 AnchorAcquisitionStatus.FINALIZABLE,
@@ -563,18 +615,15 @@ class YahooAnchorAcquisition:
             }:
                 return result
 
-            minimum_finalize_at = current.official_close_utc + timedelta(
-                seconds=self._nav_config.anchor_min_finalize_delay_seconds
-            )
-            due_at = max(current.next_poll_utc, minimum_finalize_at)
-            now = self._utc_clock()
-            delay = max(0.0, (due_at - now).total_seconds())
-            wall_remaining = max(0.0, (current.deadline_utc - now).total_seconds())
-            monotonic_remaining = max(0.0, monotonic_deadline - self._monotonic_clock())
-            remaining = min(wall_remaining, monotonic_remaining)
-            if remaining <= 0:
-                continue
-            await self._sleep(min(delay, remaining))
+            now = _validate_utc(self._utc_clock(), "UTC clock")
+            delay = max(0.0, (current.next_poll_utc - now).total_seconds())
+            try:
+                await budget.wait(
+                    self._sleep(min(delay, budget.ensure_remaining("inter-round sleep"))),
+                    "inter-round sleep",
+                )
+            except YahooDeadlineExceeded:
+                return self._deadline_result(current)
 
     def assess_finalized(
         self,
@@ -642,7 +691,10 @@ class YahooAnchorAcquisition:
             prior_received_at = max(checkpoint.stock_received_at_utc, checkpoint.etf_received_at_utc)
             confirmation_elapsed = (current_received_at - prior_received_at).total_seconds()
             if confirmation_elapsed >= self._nav_config.anchor_confirmation_interval_seconds:
-                confirmation_count = checkpoint.confirmation_count + 1
+                confirmation_count = min(
+                    self._nav_config.anchor_confirmation_count,
+                    checkpoint.confirmation_count + 1,
+                )
                 stock_close = stock.close
                 etf_close = etf.close
                 stock_hash = stock.raw_response_hash
@@ -669,6 +721,11 @@ class YahooAnchorAcquisition:
                 self._poll_interval(attempt),
             )
             next_poll = current_received_at + timedelta(seconds=interval)
+        minimum_finalize_at = checkpoint.official_close_utc + timedelta(
+            seconds=self._nav_config.anchor_min_finalize_delay_seconds
+        )
+        if confirmation_count >= self._nav_config.anchor_confirmation_count and round_time < minimum_finalize_at:
+            next_poll = max(next_poll, minimum_finalize_at)
         next_poll = min(checkpoint.deadline_utc, next_poll)
         updated = replace(
             checkpoint,
@@ -683,7 +740,10 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=etf_received_at,
             revision=checkpoint.revision + 1,
         )
-        if confirmation_count < self._nav_config.anchor_confirmation_count:
+        if (
+            confirmation_count < self._nav_config.anchor_confirmation_count
+            or round_time < minimum_finalize_at
+        ):
             return AnchorAcquisitionResult(status=AnchorAcquisitionStatus.POLLING, checkpoint=updated)
 
         evidence_hash = anchor_evidence_hash(
@@ -758,12 +818,23 @@ class YahooAnchorAcquisition:
         )
 
     def _poll_interval(self, attempt: int) -> int:
-        return min(
-            self._nav_config.anchor_poll_initial_interval_seconds * (2 ** max(0, attempt - 1)),
-            self._nav_config.anchor_poll_max_interval_seconds,
-        )
+        if isinstance(attempt, bool) or not isinstance(attempt, int):
+            raise TypeError("attempt must be an integer")
+        if attempt >= self._poll_saturation_attempt:
+            return self._nav_config.anchor_poll_max_interval_seconds
+        exponent = max(0, int(attempt) - 1)
+        return self._nav_config.anchor_poll_initial_interval_seconds * (2 ** exponent)
 
-    def _has_conservative_budget(self, checkpoint: AnchorPollingCheckpoint, now: datetime) -> bool:
+    def _calculate_poll_saturation_attempt(self) -> int:
+        attempt = 1
+        interval = self._nav_config.anchor_poll_initial_interval_seconds
+        maximum = self._nav_config.anchor_poll_max_interval_seconds
+        while interval < maximum:
+            interval = min(maximum, interval * 2)
+            attempt += 1
+        return attempt
+
+    def _has_conservative_budget(self, checkpoint: AnchorPollingCheckpoint, remaining_seconds: float) -> bool:
         remaining_rounds = max(
             1,
             self._nav_config.anchor_confirmation_count - checkpoint.confirmation_count,
@@ -777,11 +848,112 @@ class YahooAnchorAcquisition:
             self._nav_config.anchor_poll_max_interval_seconds,
         )
         required_seconds = remaining_rounds * round_budget + max(0, remaining_rounds - 1) * between_rounds
-        return (checkpoint.deadline_utc - now).total_seconds() >= required_seconds
+        return remaining_seconds >= required_seconds
+
+    def _budget_for(self, checkpoint: AnchorPollingCheckpoint) -> YahooCycleBudget:
+        key = (checkpoint.cycle_id, checkpoint.deadline_utc)
+        if self._active_budget is None or self._active_budget_key != key:
+            self._active_budget = YahooCycleBudget.start(
+                deadline_utc=checkpoint.deadline_utc,
+                utc_clock=self._utc_clock,
+                monotonic_clock=self._monotonic_clock,
+            )
+            self._active_budget_key = key
+        return self._active_budget
+
+    async def _fetch_pair(
+        self,
+        checkpoint: AnchorPollingCheckpoint,
+        stock_symbol: str,
+        etf_symbol: str,
+        budget: YahooCycleBudget,
+    ) -> list[Any]:
+        async def fetch_leg(symbol: str):
+            observation = await self._provider.fetch_close(
+                symbol,
+                checkpoint.target_session_date,
+                checkpoint.deadline_utc,
+                budget=budget,
+            )
+            if not isinstance(observation, YahooCloseObservation):
+                return observation
+            return _PairLegOutcome(
+                observation=observation,
+                completed_monotonic=self._monotonic_clock(),
+            )
+
+        tasks = [
+            asyncio.create_task(fetch_leg(stock_symbol)),
+            asyncio.create_task(fetch_leg(etf_symbol)),
+        ]
+
+        def cancel_sibling_after_leg_cancellation(completed: asyncio.Task) -> None:
+            if completed.cancelled():
+                for task in tasks:
+                    if task is not completed and not task.done():
+                        task.cancel()
+
+        for task in tasks:
+            task.add_done_callback(cancel_sibling_after_leg_cancellation)
+        try:
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _run_checkpoint_callback(
+        self,
+        callback: Callable[[AnchorPollingCheckpoint], Any],
+        checkpoint: AnchorPollingCheckpoint,
+        budget: YahooCycleBudget,
+    ) -> None:
+        if inspect.iscoroutinefunction(callback):
+            await budget.wait(callback(checkpoint), "checkpoint callback")
+            return
+        callback_result = await budget.wait(
+            asyncio.to_thread(callback, checkpoint),
+            "checkpoint callback",
+        )
+        if inspect.isawaitable(callback_result):
+            await budget.wait(callback_result, "checkpoint callback awaitable")
+
+    @staticmethod
+    def _deadline_result(
+        checkpoint: AnchorPollingCheckpoint,
+        reason: str = "absolute Yahoo anchor deadline elapsed",
+    ) -> AnchorAcquisitionResult:
+        return AnchorAcquisitionResult(
+            status=AnchorAcquisitionStatus.ANCHOR_UNAVAILABLE,
+            checkpoint=checkpoint,
+            failure_reason=reason,
+        )
+
+    def _validate_exact_official_close(
+        self,
+        target_session_date: date,
+        official_close_utc: datetime,
+    ) -> None:
+        try:
+            expected_close = self._calendar.official_close_for_session(target_session_date)
+        except (CalendarRangeError, TypeError, ValueError) as exception:
+            raise CheckpointIntegrityError(
+                "target session date is not a valid XNYS session"
+            ) from exception
+        if official_close_utc != expected_close:
+            raise CheckpointIntegrityError(
+                "official close does not match the exact XNYS session schedule"
+            )
 
     def _validate_checkpoint_for_config(self, checkpoint: AnchorPollingCheckpoint) -> None:
         if not isinstance(checkpoint, AnchorPollingCheckpoint):
             raise TypeError("checkpoint must be an AnchorPollingCheckpoint")
+        self._validate_exact_official_close(
+            checkpoint.target_session_date,
+            checkpoint.official_close_utc,
+        )
         expected_deadline = checkpoint.official_close_utc + timedelta(
             seconds=self._nav_config.anchor_wait_timeout_seconds
         )
@@ -793,6 +965,20 @@ class YahooAnchorAcquisition:
             skew = abs((checkpoint.stock_received_at_utc - checkpoint.etf_received_at_utc).total_seconds())
             if skew > self._nav_config.anchor_pair_fetch_max_skew_seconds:
                 raise CheckpointIntegrityError("checkpoint paired receive skew exceeds the configured maximum")
+
+    def _validate_observation_window(
+        self,
+        observation: YahooCloseObservation,
+        expected_symbol: str,
+        checkpoint: AnchorPollingCheckpoint,
+    ) -> None:
+        self._validate_observation(
+            observation,
+            expected_symbol,
+            checkpoint.target_session_date,
+        )
+        if not checkpoint.official_close_utc <= observation.received_at_utc < checkpoint.deadline_utc:
+            raise ValueError("Yahoo observation receive time is outside the post-close acquisition window")
 
     @staticmethod
     def _validate_symbol(symbol: object, field_name: str) -> str:

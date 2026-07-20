@@ -12,6 +12,11 @@ from zoneinfo import ZoneInfo
 UTC = timezone.utc
 NEW_YORK = ZoneInfo("America/New_York")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_EVENT_KEY_PATTERN = re.compile(r"^[1-9][0-9]*$")
+_SPLIT_RATIO_PATTERN = re.compile(
+    r"^(?P<numerator>[1-9][0-9]*(?:\.[0-9]*[1-9])?):"
+    r"(?P<denominator>[1-9][0-9]*(?:\.[0-9]*[1-9])?)$"
+)
 
 
 class YahooChartParseError(ValueError):
@@ -201,8 +206,26 @@ class YahooChartParser:
                 raise YahooChartParseError(f"unsupported corporate action group {group_name}")
             group = self._mapping(raw_events, f"events.{group_name}")
             for event_key, raw_event in group.items():
+                if not isinstance(event_key, str) or _EVENT_KEY_PATTERN.fullmatch(event_key) is None:
+                    raise YahooChartParseError(
+                        f"events.{group_name} event key must be a positive integer Unix timestamp"
+                    )
+                try:
+                    key_value = int(event_key)
+                except ValueError as exception:
+                    raise YahooChartParseError(
+                        f"events.{group_name} event key must be a positive integer Unix timestamp"
+                    ) from exception
+                key_timestamp = self._unix_timestamp(key_value, f"events.{group_name}.{event_key} key")
                 event = self._mapping(raw_event, f"events.{group_name}.{event_key}")
-                self._unix_timestamp(event.get("date"), f"events.{group_name}.{event_key}.date")
+                event_timestamp = self._unix_timestamp(
+                    event.get("date"),
+                    f"events.{group_name}.{event_key}.date",
+                )
+                if event_timestamp != key_timestamp:
+                    raise YahooChartParseError(
+                        f"events.{group_name}.{event_key} event key does not match date"
+                    )
                 if group_name in {"dividends", "capitalGains"}:
                     self._numeric_decimal(
                         event.get("amount"),
@@ -211,12 +234,33 @@ class YahooChartParser:
                         nullable=False,
                     )
                 else:
-                    for field_name in ("numerator", "denominator"):
-                        self._numeric_decimal(
-                            event.get(field_name),
-                            f"events.{group_name}.{event_key}.{field_name}",
-                            positive=True,
-                            nullable=False,
+                    numerator = self._numeric_decimal(
+                        event.get("numerator"),
+                        f"events.{group_name}.{event_key}.numerator",
+                        positive=True,
+                        nullable=False,
+                    )
+                    denominator = self._numeric_decimal(
+                        event.get("denominator"),
+                        f"events.{group_name}.{event_key}.denominator",
+                        positive=True,
+                        nullable=False,
+                    )
+                    split_ratio = event.get("splitRatio")
+                    if not isinstance(split_ratio, str):
+                        raise YahooChartParseError(
+                            f"events.{group_name}.{event_key}.splitRatio must use numerator:denominator syntax"
+                        )
+                    ratio_match = _SPLIT_RATIO_PATTERN.fullmatch(split_ratio)
+                    if ratio_match is None:
+                        raise YahooChartParseError(
+                            f"events.{group_name}.{event_key}.splitRatio must use numerator:denominator syntax"
+                        )
+                    ratio_numerator = Decimal(ratio_match.group("numerator"))
+                    ratio_denominator = Decimal(ratio_match.group("denominator"))
+                    if ratio_numerator != numerator or ratio_denominator != denominator:
+                        raise YahooChartParseError(
+                            f"events.{group_name}.{event_key}.splitRatio is inconsistent with split fields"
                         )
 
     @staticmethod

@@ -248,6 +248,22 @@ class XnysNavCalendar:
             force_market_flatten_required=force_market_flatten_required,
         )
 
+    def official_close_for_session(self, session_date: date) -> datetime:
+        """Return the exact official close for an XNYS session date.
+
+        A holiday or weekend is not silently shifted to an adjacent session. This
+        makes persisted NAV-cycle dates safe to validate independently of an
+        observation clock.
+        """
+
+        if not isinstance(session_date, date) or isinstance(session_date, datetime):
+            raise TypeError("session_date must be a date")
+        self._validate_supported_date(session_date)
+        if not self._calendar.is_session(session_date):
+            raise ValueError(f"date {session_date.isoformat()} is not an XNYS session")
+        session = self._calendar.date_to_session(session_date)
+        return self._session_close(session)
+
     @staticmethod
     def _validate_supported_date(local_date: date) -> None:
         if not SUPPORTED_START_DATE <= local_date <= SUPPORTED_END_DATE:

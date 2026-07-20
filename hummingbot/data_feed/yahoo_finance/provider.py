@@ -1,11 +1,14 @@
 import asyncio
+import inspect
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import date, datetime, timezone
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+
+import aiohttp
 
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.api_throttler.data_types import RateLimit
@@ -16,7 +19,9 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import NavConfig
 
 
 YAHOO_CHART_RATE_LIMIT_ID = "yahoo_finance_chart_http"
+YAHOO_MAX_CHART_RESPONSE_BYTES = 1024 * 1024
 _YAHOO_RATE_LIMITS = [RateLimit(limit_id=YAHOO_CHART_RATE_LIMIT_ID, limit=8, time_interval=1.0)]
+_TRANSPORT_ERRORS = (OSError, aiohttp.ClientError)
 
 
 class YahooHTTPError(IOError):
@@ -27,12 +32,95 @@ class YahooDeadlineExceeded(YahooHTTPError):
     """Raised when the original absolute acquisition deadline has elapsed."""
 
 
+class YahooResponseError(YahooHTTPError):
+    """Raised for an untrusted HTTP response that must not trigger host failover."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+def _validate_deadline(deadline_utc: datetime) -> None:
+    if (
+        not isinstance(deadline_utc, datetime)
+        or deadline_utc.tzinfo is None
+        or deadline_utc.utcoffset() != timezone.utc.utcoffset(deadline_utc)
+    ):
+        raise TypeError("deadline_utc must be an aware UTC datetime")
+
+
+class YahooCycleBudget:
+    """One conservative wall-plus-monotonic budget for an entire NAV cycle."""
+
+    def __init__(
+        self,
+        deadline_utc: datetime,
+        monotonic_deadline: float,
+        utc_clock: Callable[[], datetime],
+        monotonic_clock: Callable[[], float],
+    ):
+        _validate_deadline(deadline_utc)
+        self.deadline_utc = deadline_utc
+        self.monotonic_deadline = monotonic_deadline
+        self._utc_clock = utc_clock
+        self._monotonic_clock = monotonic_clock
+
+    @classmethod
+    def start(
+        cls,
+        deadline_utc: datetime,
+        utc_clock: Callable[[], datetime],
+        monotonic_clock: Callable[[], float],
+    ) -> "YahooCycleBudget":
+        _validate_deadline(deadline_utc)
+        wall_remaining = max(0.0, (deadline_utc - utc_clock()).total_seconds())
+        return cls(
+            deadline_utc=deadline_utc,
+            monotonic_deadline=monotonic_clock() + wall_remaining,
+            utc_clock=utc_clock,
+            monotonic_clock=monotonic_clock,
+        )
+
+    def remaining_seconds(self) -> float:
+        wall_remaining = (self.deadline_utc - self._utc_clock()).total_seconds()
+        monotonic_remaining = self.monotonic_deadline - self._monotonic_clock()
+        return max(0.0, min(wall_remaining, monotonic_remaining))
+
+    def ensure_remaining(self, operation: str) -> float:
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            raise YahooDeadlineExceeded(f"{operation} completed at or after the Yahoo acquisition deadline")
+        return remaining
+
+    async def wait(self, awaitable, operation: str, *, check_after: bool = True):
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            self._discard_unstarted(awaitable)
+            raise YahooDeadlineExceeded(f"Yahoo acquisition deadline elapsed before {operation}")
+        try:
+            result = await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as exception:
+            if self.remaining_seconds() <= 0:
+                raise YahooDeadlineExceeded(
+                    f"Yahoo acquisition deadline elapsed during {operation}"
+                ) from exception
+            raise
+        if check_after:
+            self.ensure_remaining(operation)
+        return result
+
+    @staticmethod
+    def _discard_unstarted(awaitable) -> None:
+        if inspect.iscoroutine(awaitable):
+            awaitable.close()
+        elif isinstance(awaitable, asyncio.Future):
+            awaitable.cancel()
+
+
 class YahooChartProvider:
-    """Fetches raw Yahoo chart text through Hummingbot's shared REST lifecycle."""
+    """Fetch raw Yahoo chart bytes through Hummingbot's shared REST lifecycle."""
 
     def __init__(
         self,
@@ -55,6 +143,9 @@ class YahooChartProvider:
         self._sleep = sleep
         self._jitter = jitter
         self._parser = parser or YahooChartParser()
+        self._approved_hosts = {
+            urlsplit(base_url).hostname for base_url in self._nav_config.yahoo_base_urls
+        }
 
     @property
     def web_assistants_factory(self) -> WebAssistantsFactory:
@@ -65,103 +156,211 @@ class YahooChartProvider:
         symbol: str,
         target_session_date: date,
         deadline_utc: datetime,
+        *,
+        budget: YahooCycleBudget | None = None,
     ) -> YahooCloseObservation:
-        self._validate_deadline(deadline_utc)
-        monotonic_deadline = self._monotonic_clock() + max(
-            0.0,
-            (deadline_utc - self._utc_clock()).total_seconds(),
-        )
-        if self._remaining_seconds(deadline_utc, monotonic_deadline) <= 0:
-            raise YahooDeadlineExceeded("Yahoo acquisition deadline has elapsed")
+        _validate_deadline(deadline_utc)
+        if budget is None:
+            budget = YahooCycleBudget.start(
+                deadline_utc=deadline_utc,
+                utc_clock=self._utc_clock,
+                monotonic_clock=self._monotonic_clock,
+            )
+        elif budget.deadline_utc != deadline_utc:
+            raise ValueError("Yahoo cycle budget deadline does not match the requested deadline")
+        budget.ensure_remaining("Yahoo request")
 
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        try:
+            rest_assistant = await budget.wait(
+                self._web_assistants_factory.get_rest_assistant(),
+                "WebAssistantsFactory acquisition",
+            )
+        except asyncio.CancelledError:
+            raise
+        except YahooDeadlineExceeded:
+            raise
+        except _TRANSPORT_ERRORS as exception:
+            raise YahooHTTPError(f"Yahoo REST assistant acquisition failed: {exception}") from exception
+
         encoded_symbol = quote(symbol, safe="")
         last_error: BaseException | None = None
         rate_limit_attempt = 0
 
-        for base_index, base_url in enumerate(self._nav_config.yahoo_base_urls):
-            remaining = self._remaining_seconds(deadline_utc, monotonic_deadline)
-            if remaining <= 0:
-                raise YahooDeadlineExceeded("Yahoo acquisition deadline has elapsed") from last_error
+        for base_url in self._nav_config.yahoo_base_urls:
             request_url = f"{base_url}/v8/finance/chart/{encoded_symbol}"
-            timeout = min(self._nav_config.anchor_http_request_timeout_seconds, remaining)
+            rate_limit_retry_used = False
+            while True:
+                try:
+                    status, raw_bytes, source_url = await self._request_host(
+                        rest_assistant=rest_assistant,
+                        request_url=request_url,
+                        symbol=symbol,
+                        budget=budget,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except YahooDeadlineExceeded:
+                    raise
+                except YahooHTTPError:
+                    raise
+                except _TRANSPORT_ERRORS as exception:
+                    last_error = exception
+                    break
+
+                if status == 200:
+                    assert raw_bytes is not None
+                    try:
+                        raw_text = raw_bytes.decode("utf-8", errors="strict")
+                    except UnicodeDecodeError as exception:
+                        raise YahooResponseError(
+                            "Yahoo HTTP 200 chart body is not valid UTF-8"
+                        ) from exception
+                    received_at = self._utc_clock()
+                    budget.ensure_remaining("Yahoo response parsing")
+                    observation = self._parser.parse(
+                        raw_text=raw_text,
+                        expected_symbol=symbol,
+                        target_session_date=target_session_date,
+                        received_at_utc=received_at,
+                        source_url=source_url,
+                    )
+                    budget.ensure_remaining("Yahoo response parsing")
+                    return observation
+
+                if status == 429:
+                    last_error = YahooHTTPError(f"Yahoo returned HTTP 429 from {base_url}")
+                    if rate_limit_retry_used:
+                        raise last_error
+                    backoff = min(
+                        self._nav_config.anchor_poll_initial_interval_seconds * (2 ** rate_limit_attempt),
+                        self._nav_config.anchor_poll_max_interval_seconds,
+                    )
+                    rate_limit_attempt += 1
+                    jitter = self._jitter(float(backoff))
+                    if not isinstance(jitter, (int, float)) or isinstance(jitter, bool) or not math.isfinite(jitter):
+                        raise ValueError("Yahoo backoff jitter must be a finite number")
+                    if jitter < 0 or jitter > backoff:
+                        raise ValueError("Yahoo backoff jitter must be between zero and the backoff bound")
+                    delay = min(float(backoff) + float(jitter), budget.ensure_remaining("Yahoo 429 backoff"))
+                    await budget.wait(self._sleep(delay), "Yahoo 429 backoff")
+                    rate_limit_retry_used = True
+                    continue
+
+                if 500 <= status <= 599:
+                    last_error = YahooHTTPError(f"Yahoo returned HTTP {status} from {base_url}")
+                    break
+                raise YahooHTTPError(f"Yahoo returned non-success HTTP status {status} from {base_url}")
+
+        raise YahooHTTPError("Yahoo request failed on all approved hosts") from last_error
+
+    async def _request_host(
+        self,
+        rest_assistant,
+        request_url: str,
+        symbol: str,
+        budget: YahooCycleBudget,
+    ) -> tuple[int, bytes | None, str]:
+        timeout = min(
+            self._nav_config.anchor_http_request_timeout_seconds,
+            budget.ensure_remaining("Yahoo HTTP attempt"),
+        )
+        response = await budget.wait(
+            rest_assistant.execute_request_and_get_response(
+                url=request_url,
+                throttler_limit_id=YAHOO_CHART_RATE_LIMIT_ID,
+                params={
+                    "range": self._nav_config.yahoo_chart_range,
+                    "interval": self._nav_config.yahoo_chart_interval,
+                    "events": "div,splits",
+                    "includePrePost": str(self._nav_config.yahoo_include_pre_post).lower(),
+                },
+                method=RESTMethod.GET,
+                return_err=True,
+                timeout=timeout,
+                headers={"User-Agent": self._nav_config.yahoo_user_agent},
+            ),
+            "Yahoo throttler and HTTP request",
+            check_after=False,
+        )
+        try:
+            budget.ensure_remaining("Yahoo throttler and HTTP request")
+            source_url = self._validate_final_url(response.url, symbol)
             try:
-                response = await rest_assistant.execute_request_and_get_response(
-                    url=request_url,
-                    throttler_limit_id=YAHOO_CHART_RATE_LIMIT_ID,
-                    params={
-                        "range": self._nav_config.yahoo_chart_range,
-                        "interval": self._nav_config.yahoo_chart_interval,
-                        "events": "div,splits",
-                        "includePrePost": str(self._nav_config.yahoo_include_pre_post).lower(),
-                    },
-                    method=RESTMethod.GET,
-                    return_err=True,
-                    timeout=timeout,
-                    headers={"User-Agent": self._nav_config.yahoo_user_agent},
-                )
-                raw_text = await response.text()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exception:
-                last_error = exception
-                if base_index + 1 < len(self._nav_config.yahoo_base_urls):
-                    continue
-                raise YahooHTTPError(f"Yahoo request failed on all approved hosts: {exception}") from exception
-
-            received_at = self._utc_clock()
-            if self._remaining_seconds(deadline_utc, monotonic_deadline) <= 0:
-                raise YahooDeadlineExceeded("Yahoo response completed at or after the acquisition deadline")
-
-            status = response.status
+                status = int(response.status)
+            except (TypeError, ValueError) as exception:
+                raise YahooResponseError("Yahoo response status is invalid") from exception
+            raw_bytes = None
             if status == 200:
-                return self._parser.parse(
-                    raw_text=raw_text,
-                    expected_symbol=symbol,
-                    target_session_date=target_session_date,
-                    received_at_utc=received_at,
-                    source_url=request_url,
-                )
-            if status == 429:
-                last_error = YahooHTTPError(f"Yahoo returned HTTP 429 from {base_url}")
-                if base_index + 1 >= len(self._nav_config.yahoo_base_urls):
-                    raise last_error
-                backoff = min(
-                    self._nav_config.anchor_poll_initial_interval_seconds * (2**rate_limit_attempt),
-                    self._nav_config.anchor_poll_max_interval_seconds,
-                )
-                rate_limit_attempt += 1
-                jitter = self._jitter(float(backoff))
-                if not isinstance(jitter, (int, float)) or isinstance(jitter, bool) or not math.isfinite(jitter):
-                    raise ValueError("Yahoo backoff jitter must be a finite number")
-                if jitter < 0 or jitter > backoff:
-                    raise ValueError("Yahoo backoff jitter must be between zero and the backoff bound")
-                remaining = self._remaining_seconds(deadline_utc, monotonic_deadline)
-                if remaining <= 0:
-                    raise YahooDeadlineExceeded("Yahoo acquisition deadline has elapsed") from last_error
-                await self._sleep(min(float(backoff) + float(jitter), remaining))
-                if self._remaining_seconds(deadline_utc, monotonic_deadline) <= 0:
-                    raise YahooDeadlineExceeded("Yahoo 429 backoff reached the acquisition deadline") from last_error
-                continue
-            if 500 <= status <= 599:
-                last_error = YahooHTTPError(f"Yahoo returned HTTP {status} from {base_url}")
-                if base_index + 1 < len(self._nav_config.yahoo_base_urls):
-                    continue
-                raise last_error
-            raise YahooHTTPError(f"Yahoo returned non-success HTTP status {status} from {base_url}")
+                raw_bytes = await self._read_response_body(response, budget)
+            return status, raw_bytes, source_url
+        finally:
+            self._release_response(response)
 
-        raise YahooHTTPError("Yahoo request exhausted approved hosts") from last_error
+    async def _read_response_body(self, response, budget: YahooCycleBudget) -> bytes:
+        headers = response.headers
+        if headers is not None and isinstance(headers, Mapping):
+            content_length = headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except (TypeError, ValueError) as exception:
+                    raise YahooResponseError("Yahoo Content-Length is invalid") from exception
+                if declared_length < 0 or declared_length > YAHOO_MAX_CHART_RESPONSE_BYTES:
+                    raise YahooResponseError("Yahoo chart response exceeds the body-size limit")
 
-    def _remaining_seconds(self, deadline_utc: datetime, monotonic_deadline: float) -> float:
-        wall_remaining = (deadline_utc - self._utc_clock()).total_seconds()
-        monotonic_remaining = monotonic_deadline - self._monotonic_clock()
-        return max(0.0, min(wall_remaining, monotonic_remaining))
+        limited_reader = getattr(response, "read_limited", None)
+        try:
+            if callable(limited_reader):
+                body = await budget.wait(
+                    limited_reader(YAHOO_MAX_CHART_RESPONSE_BYTES),
+                    "Yahoo response body read",
+                )
+            else:
+                text_body = await budget.wait(response.text(), "Yahoo response body read")
+                body = text_body.encode("utf-8")
+                if len(body) > YAHOO_MAX_CHART_RESPONSE_BYTES:
+                    raise YahooResponseError("Yahoo chart response exceeds the body-size limit")
+        except asyncio.CancelledError:
+            raise
+        except YahooDeadlineExceeded:
+            raise
+        except YahooResponseError:
+            raise
+        except ValueError as exception:
+            raise YahooResponseError("Yahoo chart response exceeds the body-size limit") from exception
+        if not isinstance(body, bytes):
+            raise YahooResponseError("Yahoo chart response body is not bytes")
+        return body
+
+    def _validate_final_url(self, value: object, symbol: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise YahooResponseError("Yahoo response does not expose its final URL")
+        parsed = urlsplit(value)
+        expected_path = f"/v8/finance/chart/{quote(symbol, safe='')}"
+        try:
+            final_port = parsed.port
+        except ValueError as exception:
+            raise YahooResponseError("Yahoo response final URL contains an invalid port") from exception
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in self._approved_hosts
+            or final_port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != expected_path
+            or parsed.fragment
+        ):
+            raise YahooResponseError("Yahoo response final URL is outside the approved chart endpoints")
+        return value
 
     @staticmethod
-    def _validate_deadline(deadline_utc: datetime) -> None:
-        if (
-            not isinstance(deadline_utc, datetime)
-            or deadline_utc.tzinfo is None
-            or deadline_utc.utcoffset() != timezone.utc.utcoffset(deadline_utc)
-        ):
-            raise TypeError("deadline_utc must be an aware UTC datetime")
+    def _release_response(response) -> None:
+        release = getattr(response, "release", None)
+        if not callable(release):
+            return
+        try:
+            result = release()
+        except Exception:
+            return
+        if inspect.isawaitable(result):
+            result.close()
