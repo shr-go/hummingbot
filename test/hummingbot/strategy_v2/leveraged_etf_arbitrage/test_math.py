@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import json
 import pickle
 from dataclasses import FrozenInstanceError, asdict, dataclass, fields, is_dataclass
@@ -45,6 +47,31 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.math import (
 D = Decimal
 
 
+def raw_etf_price(value: Decimal):
+    return getattr(decimal_policy, "RawExactDecision").etf_price(value)
+
+
+def raw_net_bp(value: Decimal):
+    return getattr(decimal_policy, "RawExactDecision").net_bp(value)
+
+
+def rehash_decision_fields(fields_payload: dict[str, object]) -> None:
+    payload = {key: value for key, value in fields_payload.items() if key != "integrity_hash"}
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    fields_payload["integrity_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def replace_serialized_operand(
+    fields_payload: dict[str, object],
+    operand_name: str,
+    replacement: str,
+) -> None:
+    fields_payload["operands"] = [
+        [name, replacement if name == operand_name else value]
+        for name, value in fields_payload["operands"]
+    ]
+
+
 @pytest.mark.parametrize(
     ("stock_anchor", "etf_anchor", "multiplier", "stock_price", "expected_h", "expected_theoretical"),
     [
@@ -86,7 +113,7 @@ def test_both_directions_use_contract_multiplier_aware_quantities(
     expected_stock_quantity: Decimal,
 ):
     theoretical = calculate_theoretical_etf_price(D("110"), D("100"), D("50"), D("2"))
-    direction = determine_arbitrage_direction(etf_price, theoretical)
+    direction = determine_arbitrage_direction(raw_etf_price(etf_price), theoretical)
     quantities = calculate_leg_quantities(
         etf_quantity=D("10"),
         direction=direction,
@@ -319,7 +346,7 @@ def test_stock_book_walk_bp(vwap: Decimal, best_quote: Decimal, side: BookSide, 
 def test_entry_tier_lookup_has_nonpositive_zero_exception(net_bp: Decimal, expected_target: Decimal):
     tiers = {D("0"): D("1"), D("22.29"): D("3"), D("44.58"): D("8")}
 
-    assert select_entry_target(net_bp, tiers) == expected_target
+    assert select_entry_target(raw_net_bp(net_bp), tiers) == expected_target
 
 
 def test_entry_confirmation_requires_consecutive_stable_direction_and_target():
@@ -361,12 +388,12 @@ def test_reduce_hysteresis_uses_strict_threshold_and_one_previous_tier(
     tiers = {D("0"): D("1"), D("22.29"): D("3"), D("44.58"): D("8")}
     reductions = {D("1"): D("0"), D("3"): D("17"), D("8"): D("39")}
 
-    assert select_reduce_target(net_bp, current_target, tiers, reductions) == expected_target
+    assert select_reduce_target(raw_net_bp(net_bp), current_target, tiers, reductions) == expected_target
 
 
 def test_reduce_hysteresis_rejects_unknown_current_target():
     with pytest.raises(ValueError, match="current target"):
-        select_reduce_target(D("1"), D("2"), {D("0"): D("1")}, {D("1"): D("0")})
+        select_reduce_target(raw_net_bp(D("1")), D("2"), {D("0"): D("1")}, {D("1"): D("0")})
 
 
 @pytest.mark.parametrize(
@@ -521,7 +548,7 @@ def _risk_decision_snapshot() -> dict[str, object]:
     )
     return {
         "theoretical": theoretical,
-        "direction": determine_arbitrage_direction(D("60.002"), theoretical),
+        "direction": determine_arbitrage_direction(raw_etf_price(D("60.002")), theoretical),
         "hedge_ratio": opportunity.hedge_ratio,
         "quantities": opportunity.quantities,
         "notionals": opportunity.notionals,
@@ -565,10 +592,10 @@ def test_theoretical_direction_uses_exact_zero_and_first_values_on_either_side()
     assert theoretical == D("60.004900")
     assert determine_arbitrage_direction(theoretical, theoretical) is None
     assert determine_arbitrage_direction(
-        theoretical - D("0.000000000000000001"), theoretical
+        raw_etf_price(theoretical.display - D("0.000000000000000001")), theoretical
     ) is ArbitrageDirection.LONG_ETF_SHORT_STOCK
     assert determine_arbitrage_direction(
-        theoretical + D("0.000000000000000001"), theoretical
+        raw_etf_price(theoretical.display + D("0.000000000000000001")), theoretical
     ) is ArbitrageDirection.SHORT_ETF_LONG_STOCK
 
 
@@ -588,7 +615,10 @@ def test_theoretical_direction_retains_exact_provenance_when_display_rounds_acro
     observed_at_displayed_boundary = D(theoretical.display)
 
     assert Fraction(observed_at_displayed_boundary) != exact_theoretical
-    assert determine_arbitrage_direction(observed_at_displayed_boundary, theoretical) is expected_direction
+    assert (
+        determine_arbitrage_direction(raw_etf_price(observed_at_displayed_boundary), theoretical)
+        is expected_direction
+    )
 
 
 def _zero_cost_boundary_opportunity(etf_entry_price: Decimal):
@@ -660,7 +690,7 @@ def test_exact_boundary_decisions_ignore_caller_precision_rounding_and_enabled_i
         assert select_entry_target(opportunity.net_bp, tiers) == D("1")
         assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("1")
         assert (
-            determine_arbitrage_direction(D(theoretical.display), theoretical)
+            determine_arbitrage_direction(raw_etf_price(D(theoretical.display)), theoretical)
             is ArbitrageDirection.SHORT_ETF_LONG_STOCK
         )
         assert str(getcontext()) == str(before)
@@ -710,7 +740,14 @@ def test_decision_value_round_trips_losslessly_across_dataclass_pydantic_json_an
 
     tiers = {D("0"): D("1"), opportunity.net_bp.display: D("3")}
     reductions = {D("1"): D("0"), D("3"): opportunity.net_bp.display}
-    for restored in (dataclass_restored, pydantic_restored, json_restored, pickle_restored):
+    for restored in (
+        dataclass_restored,
+        pydantic_restored,
+        json_restored,
+        pickle_restored,
+        copy.copy(opportunity.net_bp),
+        copy.deepcopy(opportunity.net_bp),
+    ):
         assert restored == opportunity.net_bp
         assert restored.exact_fraction == Fraction(10000, 17001)
         assert select_entry_target(restored, tiers) == D("1")
@@ -742,7 +779,7 @@ def test_missing_or_forged_decision_provenance_is_rejected_and_display_only_is_f
 
     theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
     untrusted_theoretical = decision_type.from_untrusted_derived(theoretical.display)
-    assert determine_arbitrage_direction(theoretical.display, untrusted_theoretical) is None
+    assert determine_arbitrage_direction(raw_etf_price(theoretical.display), untrusted_theoretical) is None
 
 
 @pytest.mark.parametrize(
@@ -778,7 +815,7 @@ def test_direction_uses_exact_contract_after_noop_json_and_pickle_round_trips():
     for preserved in (+theoretical, theoretical + D("0"), json_restored, pickle_restored):
         assert preserved.exact_fraction == Fraction(5, 3)
         assert (
-            determine_arbitrage_direction(D(preserved.display), preserved)
+            determine_arbitrage_direction(raw_etf_price(D(preserved.display)), preserved)
             is ArbitrageDirection.SHORT_ETF_LONG_STOCK
         )
 
@@ -808,13 +845,171 @@ def test_serialized_decision_contract_and_noop_arithmetic_ignore_ambient_context
         assert str(getcontext()) == str(before)
 
 
-def test_plain_decimal_inputs_remain_the_explicit_exact_raw_value_contract():
+def test_exact_derived_values_bind_canonical_semantic_kind_operands_fraction_and_display():
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+
+    assert theoretical.schema_version == 2
+    assert theoretical.certainty.value == "EXACT_DERIVED"
+    assert theoretical.semantic_kind.value == "THEORETICAL_ETF_PRICE"
+    assert theoretical.operands == (
+        ("stock_price", "4"),
+        ("stock_anchor", "3"),
+        ("etf_anchor", "1"),
+        ("etf_daily_multiplier", "2"),
+    )
+    assert theoretical.exact_fraction == Fraction(5, 3)
+    assert theoretical.display == D("1.666666666666666666666666667")
+
+    assert opportunity.net_bp.schema_version == 2
+    assert opportunity.net_bp.certainty.value == "EXACT_DERIVED"
+    assert opportunity.net_bp.semantic_kind.value == "OPPORTUNITY_NET_BP"
+    assert opportunity.net_bp.operands == (
+        ("stock_anchor", "100"),
+        ("etf_anchor", "50"),
+        ("etf_daily_multiplier", "2"),
+        ("stock_entry_price", "110"),
+        ("etf_entry_price", "60.01"),
+        ("etf_quantity", "1"),
+        ("stock_contract_multiplier", "1"),
+        ("etf_contract_multiplier", "1"),
+        ("maker_fee_bp", "0"),
+        ("taker_fee_bp", "0"),
+        ("maker_slippage_bp_per_fill", "0"),
+    )
+    assert opportunity.net_bp.exact_fraction == Fraction(10000, 17001)
+    assert opportunity.net_bp.display == D("0.5882006940768190106464325628")
+
+
+def test_arbitrary_exact_fraction_constructor_cannot_upgrade_display_to_derived_authority():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    display = D("1.666666666666666666666666667")
+
+    with pytest.raises(integrity_error, match="semantic|derived|operands"):
+        decision_type.from_exact_fraction(Fraction(2), display=display)
+    with pytest.raises(integrity_error, match="semantic|derived|operands"):
+        decision_type.from_exact_fraction(Fraction(display), display=display)
+
+
+def test_recomputed_public_hash_cannot_forge_theoretical_exact_fraction():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    forged = theoretical.to_fields()
+    forged["exact_numerator"] = "2"
+    forged["exact_denominator"] = "1"
+    rehash_decision_fields(forged)
+
+    assert (
+        determine_arbitrage_direction(raw_etf_price(theoretical.display), theoretical)
+        is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+    )
+    with pytest.raises(integrity_error, match="recomputed|semantic|fraction"):
+        decision_type.from_fields(json.loads(json.dumps(forged)))
+
+
+def test_recomputed_public_hash_cannot_promote_rounded_net_bp_display_to_exact():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    displayed_fraction = Fraction(opportunity.net_bp.display)
+    forged = opportunity.net_bp.to_fields()
+    forged["exact_numerator"] = str(displayed_fraction.numerator)
+    forged["exact_denominator"] = str(displayed_fraction.denominator)
+    rehash_decision_fields(forged)
+
+    with pytest.raises(integrity_error, match="recomputed|semantic|fraction"):
+        decision_type.from_fields(json.loads(json.dumps(forged)))
+
+
+def test_tampered_semantic_kind_or_operands_are_rejected_even_with_recomputed_hash():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+
+    tampered_operands = opportunity.net_bp.to_fields()
+    replace_serialized_operand(tampered_operands, "stock_entry_price", "111")
+    rehash_decision_fields(tampered_operands)
+
+    tampered_kind = opportunity.net_bp.to_fields()
+    tampered_kind["semantic_kind"] = "THEORETICAL_ETF_PRICE"
+    rehash_decision_fields(tampered_kind)
+
+    stale_hash = opportunity.net_bp.to_fields()
+    replace_serialized_operand(stale_hash, "stock_entry_price", "111")
+
+    for payload in (tampered_operands, tampered_kind, stale_hash):
+        with pytest.raises(integrity_error):
+            decision_type.from_fields(json.loads(json.dumps(payload)))
+
+
+def test_bare_decimal_and_string_display_crossings_fail_closed_for_all_decision_apis():
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    tiers = {D("0"): D("1"), opportunity.net_bp.display: D("3")}
+    reductions = {D("1"): D("0"), D("3"): opportunity.net_bp.display}
+
+    for stripped_net_bp in (opportunity.net_bp.display, D(str(opportunity.net_bp))):
+        assert select_entry_target(stripped_net_bp, tiers) == D("0")
+        assert select_reduce_target(stripped_net_bp, D("3"), tiers, reductions) == D("1")
+
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    for stripped_theoretical in (theoretical.display, D(str(theoretical))):
+        assert determine_arbitrage_direction(raw_etf_price(theoretical.display), stripped_theoretical) is None
+        assert determine_arbitrage_direction(stripped_theoretical, theoretical) is None
+
+
+def test_nonzero_arithmetic_cannot_invent_new_exact_derived_semantics():
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    altered = theoretical + D("0.1")
+
+    assert altered.exact_fraction is None
+    assert determine_arbitrage_direction(raw_etf_price(altered.display), altered) is None
+
+
+def test_raw_exact_contract_is_kind_bound_immutable_and_losslessly_serializable():
+    raw_type = getattr(decimal_policy, "RawExactDecision")
+    theoretical = calculate_theoretical_etf_price(D("110"), D("100"), D("50"), D("2"))
+    raw_price = raw_etf_price(D("62"))
+
+    @dataclass(frozen=True)
+    class DataclassEnvelope:
+        decision: object
+
+    dataclass_restored = raw_type(**asdict(DataclassEnvelope(raw_price))["decision"])
+    pydantic_model = create_model("RawDecisionEnvelope", decision=(raw_type, ...))
+    pydantic_payload = pydantic_model(decision=raw_price).model_dump_json()
+    pydantic_restored = pydantic_model.model_validate_json(pydantic_payload).decision
+    json_restored = raw_type.from_fields(json.loads(json.dumps(raw_price.to_fields())))
+
+    for restored in (
+        dataclass_restored,
+        pydantic_restored,
+        json_restored,
+        pickle.loads(pickle.dumps(raw_price)),
+        copy.copy(raw_price),
+        copy.deepcopy(raw_price),
+    ):
+        assert restored == raw_price
+        assert determine_arbitrage_direction(restored, theoretical) is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+
+    with pytest.raises(FrozenInstanceError):
+        raw_price.value = D("61")
+    assert determine_arbitrage_direction(raw_net_bp(D("62")), theoretical) is None
+    assert select_entry_target(raw_price, {D("0"): D("1")}) == D("0")
+
+
+def test_raw_exact_decision_contract_preserves_explicit_legal_inputs():
     tiers = {D("0"): D("1"), D("22.29"): D("3"), D("44.58"): D("8")}
     reductions = {D("1"): D("0"), D("3"): D("17"), D("8"): D("39")}
+    theoretical = calculate_theoretical_etf_price(D("110"), D("100"), D("50"), D("2"))
 
-    assert determine_arbitrage_direction(D("62"), D("60")) is ArbitrageDirection.SHORT_ETF_LONG_STOCK
-    assert select_entry_target(D("22.29"), tiers) == D("3")
-    assert select_reduce_target(D("17"), D("3"), tiers, reductions) == D("3")
+    assert (
+        determine_arbitrage_direction(raw_etf_price(D("62")), theoretical)
+        is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+    )
+    assert select_entry_target(raw_net_bp(D("22.29")), tiers) == D("3")
+    assert select_reduce_target(raw_net_bp(D("17")), D("3"), tiers, reductions) == D("3")
 
 
 @pytest.mark.parametrize(
