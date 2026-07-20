@@ -172,6 +172,7 @@ def test_raw_cost_and_net_bp_vectors_for_both_directions(
         stock_entry_price=D("110"),
         etf_entry_price=etf_price,
         etf_quantity=D("10"),
+        stock_quantity=D("2.5"),
         stock_contract_multiplier=D("2"),
         etf_contract_multiplier=D("0.5"),
         maker_fee_bp=D("1"),
@@ -241,6 +242,7 @@ def test_entry_depth_impact_is_in_g_once_and_future_exit_impact_is_not_reserved(
         stock_entry_price=D("110"),
         etf_entry_price=D("62"),
         etf_quantity=D("10"),
+        stock_quantity=D("2.5"),
         stock_contract_multiplier=D("2"),
         etf_contract_multiplier=D("0.5"),
         maker_fee_bp=D("0"),
@@ -483,6 +485,7 @@ def test_float_sentinel_guards_every_decision_output():
         stock_entry_price=sentinel("110"),
         etf_entry_price=sentinel("62"),
         etf_quantity=sentinel("10"),
+        stock_quantity=sentinel("2.5"),
         stock_contract_multiplier=sentinel("2"),
         etf_contract_multiplier=sentinel("0.5"),
         maker_fee_bp=sentinel("0"),
@@ -529,6 +532,7 @@ def _risk_decision_snapshot() -> dict[str, object]:
         stock_entry_price=D("110"),
         etf_entry_price=D("60.25"),
         etf_quantity=D("10"),
+        stock_quantity=D("2.5"),
         stock_contract_multiplier=D("2"),
         etf_contract_multiplier=D("0.5"),
         maker_fee_bp=D("1"),
@@ -633,6 +637,7 @@ def _zero_cost_boundary_opportunity(etf_entry_price: Decimal):
         stock_entry_price=D("110"),
         etf_entry_price=etf_entry_price,
         etf_quantity=D("1"),
+        stock_quantity=D("1"),
         stock_contract_multiplier=D("1"),
         etf_contract_multiplier=D("1"),
         maker_fee_bp=D("0"),
@@ -853,7 +858,7 @@ def test_exact_derived_values_bind_canonical_semantic_kind_operands_fraction_and
     theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
     opportunity = _zero_cost_boundary_opportunity(D("60.01"))
 
-    assert theoretical.schema_version == 2
+    assert theoretical.schema_version == 3
     assert theoretical.certainty.value == "EXACT_DERIVED"
     assert theoretical.semantic_kind.value == "THEORETICAL_ETF_PRICE"
     assert theoretical.operands == (
@@ -865,7 +870,7 @@ def test_exact_derived_values_bind_canonical_semantic_kind_operands_fraction_and
     assert theoretical.exact_fraction == Fraction(5, 3)
     assert theoretical.display == D("1.666666666666666666666666667")
 
-    assert opportunity.net_bp.schema_version == 2
+    assert opportunity.net_bp.schema_version == 3
     assert opportunity.net_bp.certainty.value == "EXACT_DERIVED"
     assert opportunity.net_bp.semantic_kind.value == "OPPORTUNITY_NET_BP"
     assert opportunity.net_bp.operands == (
@@ -875,6 +880,7 @@ def test_exact_derived_values_bind_canonical_semantic_kind_operands_fraction_and
         ("stock_entry_price", "110"),
         ("etf_entry_price", "60.01"),
         ("etf_quantity", "1"),
+        ("stock_quantity", "1"),
         ("stock_contract_multiplier", "1"),
         ("etf_contract_multiplier", "1"),
         ("maker_fee_bp", "0"),
@@ -1068,6 +1074,7 @@ def test_opportunity_rejects_every_locally_valid_inconsistent_component(mutation
         stock_entry_price=D("110"),
         etf_entry_price=D("60.01"),
         etf_quantity=D("1"),
+        stock_quantity=D("1"),
         stock_contract_multiplier=D("1"),
         etf_contract_multiplier=D("1"),
         maker_fee_bp=D("1"),

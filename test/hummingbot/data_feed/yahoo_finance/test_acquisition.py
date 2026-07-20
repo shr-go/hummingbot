@@ -177,11 +177,20 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
             etf_daily_multiplier=etf_daily_multiplier,
         )
 
-    def new_checkpoint(self, acquisition):
+    def new_checkpoint(
+        self,
+        acquisition,
+        pair_id="sndk_snxx",
+        stock_symbol="SNDK",
+        etf_symbol="SNXX",
+    ):
         return acquisition.create_checkpoint(
             cycle_id="xnys-2026-07-17",
             target_session_date=TARGET_SESSION_DATE,
             official_close_utc=OFFICIAL_CLOSE,
+            pair_id=pair_id,
+            stock_symbol=stock_symbol,
+            etf_symbol=etf_symbol,
         )
 
     async def finalized_with_distinct_evidence(self):
@@ -257,8 +266,10 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert before.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count
         assert len(provider.calls) == 6
         assert final.status is AnchorAcquisitionStatus.FINALIZABLE
-        assert final.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count
+        assert final.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count + 1
+        assert len(final.checkpoint.confirmation_evidence) == 3
         assert final.candidate is not None
+        assert final.candidate.observed_confirmation_count == 3
 
     async def test_same_round_stock_and_etf_fetches_are_concurrent_and_persist_first_confirmation(self):
         received_at = OFFICIAL_CLOSE + timedelta(seconds=60)
@@ -590,7 +601,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert result.candidate is None
         assert [checkpoint.confirmation_count for checkpoint in emitted] == [1, 2]
 
-    async def test_restart_from_already_confirmed_checkpoint_is_saturated_and_repeatable(self):
+    async def test_restart_from_confirmed_checkpoint_retains_each_later_qualifying_round(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         second_at = first_at + timedelta(seconds=5.15)
         initial_provider = ScriptedPairProvider(observation_pair(first_at), observation_pair(second_at))
@@ -611,14 +622,15 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         replayed = await restarted.advance(confirmed.checkpoint, "SNDK", "SNXX")
 
         assert replayed.status is AnchorAcquisitionStatus.FINALIZABLE
-        assert replayed.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count
+        assert replayed.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count + 1
         persisted = AnchorPollingCheckpoint.from_recovery_fields(replayed.checkpoint.to_recovery_fields())
-        assert persisted.confirmation_evidence == confirmed.checkpoint.confirmation_evidence
+        assert persisted.confirmation_evidence[:2] == confirmed.checkpoint.confirmation_evidence
+        assert len(persisted.confirmation_evidence) == 3
         replay_clock.current = persisted.next_poll_utc
         replay_clock.monotonic_value += 15
         replayed_again = await restarted.advance(persisted, "SNDK", "SNXX")
         assert replayed_again.status is AnchorAcquisitionStatus.FINALIZABLE
-        assert replayed_again.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count
+        assert replayed_again.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count + 2
 
     async def test_checkpoint_creation_is_bound_to_exact_xnys_regular_dst_and_early_closes(self):
         clock = FakeClock(OFFICIAL_CLOSE)
@@ -634,6 +646,9 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
                     f"xnys-{session_date.isoformat()}",
                     session_date,
                     official_close,
+                    pair_id="sndk_snxx",
+                    stock_symbol="SNDK",
+                    etf_symbol="SNXX",
                 )
                 assert checkpoint.official_close_utc == official_close
 
@@ -650,6 +665,9 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
                         f"xnys-{session_date.isoformat()}",
                         session_date,
                         official_close,
+                        pair_id="sndk_snxx",
+                        stock_symbol="SNDK",
+                        etf_symbol="SNXX",
                     )
 
     async def test_loaded_checkpoint_with_non_xnys_close_is_rejected_before_any_fetch(self):
@@ -770,7 +788,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         _, final = await self.finalized_with_distinct_evidence()
 
         candidate = final.candidate
-        assert candidate.evidence_version == 2
+        assert candidate.evidence_version == 3
         assert candidate.pair_id == "sndk_snxx"
         assert candidate.anchor_source == self.nav_config.anchor_source
         assert candidate.official_close_utc == OFFICIAL_CLOSE
@@ -950,7 +968,8 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
             "stock_received_at_utc": shifted_utc(recovery_fields["stock_received_at_utc"]),
             "etf_received_at_utc": shifted_utc(recovery_fields["etf_received_at_utc"]),
             "revision": recovery_fields["revision"] + 1,
-            "integrity_version": 1,
+            "integrity_version": 2,
+            "pair_id": "intc_intw",
             "stock_symbol": "INTC",
             "etf_symbol": "INTW",
             "confirmation_evidence": changed_evidence,
@@ -969,7 +988,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(CheckpointIntegrityError):
                     AnchorPollingCheckpoint.from_recovery_fields(corrupted)
 
-    async def test_empty_v1_checkpoint_upgrades_to_lossless_v2_recovery_state(self):
+    async def test_empty_v1_checkpoint_cannot_be_upgraded_without_a_pair_namespace(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         provider = ScriptedPairProvider(observation_pair(first_at))
         clock = FakeClock(first_at)
@@ -978,19 +997,12 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
 
         legacy_fields = pristine_v2.to_contract_fields()
         legacy_v1 = AnchorPollingCheckpoint.from_contract_fields(legacy_fields)
-        upgraded = await acquisition.advance(legacy_v1, "SNDK", "SNXX")
-
         assert legacy_v1.integrity_version == 1
         assert legacy_v1.confirmation_count == 0
-        assert upgraded.checkpoint.integrity_version == 2
-        assert upgraded.checkpoint.anchor_source == self.nav_config.anchor_source
-        assert upgraded.checkpoint.etf_daily_multiplier == Decimal("2")
-        assert upgraded.checkpoint.hedge_ratio == Decimal("0.24")
-        assert len(upgraded.checkpoint.acquisition_config_hash) == 64
-        recovery_fields = upgraded.checkpoint.to_recovery_fields()
-        assert AnchorPollingCheckpoint.from_recovery_fields(recovery_fields) == upgraded.checkpoint
+        with self.assertRaisesRegex(CheckpointIntegrityError, "pair|legacy|version"):
+            await acquisition.advance(legacy_v1, "SNDK", "SNXX")
 
-    async def test_confirmed_v2_checkpoint_cannot_be_serialized_through_lossy_v1_contract(self):
+    async def test_pair_scoped_checkpoint_cannot_be_serialized_through_lossy_v1_contract(self):
         _, final = await self.finalized_with_distinct_evidence()
 
         with self.assertRaisesRegex(CheckpointIntegrityError, "lossy|version-1|recovery"):
@@ -1011,7 +1023,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
 
         assert provider.calls == []
 
-    async def test_crash_before_finalize_and_repeated_finalize_are_full_trail_idempotent(self):
+    async def test_crash_before_finalize_restores_and_binds_the_boundary_revalidation_round(self):
         first_at = OFFICIAL_CLOSE
         second_at = first_at + timedelta(seconds=5.15)
         boundary = OFFICIAL_CLOSE + timedelta(seconds=self.nav_config.anchor_min_finalize_delay_seconds)
@@ -1026,28 +1038,22 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         confirmed = await initial.advance(first.checkpoint, "SNDK", "SNXX")
         persisted = confirmed.checkpoint.to_recovery_fields()
 
-        candidates = []
-        for offset, hash_pair in ((0, ("5", "6")), (10, ("7", "8"))):
-            restart_at = boundary + timedelta(seconds=offset)
-            restart_clock = FakeClock(restart_at, monotonic_value=100 + offset)
-            restart_provider = ScriptedPairProvider(
-                observation_pair(
-                    restart_at,
-                    stock_hash=hash_pair[0],
-                    etf_hash=hash_pair[1],
-                    etf_delay_seconds=0,
-                )
-            )
-            restarted = self.acquisition(restart_clock, restart_provider)
-            restored = AnchorPollingCheckpoint.from_recovery_fields(copy.deepcopy(persisted))
-            finalized = await restarted.advance(restored, "SNDK", "SNXX")
-            assert finalized.status is AnchorAcquisitionStatus.FINALIZABLE
-            assert len(finalized.candidate.confirmation_evidence) == 2
-            candidates.append(finalized.candidate)
+        restart_clock = FakeClock(boundary, monotonic_value=100)
+        restart_provider = ScriptedPairProvider(
+            observation_pair(boundary, stock_hash="5", etf_hash="6", etf_delay_seconds=0)
+        )
+        restarted = self.acquisition(restart_clock, restart_provider)
+        restored = AnchorPollingCheckpoint.from_recovery_fields(copy.deepcopy(persisted))
+        finalized = await restarted.advance(restored, "SNDK", "SNXX")
 
-        assert candidates[0] == candidates[1]
-        assert candidates[0].finalized_at_utc == boundary
-        assert [record.stock_raw_response_hash for record in candidates[0].confirmation_evidence] == [
+        assert finalized.status is AnchorAcquisitionStatus.FINALIZABLE
+        assert finalized.checkpoint.confirmation_count == 3
+        assert finalized.candidate.observed_confirmation_count == 3
+        assert finalized.candidate.finalized_at_utc == boundary
+        assert [record.stock_raw_response_hash for record in finalized.candidate.confirmation_evidence] == [
             "1" * 64,
             "3" * 64,
+            "5" * 64,
         ]
+        evidence_fields = finalized.candidate.to_evidence_fields()
+        assert type(finalized.candidate).from_evidence_fields(evidence_fields) == finalized.candidate
