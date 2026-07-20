@@ -56,6 +56,8 @@ def main():
         "cryptography>=41.0.2",
         "decibel-python-sdk==0.2.1",
         "eth-account>=0.13.0",
+        # Exact pin keeps XNYS holiday/early-close schedules and NAV-cycle IDs reproducible.
+        "exchange-calendars==4.13.2",
         "injective-py>=1.13",
         "msgpack-python",
         "numba>=0.61.2",
