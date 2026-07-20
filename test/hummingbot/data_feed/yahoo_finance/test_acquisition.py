@@ -225,7 +225,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert [checkpoint.revision for checkpoint in emitted] == [2, 3]
         assert emitted[-1] is result.checkpoint
 
-    async def test_either_leg_change_resets_paired_confirmation_to_one_current_observation():
+    async def test_either_leg_change_resets_paired_confirmation_to_one_current_observation(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         second_at = first_at + timedelta(seconds=5.15)
         provider = ScriptedPairProvider(
@@ -247,7 +247,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert changed.checkpoint.candidate_stock_raw_response_hash == "1" * 64
         assert changed.checkpoint.candidate_etf_raw_response_hash == "4" * 64
 
-    async def test_identical_pair_received_too_soon_does_not_slide_confirmation_baseline():
+    async def test_identical_pair_received_too_soon_does_not_slide_confirmation_baseline(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         too_soon_at = first_at + timedelta(seconds=4)
         provider = ScriptedPairProvider(observation_pair(first_at), observation_pair(too_soon_at))
@@ -265,7 +265,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert too_soon.checkpoint.etf_received_at_utc == first.checkpoint.etf_received_at_utc
         assert too_soon.checkpoint.next_poll_utc == first.checkpoint.etf_received_at_utc + timedelta(seconds=5)
 
-    async def test_asymmetric_leg_delay_over_skew_limit_fails_whole_round_and_clears_candidate():
+    async def test_asymmetric_leg_delay_over_skew_limit_fails_whole_round_and_clears_candidate(self):
         received_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         provider = ScriptedPairProvider(observation_pair(received_at, etf_delay_seconds=5.000001))
         clock = FakeClock(received_at)
@@ -279,7 +279,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert result.checkpoint.candidate_etf_close is None
         assert result.failure_reason == "paired Yahoo receive skew exceeds configured maximum"
 
-    async def test_one_leg_failure_fails_whole_round_and_uses_bounded_exponential_next_poll():
+    async def test_one_leg_failure_fails_whole_round_and_uses_bounded_exponential_next_poll(self):
         received_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         stock, etf = observation_pair(received_at)
         provider = ScriptedPairProvider((YahooHTTPError("synthetic 503"), etf))
@@ -294,7 +294,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert result.checkpoint.next_poll_utc == received_at + timedelta(seconds=2)
         assert "synthetic 503" in result.failure_reason
 
-    async def test_conservative_remaining_schedule_budget_fails_closed_before_impossible_poll():
+    async def test_conservative_remaining_schedule_budget_fails_closed_before_impossible_poll(self):
         clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=570))
         provider = ScriptedPairProvider()
         acquisition = self.acquisition(clock, provider)
@@ -306,7 +306,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert provider.calls == []
         assert result.failure_reason == "insufficient conservative budget for remaining confirmations"
 
-    async def test_deadline_equality_and_post_deadline_restart_never_issue_late_request():
+    async def test_deadline_equality_and_post_deadline_restart_never_issue_late_request(self):
         for seconds_after_close in (600, 601):
             with self.subTest(seconds_after_close=seconds_after_close):
                 clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=seconds_after_close))
@@ -319,7 +319,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
                 assert provider.calls == []
                 assert result.checkpoint.deadline_utc == OFFICIAL_CLOSE + timedelta(seconds=600)
 
-    async def test_response_received_after_absolute_deadline_cannot_finalize_late():
+    async def test_response_received_after_absolute_deadline_cannot_finalize_late(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         late_at = OFFICIAL_CLOSE + timedelta(seconds=601)
         provider = ScriptedPairProvider(observation_pair(first_at), observation_pair(late_at))
@@ -334,7 +334,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert late.status is AnchorAcquisitionStatus.ANCHOR_UNAVAILABLE
         assert late.candidate is None
 
-    async def test_restart_uses_prior_checkpoint_confirmation_and_original_remaining_deadline():
+    async def test_restart_uses_prior_checkpoint_confirmation_and_original_remaining_deadline(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         second_at = first_at + timedelta(seconds=5.15)
         first_clock = FakeClock(first_at)
@@ -370,7 +370,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert assessment.candidate is corrupted
         assert assessment.revision_observation is None
 
-    async def test_post_finalization_price_revision_is_append_only_observation_not_replacement():
+    async def test_post_finalization_price_revision_is_append_only_observation_not_replacement(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         second_at = first_at + timedelta(seconds=5.15)
         provider = ScriptedPairProvider(observation_pair(first_at), observation_pair(second_at))
@@ -395,7 +395,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert assessment.revision_observation.observed_at_utc == revised_etf.received_at_utc
         assert assessment.revision_observation.evidence_hash != final.candidate.evidence_hash
 
-    async def test_post_finalization_same_closes_do_not_alert_when_irrelevant_raw_fields_change():
+    async def test_post_finalization_same_closes_do_not_alert_when_irrelevant_raw_fields_change(self):
         first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
         second_at = first_at + timedelta(seconds=5.15)
         provider = ScriptedPairProvider(observation_pair(first_at), observation_pair(second_at))
