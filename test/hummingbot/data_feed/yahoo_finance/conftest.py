@@ -72,13 +72,39 @@ class FakeClock:
 
 
 class FakeResponse:
-    def __init__(self, status: int, body: str):
+    def __init__(
+        self,
+        status: int,
+        body: str | bytes,
+        *,
+        url: str = "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+        headers: dict[str, str] | None = None,
+        read_hook=None,
+    ):
         self.status = status
         self.body = body
-        self.headers: dict[str, str] = {}
+        self.url = url
+        self.headers = {} if headers is None else headers
+        self.read_hook = read_hook
+        self.released = False
 
     async def text(self) -> str:
+        if self.read_hook is not None:
+            self.read_hook()
+        if isinstance(self.body, bytes):
+            return self.body.decode("utf-8")
         return self.body
+
+    async def read_limited(self, max_bytes: int) -> bytes:
+        if self.read_hook is not None:
+            self.read_hook()
+        body = self.body if isinstance(self.body, bytes) else self.body.encode("utf-8")
+        if len(body) > max_bytes:
+            raise ValueError("synthetic response exceeds body limit")
+        return body
+
+    def release(self) -> None:
+        self.released = True
 
 
 class ScriptedRestAssistant:

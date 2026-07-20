@@ -1,16 +1,110 @@
 import asyncio
 import unittest
+from collections import deque
 from datetime import timedelta
 from decimal import Decimal
+from typing import Any
 
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.web_assistant.connections.rest_connection import RESTConnection
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.data_feed.yahoo_finance.parser import YahooChartParseError
 from hummingbot.data_feed.yahoo_finance.provider import (
+    YAHOO_CHART_RATE_LIMIT_ID,
     YahooChartProvider,
     YahooDeadlineExceeded,
     YahooHTTPError,
 )
+
+
+class SyntheticContent:
+    def __init__(self, response):
+        self._response = response
+
+    async def iter_chunked(self, chunk_size):
+        self._response.run_read_hook()
+        body = self._response.body
+        for index in range(0, len(body), chunk_size):
+            await asyncio.sleep(0)
+            yield body[index:index + chunk_size]
+
+
+class SyntheticAiohttpResponse:
+    def __init__(self, status, body, url, *, headers=None, read_hook=None):
+        self.status = status
+        self.body = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.url = url
+        self.method = "GET"
+        self.headers = {} if headers is None else headers
+        self.content_type = "application/json"
+        self.content = SyntheticContent(self)
+        self.read_hook = read_hook
+        self.read_hook_called = False
+        self.released = False
+
+    def run_read_hook(self):
+        if self.read_hook is not None and not self.read_hook_called:
+            self.read_hook_called = True
+            self.read_hook()
+
+    async def text(self):
+        self.run_read_hook()
+        return self.body.decode("utf-8")
+
+    async def read(self):
+        self.run_read_hook()
+        return self.body
+
+    def release(self):
+        self.released = True
+
+
+class ScriptedClientSession:
+    def __init__(self, *outcomes: Any):
+        self.outcomes = deque(outcomes)
+        self.calls = []
+
+    async def request(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.outcomes:
+            raise AssertionError("unexpected synthetic HTTP request")
+        outcome = self.outcomes.popleft()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if callable(outcome):
+            outcome = outcome()
+        return outcome
+
+
+class StaticConnectionsFactory:
+    def __init__(self, session, *, acquire_hook=None):
+        self.session = session
+        self.acquire_hook = acquire_hook
+        self.calls = 0
+
+    async def get_rest_connection(self):
+        self.calls += 1
+        if self.acquire_hook is not None:
+            self.acquire_hook()
+        return RESTConnection(aiohttp_client_session=self.session)
+
+
+class DeadlineAdvancingLock:
+    def __init__(self, hook):
+        self._hook = hook
+        self._entered = False
+
+    async def __aenter__(self):
+        if not self._entered:
+            self._entered = True
+            self._hook()
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
 
 from .conftest import (
     FakeClock,
@@ -43,6 +137,40 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
             monotonic_clock=clock.monotonic,
             sleep=clock.sleep,
             jitter=deterministic_jitter,
+        )
+
+    def make_real_assistant_provider(
+        self,
+        clock,
+        *responses,
+        throttler=None,
+        connection_acquire_hook=None,
+    ):
+        self.real_session = ScriptedClientSession(*responses)
+        self.real_throttler = throttler or AsyncThrottler(
+            rate_limits=[
+                RateLimit(
+                    limit_id=YAHOO_CHART_RATE_LIMIT_ID,
+                    limit=100,
+                    time_interval=1,
+                )
+            ]
+        )
+        self.real_connections_factory = StaticConnectionsFactory(
+            self.real_session,
+            acquire_hook=connection_acquire_hook,
+        )
+        factory = WebAssistantsFactory(
+            throttler=self.real_throttler,
+            connections_factory=self.real_connections_factory,
+        )
+        return YahooChartProvider(
+            nav_config=self.nav_config,
+            web_assistants_factory=factory,
+            utc_clock=clock.utcnow,
+            monotonic_clock=clock.monotonic,
+            sleep=clock.sleep,
+            jitter=lambda upper_bound: 0.0,
         )
 
     async def test_query2_success_uses_raw_rest_response_and_exact_chart_request(self):
@@ -211,3 +339,190 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
             )
 
         assert len(assistant.calls) == 1
+
+    async def test_http_200_unicode_decode_failure_fails_round_without_query1_failover(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        assistant = ScriptedRestAssistant(
+            FakeResponse(200, b"\xff\xfe"),
+            FakeResponse(200, fixture_text("sndk_chart.json")),
+        )
+        provider = self.make_provider(self.nav_config, clock, assistant)
+
+        with self.assertRaises((UnicodeDecodeError, YahooChartParseError, YahooHTTPError)):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert len(assistant.calls) == 1
+
+    async def test_real_rest_assistant_and_async_throttler_seam_reads_status_and_body_without_network(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(clock, response)
+
+        observation = await provider.fetch_close(
+            "SNDK",
+            TARGET_SESSION_DATE,
+            OFFICIAL_CLOSE + timedelta(seconds=600),
+        )
+
+        assert observation.close == Decimal("250.125")
+        assert observation.source_url == response.url
+        assert len(self.real_session.calls) == 1
+        assert len(self.real_throttler._task_logs) == 1
+        assert response.released is True
+
+    async def test_real_rest_assistant_transport_timeout_and_5xx_use_approved_failover(self):
+        for first_outcome in (
+            TimeoutError("synthetic timeout"),
+            SyntheticAiohttpResponse(
+                503,
+                b"unavailable",
+                "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+            ),
+        ):
+            with self.subTest(first_outcome=type(first_outcome).__name__):
+                clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+                query1_response = SyntheticAiohttpResponse(
+                    200,
+                    fixture_text("sndk_chart.json"),
+                    "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+                )
+                provider = self.make_real_assistant_provider(clock, first_outcome, query1_response)
+
+                observation = await provider.fetch_close(
+                    "SNDK",
+                    TARGET_SESSION_DATE,
+                    OFFICIAL_CLOSE + timedelta(seconds=600),
+                )
+
+                assert observation.close == Decimal("250.125")
+                assert len(self.real_session.calls) == 2
+                assert query1_response.released is True
+                if isinstance(first_outcome, SyntheticAiohttpResponse):
+                    assert first_outcome.released is True
+
+    async def test_real_rest_assistant_cancellation_propagates_without_failover(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        provider = self.make_real_assistant_provider(clock, asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert len(self.real_session.calls) == 1
+
+    async def test_real_async_throttler_wait_consumes_absolute_budget_and_releases_response(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=599))
+        response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        throttler = AsyncThrottler(
+            rate_limits=[RateLimit(YAHOO_CHART_RATE_LIMIT_ID, limit=100, time_interval=1)]
+        )
+        throttler._lock = DeadlineAdvancingLock(lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1))
+        provider = self.make_real_assistant_provider(clock, response, throttler=throttler)
+
+        with self.assertRaises(YahooDeadlineExceeded):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert response.released is True
+
+    async def test_real_response_body_read_consumes_absolute_budget_and_releases_response(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=599))
+        response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+            read_hook=lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1),
+        )
+        provider = self.make_real_assistant_provider(clock, response)
+
+        with self.assertRaises(YahooDeadlineExceeded):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert response.released is True
+
+    async def test_real_factory_acquisition_consumes_absolute_budget_before_request(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=599))
+        provider = self.make_real_assistant_provider(
+            clock,
+            connection_acquire_hook=lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1),
+        )
+
+        with self.assertRaises(YahooDeadlineExceeded):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert self.real_session.calls == []
+
+    async def test_final_response_url_must_remain_on_approved_https_chart_endpoint(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        redirected = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://example.invalid/v8/finance/chart/SNDK",
+        )
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(clock, redirected, query1_response)
+
+        with self.assertRaises(YahooHTTPError):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert len(self.real_session.calls) == 1
+        assert redirected.released is True
+
+    async def test_declared_oversized_chart_body_fails_closed_without_cross_host_retry(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        oversized = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+            headers={"Content-Length": str(20 * 1024 * 1024)},
+        )
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(clock, oversized, query1_response)
+
+        with self.assertRaises(YahooHTTPError):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert len(self.real_session.calls) == 1
+        assert oversized.released is True

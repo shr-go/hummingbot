@@ -1,7 +1,7 @@
 import copy
 import json
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -71,6 +71,38 @@ def test_empty_checkpoint_rejects_hidden_partial_candidate_state():
     wire_fields["candidate_stock_close"] = "250"
 
     with pytest.raises(CheckpointIntegrityError, match="paired candidate"):
+        AnchorPollingCheckpoint.from_contract_fields(wire_fields)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "expected_pattern"),
+    [
+        ("stock_received_at_utc", "2026-07-17T19:59:59.999999Z", "official close|acquisition window"),
+        ("etf_received_at_utc", "2026-07-17T20:10:00.000000Z", "deadline|acquisition window"),
+        ("next_poll_utc", "2026-07-17T19:59:59.999999Z", "next poll|official close"),
+        ("next_poll_utc", "2026-07-17T20:01:59.999999Z", "next poll|receive"),
+    ],
+)
+def test_checkpoint_rejects_preclose_deadline_equal_or_incoherently_ordered_candidate_times(
+    field_name,
+    value,
+    expected_pattern,
+):
+    wire_fields = copy.deepcopy(contract_vectors()["fixtures"]["checkpoint_confirmed"])
+    wire_fields[field_name] = value
+
+    with pytest.raises(CheckpointIntegrityError, match=expected_pattern):
+        AnchorPollingCheckpoint.from_contract_fields(wire_fields)
+
+
+def test_empty_checkpoint_next_poll_cannot_precede_official_close():
+    wire_fields = copy.deepcopy(contract_vectors()["fixtures"]["checkpoint_empty"])
+    official_close = datetime.fromisoformat(wire_fields["official_close_utc"].replace("Z", "+00:00"))
+    wire_fields["next_poll_utc"] = (official_close - timedelta(microseconds=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+
+    with pytest.raises(CheckpointIntegrityError, match="next poll|official close"):
         AnchorPollingCheckpoint.from_contract_fields(wire_fields)
 
 

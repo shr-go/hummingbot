@@ -33,6 +33,17 @@ def parse_sndk(raw_text: str | None = None):
     )
 
 
+def documented_split(payload):
+    split = {
+        "date": 1784208600,
+        "numerator": 4,
+        "denominator": 1,
+        "splitRatio": "4:1",
+    }
+    payload["chart"]["result"][0]["events"]["splits"] = {"1784208600": split}
+    return split
+
+
 def test_selects_only_target_day_unadjusted_regular_close_with_decimal_and_raw_hash():
     raw_text = fixture_text("sndk_chart.json")
 
@@ -186,4 +197,64 @@ def test_null_daily_close_never_falls_back_to_adjusted_close_or_last_trade():
     payload["chart"]["result"][0]["indicators"]["quote"][0]["close"][-1] = None
 
     with pytest.raises(YahooChartParseError, match="close"):
+        parse_sndk(dump_payload(payload))
+
+
+@pytest.mark.parametrize("event_key", ["not-a-timestamp", "0", "-1", "1784208600.5"])
+def test_corporate_action_event_keys_must_be_positive_integer_unix_timestamps(event_key):
+    payload = fixture_payload("sndk_chart.json")
+    documented_split(payload)
+    splits = payload["chart"]["result"][0]["events"]["splits"]
+    split = splits.pop("1784208600")
+    splits[event_key] = split
+
+    with pytest.raises(YahooChartParseError, match="events.*splits.*key|timestamp"):
+        parse_sndk(dump_payload(payload))
+
+
+def test_corporate_action_event_key_must_match_documented_event_date():
+    payload = fixture_payload("sndk_chart.json")
+    split = documented_split(payload)
+    split["date"] = 1784208601
+
+    with pytest.raises(YahooChartParseError, match="event key|date"):
+        parse_sndk(dump_payload(payload))
+
+
+@pytest.mark.parametrize(
+    "split_ratio",
+    [None, "", "4/1", "four:one", "4:", ":1", "4:0", "-4:1", 4],
+)
+def test_split_ratio_must_use_documented_positive_numerator_colon_denominator_syntax(split_ratio):
+    payload = fixture_payload("sndk_chart.json")
+    split = documented_split(payload)
+    if split_ratio is None:
+        split.pop("splitRatio")
+    else:
+        split["splitRatio"] = split_ratio
+
+    with pytest.raises(YahooChartParseError, match="splitRatio"):
+        parse_sndk(dump_payload(payload))
+
+
+@pytest.mark.parametrize(
+    ("numerator", "denominator", "split_ratio"),
+    [
+        (4, 1, "3:1"),
+        (3, 2, "3:1"),
+        (1.5, 1, "3:2"),
+    ],
+)
+def test_split_ratio_must_be_exactly_consistent_with_numeric_split_fields(
+    numerator,
+    denominator,
+    split_ratio,
+):
+    payload = fixture_payload("sndk_chart.json")
+    split = documented_split(payload)
+    split["numerator"] = numerator
+    split["denominator"] = denominator
+    split["splitRatio"] = split_ratio
+
+    with pytest.raises(YahooChartParseError, match="splitRatio|consistent"):
         parse_sndk(dump_payload(payload))
