@@ -3,12 +3,14 @@
 Canonical values have at most 28 coefficient digits, adjusted exponent -18 through
 12, and 28 fractional places. Yahoo/checkpoint prices are further limited to 18
 fractional places. Tuple metadata and estimated fixed-point length are checked
-before formatting or arithmetic; decision arithmetic always uses 28-digit
-ROUND_HALF_EVEN semantics in a private local context.
+before formatting or arithmetic; display arithmetic always uses 28-digit
+ROUND_HALF_EVEN semantics in a private local context, while boundary decisions
+retain exact rational provenance.
 """
 
 from contextlib import contextmanager
 from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
+from fractions import Fraction
 from typing import Iterator
 
 
@@ -30,12 +32,51 @@ _DECISION_CONTEXT = Context(
 )
 
 
+class _ExactDecisionDecimal(Decimal):
+    """Decimal display value carrying an immutable exact rational decision value."""
+
+    __slots__ = ("_exact_numerator", "_exact_denominator")
+
+    def __new__(cls, value: Decimal, exact_value: Fraction):
+        instance = super().__new__(cls, value)
+        object.__setattr__(instance, "_exact_numerator", exact_value.numerator)
+        object.__setattr__(instance, "_exact_denominator", exact_value.denominator)
+        return instance
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("exact decision Decimal provenance is immutable")
+
+
 @contextmanager
 def decision_decimal_context() -> Iterator[Context]:
     """Use the one deterministic arithmetic context for all financial outputs."""
 
     with localcontext(_DECISION_CONTEXT) as context:
         yield context
+
+
+def with_exact_decision_value(display_value: Decimal, exact_value: Fraction) -> Decimal:
+    """Attach exact comparison provenance without changing the public Decimal display."""
+
+    if not isinstance(display_value, Decimal):
+        raise TypeError("decision display value must be a Decimal")
+    if not isinstance(exact_value, Fraction):
+        raise TypeError("exact decision value must be a Fraction")
+    return _ExactDecisionDecimal(display_value, exact_value)
+
+
+def exact_decision_value(value: Decimal) -> Fraction:
+    """Return exact provenance when present; ordinary finite Decimals are already exact."""
+
+    if isinstance(value, _ExactDecisionDecimal):
+        return Fraction(value._exact_numerator, value._exact_denominator)
+    return Fraction(value)
+
+
+def displayed_decision_value(value: Decimal) -> Fraction:
+    """Return only the canonical displayed Decimal value, intentionally ignoring provenance."""
+
+    return Fraction(Decimal(value))
 
 
 def validate_bounded_decimal(

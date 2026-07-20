@@ -36,6 +36,7 @@ UTC = timezone.utc
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _CYCLE_PATTERN = re.compile(r"^xnys-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
+_ANCHOR_SOURCE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DATE_PATTERN = re.compile(r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])$")
 _UTC_PATTERN = re.compile(
     r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
@@ -80,6 +81,10 @@ _RECOVERY_FIELDS = _CHECKPOINT_FIELDS | {
     "stock_symbol",
     "etf_symbol",
     "confirmation_evidence",
+    "anchor_source",
+    "etf_daily_multiplier",
+    "hedge_ratio",
+    "acquisition_config_hash",
     "integrity_hash",
 }
 _CANDIDATE_EVIDENCE_FIELDS = {
@@ -254,6 +259,14 @@ def _canonical_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
 
 
+def _acquisition_config_hash(nav_config: NavConfig) -> str:
+    return _canonical_sha256(
+        {
+            "nav_config": nav_config.model_dump(mode="json"),
+        }
+    )
+
+
 def anchor_evidence_hash(
     cycle_id: str,
     stock_raw_response_hash: str,
@@ -417,6 +430,10 @@ class AnchorPollingCheckpoint:
     etf_received_at_utc: datetime | None
     revision: int
     integrity_version: int = 1
+    anchor_source: str | None = None
+    etf_daily_multiplier: Decimal | None = None
+    hedge_ratio: Decimal | None = None
+    acquisition_config_hash: str | None = None
     stock_symbol: str | None = None
     etf_symbol: str | None = None
     confirmation_evidence: tuple[AnchorConfirmationEvidence, ...] = ()
@@ -501,7 +518,11 @@ class AnchorPollingCheckpoint:
             raise CheckpointIntegrityError("checkpoint confirmation evidence must be an immutable tuple")
         if self.integrity_version == 1:
             if (
-                self.stock_symbol is not None
+                self.anchor_source is not None
+                or self.etf_daily_multiplier is not None
+                or self.hedge_ratio is not None
+                or self.acquisition_config_hash is not None
+                or self.stock_symbol is not None
                 or self.etf_symbol is not None
                 or self.confirmation_evidence
                 or self.integrity_hash is not None
@@ -509,9 +530,23 @@ class AnchorPollingCheckpoint:
                 raise CheckpointIntegrityError("version-1 checkpoint cannot contain version-2 recovery evidence")
             return
 
+        if (
+            not isinstance(self.anchor_source, str)
+            or _ANCHOR_SOURCE_PATTERN.fullmatch(self.anchor_source) is None
+        ):
+            raise CheckpointIntegrityError("version-2 checkpoint anchor source is invalid")
+        validate_bounded_decimal(
+            self.etf_daily_multiplier,
+            "checkpoint ETF daily multiplier",
+            positive=True,
+        )
+        _validate_hash(self.acquisition_config_hash, "checkpoint acquisition config hash")
+
         if self.confirmation_count == 0:
             if self.stock_symbol is not None or self.etf_symbol is not None or self.confirmation_evidence:
                 raise CheckpointIntegrityError("empty checkpoint cannot contain confirmation evidence")
+            if self.hedge_ratio is not None:
+                raise CheckpointIntegrityError("empty checkpoint cannot contain a derived hedge ratio")
         else:
             _validate_symbol(self.stock_symbol, "checkpoint stock symbol")
             _validate_symbol(self.etf_symbol, "checkpoint ETF symbol")
@@ -537,6 +572,15 @@ class AnchorPollingCheckpoint:
                 or latest.etf_received_at_utc != self.etf_received_at_utc
             ):
                 raise CheckpointIntegrityError("checkpoint latest summary does not match its evidence trail")
+            expected_hedge_ratio = calculate_hedge_ratio(
+                self.candidate_stock_close,
+                self.candidate_etf_close,
+                self.etf_daily_multiplier,
+            )
+            if self.hedge_ratio != expected_hedge_ratio:
+                raise CheckpointIntegrityError(
+                    "checkpoint hedge ratio does not match its anchors and multiplier"
+                )
 
         expected_integrity_hash = _canonical_sha256(self._integrity_payload())
         if self.integrity_hash is None:
@@ -547,12 +591,32 @@ class AnchorPollingCheckpoint:
                 raise CheckpointIntegrityError("checkpoint integrity hash does not match its evidence payload")
 
     def _integrity_payload(self) -> dict[str, Any]:
+        payload = self._contract_fields()
+        payload.update(
+            {
+                "integrity_version": self.integrity_version,
+                "anchor_source": self.anchor_source,
+                "etf_daily_multiplier": _format_financial_decimal(self.etf_daily_multiplier),
+                "hedge_ratio": (
+                    None if self.hedge_ratio is None else _format_financial_decimal(self.hedge_ratio)
+                ),
+                "acquisition_config_hash": self.acquisition_config_hash,
+                "stock_symbol": self.stock_symbol,
+                "etf_symbol": self.etf_symbol,
+                "confirmation_evidence": [record.to_fields() for record in self.confirmation_evidence],
+            }
+        )
+        return payload
+
+    def _contract_fields(self) -> dict[str, Any]:
         return {
-            "integrity_version": self.integrity_version,
+            "schema_version": self.schema_version,
             "cycle_id": self.cycle_id,
             "target_session_date": self.target_session_date.isoformat(),
             "official_close_utc": _format_utc(self.official_close_utc),
             "deadline_utc": _format_utc(self.deadline_utc),
+            "attempt": self.attempt,
+            "next_poll_utc": _format_utc(self.next_poll_utc),
             "confirmation_count": self.confirmation_count,
             "candidate_stock_close": (
                 None if self.candidate_stock_close is None else _format_decimal(self.candidate_stock_close)
@@ -568,9 +632,7 @@ class AnchorPollingCheckpoint:
             "etf_received_at_utc": (
                 None if self.etf_received_at_utc is None else _format_utc(self.etf_received_at_utc)
             ),
-            "stock_symbol": self.stock_symbol,
-            "etf_symbol": self.etf_symbol,
-            "confirmation_evidence": [record.to_fields() for record in self.confirmation_evidence],
+            "revision": self.revision,
         }
 
     @classmethod
@@ -619,29 +681,11 @@ class AnchorPollingCheckpoint:
             raise CheckpointIntegrityError(f"invalid checkpoint contract fields: {exception}") from exception
 
     def to_contract_fields(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "cycle_id": self.cycle_id,
-            "target_session_date": self.target_session_date.isoformat(),
-            "official_close_utc": _format_utc(self.official_close_utc),
-            "deadline_utc": _format_utc(self.deadline_utc),
-            "attempt": self.attempt,
-            "next_poll_utc": _format_utc(self.next_poll_utc),
-            "confirmation_count": self.confirmation_count,
-            "candidate_stock_close": (
-                None if self.candidate_stock_close is None else _format_decimal(self.candidate_stock_close)
-            ),
-            "candidate_etf_close": (
-                None if self.candidate_etf_close is None else _format_decimal(self.candidate_etf_close)
-            ),
-            "candidate_stock_raw_response_hash": self.candidate_stock_raw_response_hash,
-            "candidate_etf_raw_response_hash": self.candidate_etf_raw_response_hash,
-            "stock_received_at_utc": (
-                None if self.stock_received_at_utc is None else _format_utc(self.stock_received_at_utc)
-            ),
-            "etf_received_at_utc": None if self.etf_received_at_utc is None else _format_utc(self.etf_received_at_utc),
-            "revision": self.revision,
-        }
+        if self.integrity_version == _ANCHOR_EVIDENCE_VERSION and self.confirmation_count > 0:
+            raise CheckpointIntegrityError(
+                "confirmed version-2 checkpoint requires the lossless recovery adapter"
+            )
+        return self._contract_fields()
 
     @classmethod
     def from_recovery_fields(cls, fields: Mapping[str, Any]) -> "AnchorPollingCheckpoint":
@@ -650,12 +694,23 @@ class AnchorPollingCheckpoint:
         raw_records = fields["confirmation_evidence"]
         if not isinstance(raw_records, list):
             raise CheckpointIntegrityError("checkpoint confirmation evidence must be an array")
+        if fields["integrity_version"] == _ANCHOR_EVIDENCE_VERSION and fields["integrity_hash"] is None:
+            raise CheckpointIntegrityError("version-2 recovery fields require an integrity hash")
         contract_fields = {field_name: fields[field_name] for field_name in _CHECKPOINT_FIELDS}
         base = cls.from_contract_fields(contract_fields)
+
+        def optional_financial_decimal(field_name: str) -> Decimal | None:
+            value = fields[field_name]
+            return None if value is None else _parse_canonical_financial_decimal(value, field_name)
+
         try:
             return replace(
                 base,
                 integrity_version=fields["integrity_version"],
+                anchor_source=fields["anchor_source"],
+                etf_daily_multiplier=optional_financial_decimal("etf_daily_multiplier"),
+                hedge_ratio=optional_financial_decimal("hedge_ratio"),
+                acquisition_config_hash=fields["acquisition_config_hash"],
                 stock_symbol=fields["stock_symbol"],
                 etf_symbol=fields["etf_symbol"],
                 confirmation_evidence=tuple(
@@ -669,10 +724,20 @@ class AnchorPollingCheckpoint:
             raise CheckpointIntegrityError(f"invalid checkpoint recovery fields: {exception}") from exception
 
     def to_recovery_fields(self) -> dict[str, Any]:
-        fields = self.to_contract_fields()
+        fields = self._contract_fields()
         fields.update(
             {
                 "integrity_version": self.integrity_version,
+                "anchor_source": self.anchor_source,
+                "etf_daily_multiplier": (
+                    None
+                    if self.etf_daily_multiplier is None
+                    else _format_financial_decimal(self.etf_daily_multiplier)
+                ),
+                "hedge_ratio": (
+                    None if self.hedge_ratio is None else _format_financial_decimal(self.hedge_ratio)
+                ),
+                "acquisition_config_hash": self.acquisition_config_hash,
                 "stock_symbol": self.stock_symbol,
                 "etf_symbol": self.etf_symbol,
                 "confirmation_evidence": [record.to_fields() for record in self.confirmation_evidence],
@@ -1037,6 +1102,7 @@ class YahooAnchorAcquisition:
             "ETF daily multiplier",
             positive=True,
         )
+        self._acquisition_config_hash = _acquisition_config_hash(nav_config)
         self._calendar = XnysNavCalendar(nav_config=nav_config, clock=utc_clock)
         self._provider = provider or YahooChartProvider(
             nav_config=nav_config,
@@ -1073,6 +1139,10 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=None,
             revision=1,
             integrity_version=_ANCHOR_EVIDENCE_VERSION,
+            anchor_source=self._nav_config.anchor_source,
+            etf_daily_multiplier=self._etf_daily_multiplier,
+            hedge_ratio=None,
+            acquisition_config_hash=self._acquisition_config_hash,
         )
         self._active_budget_key = (checkpoint.cycle_id, checkpoint.deadline_utc)
         self._active_budget = YahooCycleBudget.start(
@@ -1346,6 +1416,14 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=etf_received_at,
             revision=checkpoint.revision + 1,
             integrity_version=_ANCHOR_EVIDENCE_VERSION,
+            anchor_source=self._nav_config.anchor_source,
+            etf_daily_multiplier=self._etf_daily_multiplier,
+            hedge_ratio=calculate_hedge_ratio(
+                stock_close,
+                etf_close,
+                self._etf_daily_multiplier,
+            ),
+            acquisition_config_hash=self._acquisition_config_hash,
             stock_symbol=latest.stock_symbol,
             etf_symbol=latest.etf_symbol,
             confirmation_evidence=confirmation_evidence,
@@ -1443,6 +1521,10 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=None,
             revision=checkpoint.revision + 1,
             integrity_version=_ANCHOR_EVIDENCE_VERSION,
+            anchor_source=self._nav_config.anchor_source,
+            etf_daily_multiplier=self._etf_daily_multiplier,
+            hedge_ratio=None,
+            acquisition_config_hash=self._acquisition_config_hash,
             stock_symbol=None,
             etf_symbol=None,
             confirmation_evidence=(),
@@ -1593,7 +1675,27 @@ class YahooAnchorAcquisition:
             raise CheckpointIntegrityError("checkpoint deadline does not match the configured original window")
         if checkpoint.confirmation_count > self._nav_config.anchor_confirmation_count:
             raise CheckpointIntegrityError("checkpoint confirmation count exceeds the configured requirement")
-        if checkpoint.confirmation_count > 0 and checkpoint.integrity_version != _ANCHOR_EVIDENCE_VERSION:
+        if checkpoint.integrity_version == _ANCHOR_EVIDENCE_VERSION:
+            if checkpoint.anchor_source != self._nav_config.anchor_source:
+                raise CheckpointIntegrityError("checkpoint anchor source does not match configuration")
+            if checkpoint.etf_daily_multiplier != self._etf_daily_multiplier:
+                raise CheckpointIntegrityError("checkpoint multiplier does not match original configuration")
+            if checkpoint.acquisition_config_hash != self._acquisition_config_hash:
+                raise CheckpointIntegrityError("checkpoint acquisition config hash does not match configuration")
+            expected_hedge_ratio = (
+                None
+                if checkpoint.candidate_stock_close is None
+                else calculate_hedge_ratio(
+                    checkpoint.candidate_stock_close,
+                    checkpoint.candidate_etf_close,
+                    self._etf_daily_multiplier,
+                )
+            )
+            if checkpoint.hedge_ratio != expected_hedge_ratio:
+                raise CheckpointIntegrityError(
+                    "checkpoint hedge ratio does not match original anchors and multiplier"
+                )
+        elif checkpoint.confirmation_count > 0:
             raise CheckpointIntegrityError(
                 "confirmed legacy checkpoint lacks the full recovery evidence trail"
             )

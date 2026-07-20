@@ -17,7 +17,10 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
     decision_decimal_context,
+    displayed_decision_value,
+    exact_decision_value,
     validate_bounded_decimal,
+    with_exact_decision_value,
 )
 
 
@@ -48,11 +51,85 @@ def _exact_theoretical_price(
     etf_anchor: Decimal,
     etf_daily_multiplier: Decimal,
 ) -> Fraction:
-    stock_price_fraction = Fraction(stock_price)
-    stock_anchor_fraction = Fraction(stock_anchor)
-    return Fraction(etf_anchor) * (
-        1 + Fraction(etf_daily_multiplier) * (stock_price_fraction / stock_anchor_fraction - 1)
+    stock_price_fraction = exact_decision_value(stock_price)
+    stock_anchor_fraction = exact_decision_value(stock_anchor)
+    return exact_decision_value(etf_anchor) * (
+        1
+        + exact_decision_value(etf_daily_multiplier)
+        * (stock_price_fraction / stock_anchor_fraction - 1)
     )
+
+
+def _display_exact_fraction(
+    exact_value: Fraction,
+    field_name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> Decimal:
+    display_value = Decimal(exact_value.numerator) / Decimal(exact_value.denominator)
+    display_value = validate_bounded_decimal(
+        display_value,
+        field_name,
+        positive=positive,
+        nonnegative=nonnegative,
+    )
+    return with_exact_decision_value(display_value, exact_value)
+
+
+def _exact_opportunity_bp(
+    *,
+    stock_anchor: Decimal,
+    etf_anchor: Decimal,
+    etf_daily_multiplier: Decimal,
+    stock_entry_price: Decimal,
+    etf_entry_price: Decimal,
+    etf_quantity: Decimal,
+    stock_contract_multiplier: Decimal,
+    etf_contract_multiplier: Decimal,
+    maker_fee_bp: Decimal,
+    taker_fee_bp: Decimal,
+    maker_slippage_bp_per_fill: Decimal,
+) -> tuple[Fraction, Fraction, Fraction]:
+    stock_anchor_fraction = exact_decision_value(stock_anchor)
+    etf_anchor_fraction = exact_decision_value(etf_anchor)
+    multiplier_fraction = exact_decision_value(etf_daily_multiplier)
+    stock_price_fraction = exact_decision_value(stock_entry_price)
+    etf_price_fraction = exact_decision_value(etf_entry_price)
+    etf_quantity_fraction = exact_decision_value(etf_quantity)
+    stock_contract_fraction = exact_decision_value(stock_contract_multiplier)
+    etf_contract_fraction = exact_decision_value(etf_contract_multiplier)
+    exact_hedge_ratio = multiplier_fraction * etf_anchor_fraction / stock_anchor_fraction
+    exact_theoretical = _exact_theoretical_price(
+        stock_entry_price,
+        stock_anchor,
+        etf_anchor,
+        etf_daily_multiplier,
+    )
+    exact_stock_quantity = (
+        etf_quantity_fraction
+        * etf_contract_fraction
+        / stock_contract_fraction
+        * exact_hedge_ratio
+    )
+    exact_etf_notional = etf_quantity_fraction * etf_contract_fraction * etf_price_fraction
+    exact_stock_notional = exact_stock_quantity * stock_contract_fraction * stock_price_fraction
+    exact_gross_notional = exact_etf_notional + exact_stock_notional
+    exact_gross_profit = (
+        abs(etf_price_fraction - exact_theoretical)
+        * etf_quantity_fraction
+        * etf_contract_fraction
+    )
+    exact_raw_bp = Fraction(BASIS_POINTS) * exact_gross_profit / exact_gross_notional
+    exact_total_quote = 2 * (
+        exact_etf_notional * exact_decision_value(maker_fee_bp) / Fraction(BASIS_POINTS)
+        + exact_stock_notional * exact_decision_value(taker_fee_bp) / Fraction(BASIS_POINTS)
+        + exact_etf_notional
+        * exact_decision_value(maker_slippage_bp_per_fill)
+        / Fraction(BASIS_POINTS)
+    )
+    exact_cost_bp = Fraction(BASIS_POINTS) * exact_total_quote / exact_gross_notional
+    return exact_gross_profit, exact_raw_bp, exact_raw_bp - exact_cost_bp
 
 
 def _direction(value: object) -> ArbitrageDirection:
@@ -76,8 +153,13 @@ def calculate_hedge_ratio(
     stock_anchor = _decimal(stock_anchor, "stock anchor", positive=True)
     etf_anchor = _decimal(etf_anchor, "ETF anchor", positive=True)
     etf_daily_multiplier = _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True)
-    return validate_bounded_decimal(
-        etf_daily_multiplier * etf_anchor / stock_anchor,
+    exact_ratio = (
+        exact_decision_value(etf_daily_multiplier)
+        * exact_decision_value(etf_anchor)
+        / exact_decision_value(stock_anchor)
+    )
+    return _display_exact_fraction(
+        exact_ratio,
         "hedge ratio result",
         positive=True,
     )
@@ -100,11 +182,10 @@ def calculate_theoretical_etf_price(
         etf_anchor,
         etf_daily_multiplier,
     )
-    theoretical_price = Decimal(exact_price.numerator) / Decimal(exact_price.denominator)
-    if theoretical_price <= 0:
+    if exact_price <= 0:
         raise ValueError("theoretical ETF price must be positive")
-    return validate_bounded_decimal(
-        theoretical_price,
+    return _display_exact_fraction(
+        exact_price,
         "theoretical ETF price result",
         positive=True,
     )
@@ -117,9 +198,11 @@ def determine_arbitrage_direction(
 ) -> Optional[ArbitrageDirection]:
     etf_price = _decimal(etf_price, "ETF price", positive=True)
     theoretical_etf_price = _decimal(theoretical_etf_price, "theoretical ETF price", positive=True)
-    if etf_price > theoretical_etf_price:
+    exact_etf_price = exact_decision_value(etf_price)
+    exact_theoretical_price = exact_decision_value(theoretical_etf_price)
+    if exact_etf_price > exact_theoretical_price:
         return ArbitrageDirection.SHORT_ETF_LONG_STOCK
-    if etf_price < theoretical_etf_price:
+    if exact_etf_price < exact_theoretical_price:
         return ArbitrageDirection.LONG_ETF_SHORT_STOCK
     return None
 
@@ -209,20 +292,42 @@ def calculate_opportunity(
     taker_fee_bp: Decimal,
     maker_slippage_bp_per_fill: Decimal,
 ) -> Opportunity:
+    stock_anchor = _decimal(stock_anchor, "stock anchor", positive=True)
+    etf_anchor = _decimal(etf_anchor, "ETF anchor", positive=True)
+    etf_daily_multiplier = _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True)
+    stock_entry_price = _decimal(stock_entry_price, "stock entry price", positive=True)
+    etf_entry_price = _decimal(etf_entry_price, "ETF entry price", positive=True)
+    etf_quantity = _decimal(etf_quantity, "ETF quantity", positive=True)
+    stock_contract_multiplier = _decimal(
+        stock_contract_multiplier,
+        "stock contract multiplier",
+        positive=True,
+    )
+    etf_contract_multiplier = _decimal(
+        etf_contract_multiplier,
+        "ETF contract multiplier",
+        positive=True,
+    )
+    maker_fee_bp = _decimal(maker_fee_bp, "maker fee bp", nonnegative=True)
+    taker_fee_bp = _decimal(taker_fee_bp, "taker fee bp", nonnegative=True)
+    maker_slippage_bp_per_fill = _decimal(
+        maker_slippage_bp_per_fill,
+        "maker slippage bp per fill",
+        nonnegative=True,
+    )
     theoretical_price = calculate_theoretical_etf_price(
         stock_entry_price,
         stock_anchor,
         etf_anchor,
         etf_daily_multiplier,
     )
-    etf_entry_price = _decimal(etf_entry_price, "ETF entry price", positive=True)
     exact_theoretical_price = _exact_theoretical_price(
-        _decimal(stock_entry_price, "stock entry price", positive=True),
-        _decimal(stock_anchor, "stock anchor", positive=True),
-        _decimal(etf_anchor, "ETF anchor", positive=True),
-        _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True),
+        stock_entry_price,
+        stock_anchor,
+        etf_anchor,
+        etf_daily_multiplier,
     )
-    etf_entry_fraction = Fraction(etf_entry_price)
+    etf_entry_fraction = exact_decision_value(etf_entry_price)
     if etf_entry_fraction > exact_theoretical_price:
         direction = ArbitrageDirection.SHORT_ETF_LONG_STOCK
     elif etf_entry_fraction < exact_theoretical_price:
@@ -231,8 +336,6 @@ def calculate_opportunity(
         direction = None
     if direction is None:
         raise ValueError("entry prices contain no directional spread")
-    if etf_entry_price == theoretical_price:
-        raise ValueError("canonical theoretical price cannot establish a certain directional spread")
     hedge_ratio = calculate_hedge_ratio(stock_anchor, etf_anchor, etf_daily_multiplier)
     quantities = calculate_leg_quantities(
         etf_quantity,
@@ -248,16 +351,33 @@ def calculate_opportunity(
         etf_contract_multiplier,
         stock_contract_multiplier,
     )
-    gross_profit_quote = (
-        abs(etf_entry_price - theoretical_price) * abs(quantities.etf_quantity) * etf_contract_multiplier
+    exact_gross_profit, exact_raw_bp, exact_net_bp = _exact_opportunity_bp(
+        stock_anchor=stock_anchor,
+        etf_anchor=etf_anchor,
+        etf_daily_multiplier=etf_daily_multiplier,
+        stock_entry_price=stock_entry_price,
+        etf_entry_price=etf_entry_price,
+        etf_quantity=etf_quantity,
+        stock_contract_multiplier=stock_contract_multiplier,
+        etf_contract_multiplier=etf_contract_multiplier,
+        maker_fee_bp=maker_fee_bp,
+        taker_fee_bp=taker_fee_bp,
+        maker_slippage_bp_per_fill=maker_slippage_bp_per_fill,
     )
-    raw_bp = BASIS_POINTS * gross_profit_quote / notionals.gross
+    gross_profit_quote = _display_exact_fraction(
+        exact_gross_profit,
+        "gross profit quote result",
+        positive=True,
+    )
+    raw_bp_display = BASIS_POINTS * gross_profit_quote / notionals.gross
+    raw_bp = with_exact_decision_value(raw_bp_display, exact_raw_bp)
     costs = calculate_round_trip_costs(
         notionals,
         maker_fee_bp,
         taker_fee_bp,
         maker_slippage_bp_per_fill,
     )
+    net_bp_display = raw_bp - costs.total_bp
     return Opportunity(
         direction=direction,
         hedge_ratio=hedge_ratio,
@@ -267,7 +387,7 @@ def calculate_opportunity(
         gross_profit_quote=gross_profit_quote,
         raw_bp=raw_bp,
         costs=costs,
-        net_bp=raw_bp - costs.total_bp,
+        net_bp=with_exact_decision_value(net_bp_display, exact_net_bp),
     )
 
 
@@ -341,9 +461,14 @@ def _ordered_tiers(position_tiers: Mapping[Decimal, Decimal]) -> tuple[tuple[Dec
 def select_entry_target(net_bp: Decimal, position_tiers: Mapping[Decimal, Decimal]) -> Decimal:
     net_bp = _decimal(net_bp, "net bp")
     ordered_tiers = _ordered_tiers(position_tiers)
-    if net_bp <= 0:
+    exact_net_bp = exact_decision_value(net_bp)
+    if exact_net_bp <= 0:
         return Decimal("0")
-    return max(target for threshold, target in ordered_tiers if threshold <= net_bp)
+    return max(
+        target
+        for threshold, target in ordered_tiers
+        if displayed_decision_value(threshold) <= exact_net_bp
+    )
 
 
 @_fixed_decimal_context
@@ -385,7 +510,8 @@ def select_reduce_target(
             ordered_targets.append(target)
     if current_target not in ordered_targets:
         raise ValueError("current target is not a configured position tier")
-    if net_bp <= 0:
+    exact_net_bp = exact_decision_value(net_bp)
+    if exact_net_bp <= 0:
         return Decimal("0")
     if not isinstance(reduce_bp_by_current_target, Mapping):
         raise TypeError("reduce thresholds must be a mapping")
@@ -395,7 +521,7 @@ def select_reduce_target(
     }
     if current_target not in parsed_reductions:
         raise ValueError("current target has no reduce threshold")
-    if net_bp < parsed_reductions[current_target]:
+    if exact_net_bp < displayed_decision_value(parsed_reductions[current_target]):
         current_index = ordered_targets.index(current_target)
         return Decimal("0") if current_index == 0 else ordered_targets[current_index - 1]
     return current_target

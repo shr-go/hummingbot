@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -96,7 +96,7 @@ class YahooChartParser:
             payload = json.loads(raw_text, parse_float=Decimal, parse_constant=reject_constant)
         except YahooChartParseError:
             raise
-        except (json.JSONDecodeError, TypeError, ValueError) as exception:
+        except (json.JSONDecodeError, DecimalException, TypeError, ValueError) as exception:
             raise YahooChartParseError("Yahoo chart response is malformed JSON") from exception
 
         result = self._chart_result(payload)
