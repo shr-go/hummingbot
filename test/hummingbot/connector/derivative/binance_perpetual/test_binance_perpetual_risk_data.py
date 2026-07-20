@@ -169,7 +169,7 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
             "marginType": "CROSSED",
             "isAutoAddMargin": False,
             "leverage": 20,
-            "maxNotionalValue": "1E+5",
+            "maxNotionalValue": "1500",
         }
         payload.update(updates)
         return payload
@@ -217,6 +217,75 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         brackets = BinancePerpetualLeverageBrackets.from_payload(
             self._brackets(), self.symbol, self.data_time, self.data_time
         )
+        return instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets
+
+    def _inactive_bundle(self) -> Tuple[Any, ...]:
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = (
+            self._typed_bundle()
+        )
+        zero = Decimal("0")
+        account_position = replace(
+            account.positions[0],
+            position_amount=zero,
+            unrealized_profit=zero,
+            isolated_margin=zero,
+            notional=zero,
+            isolated_wallet=zero,
+            initial_margin=zero,
+            maint_margin=zero,
+            update_time_ms=0,
+        )
+        asset = replace(
+            account.assets[0],
+            unrealized_profit=zero,
+            margin_balance=Decimal("100"),
+            maint_margin=zero,
+            initial_margin=zero,
+            position_initial_margin=zero,
+            open_order_initial_margin=zero,
+            cross_unrealized_profit=zero,
+            available_balance=Decimal("100"),
+            max_withdraw_amount=Decimal("100"),
+        )
+        account = replace(
+            account,
+            total_initial_margin=zero,
+            total_maint_margin=zero,
+            total_unrealized_profit=zero,
+            total_margin_balance=Decimal("100"),
+            total_position_initial_margin=zero,
+            total_open_order_initial_margin=zero,
+            total_cross_unrealized_profit=zero,
+            available_balance=Decimal("100"),
+            max_withdraw_amount=Decimal("100"),
+            assets=(asset,),
+            positions=(account_position,),
+        )
+        position = replace(
+            position,
+            position_amount=zero,
+            unrealized_profit=zero,
+            isolated_margin=zero,
+            notional=zero,
+            isolated_wallet=zero,
+            initial_margin=zero,
+            maint_margin=zero,
+            position_initial_margin=zero,
+            open_order_initial_margin=zero,
+            bid_notional=zero,
+            ask_notional=zero,
+            update_time_ms=0,
+        )
+        return instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets
+
+    @staticmethod
+    def _bundle_with_notional(bundle: Tuple[Any, ...], notional: Decimal) -> Tuple[Any, ...]:
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = bundle
+        account = replace(
+            account,
+            positions=(replace(account.positions[0], notional=notional),),
+        )
+        position = replace(position, notional=notional)
         return instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets
 
     def _configure_preflight_sources(
@@ -280,6 +349,17 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         with self.assertRaisesRegex(BinancePerpetualRiskDataError, "contract multiplier"):
             BinancePerpetualInstrumentInfo.from_exchange_info(exchange_info, self.trading_pair, self.data_time)
 
+    def test_instrument_reconciles_all_supported_multiplier_representations(self):
+        instrument = BinancePerpetualInstrumentInfo.from_exchange_info(
+            self._exchange_info(contractMultiplier="0.01"), self.trading_pair, self.data_time
+        )
+
+        self.assertEqual(Decimal("0.01"), instrument.contract_multiplier)
+        with self.assertRaisesRegex(BinancePerpetualRiskDataError, "contract multiplier"):
+            BinancePerpetualInstrumentInfo.from_exchange_info(
+                self._exchange_info(contractMultiplier="0.02"), self.trading_pair, self.data_time
+            )
+
     def test_leverage_brackets_apply_notional_coef_and_exact_cap_enters_next_bracket(self):
         brackets = BinancePerpetualLeverageBrackets.from_payload(
             [self._brackets()], self.symbol, self.data_time, self.data_time
@@ -326,6 +406,17 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
             BinancePerpetualPositionMode.from_payload({"dualSidePosition": "false"}, self.data_time)
         with self.assertRaisesRegex(BinancePerpetualRiskDataError, "multiAssetsMargin"):
             BinancePerpetualMultiAssetsMode.from_payload({}, self.data_time)
+
+    def test_symbol_config_uses_documented_json_boolean(self):
+        config = BinancePerpetualSymbolConfig.from_payload(self._symbol_config(), self.data_time)
+
+        self.assertFalse(config.is_auto_add_margin)
+        for invalid in ("false", 0, None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(BinancePerpetualRiskDataError, "boolean"):
+                    BinancePerpetualSymbolConfig.from_payload(
+                        self._symbol_config(isAutoAddMargin=invalid), self.data_time
+                    )
 
     async def test_connector_fetches_all_typed_risk_sources_and_leverage_result(self):
         get_responses = {
@@ -414,6 +505,228 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.symbol, snapshot.instruments[0].symbol)
         self.assertIsNone(self.exchange._position_mode)
         self.exchange._api_post.assert_not_awaited()
+
+    async def test_strict_preflight_rejects_unsafe_freshness_parameters(self):
+        max_age_cases = (5.000001, float("nan"), float("inf"), -0.001, True, "5")
+        for value in max_age_cases:
+            with self.subTest(parameter="max_age_seconds", value=value):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, self._typed_bundle())
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, "max_age_seconds"):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=value,
+                    )
+
+        tolerance_cases = (
+            Decimal("0.0100001"),
+            Decimal("-0.0001"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            0.01,
+            "0.01",
+            True,
+        )
+        for value in tolerance_cases:
+            with self.subTest(parameter="consistency_tolerance", value=value):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, self._typed_bundle())
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, "consistency_tolerance"):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=4.5,
+                        consistency_tolerance=value,
+                    )
+
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, self._typed_bundle())
+        await exchange.strict_account_preflight(
+            trading_pairs=[self.trading_pair],
+            known_position_trading_pairs=[self.trading_pair],
+            max_age_seconds=5,
+            consistency_tolerance=Decimal("0.01"),
+        )
+
+    async def test_strict_preflight_validates_meaningful_source_timestamps(self):
+        base = self._typed_bundle()
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = base
+        stale_time_ms = int((self.data_time - 6) * 1e3)
+        future_time_ms = int((self.data_time + 1) * 1e3)
+        cases = (
+            (
+                "active asset source time stale",
+                (instrument, replace(account, assets=(replace(account.assets[0], update_time_ms=stale_time_ms),)),
+                 position, account_config, symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "active Account V3 position source time stale",
+                (instrument,
+                 replace(account, positions=(replace(account.positions[0], update_time_ms=stale_time_ms),)),
+                 position, account_config, symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "active Position V3 source time stale",
+                (instrument, account, replace(position, update_time_ms=stale_time_ms), account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "source time future",
+                (instrument, replace(account, assets=(replace(account.assets[0], update_time_ms=future_time_ms),)),
+                 position, account_config, symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "local receive time future",
+                (instrument, replace(account, data_time=self.data_time + 1), position, account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+        )
+
+        for name, bundle in cases:
+            with self.subTest(name=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, "stale|future"):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=5,
+                    )
+
+    async def test_strict_preflight_rejects_zero_timestamp_for_active_rows(self):
+        base = self._typed_bundle()
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = base
+        cases = (
+            (
+                "active asset",
+                (instrument, replace(account, assets=(replace(account.assets[0], update_time_ms=0),)),
+                 position, account_config, symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "active Account V3 position",
+                (instrument, replace(account, positions=(replace(account.positions[0], update_time_ms=0),)),
+                 position, account_config, symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "active Position V3 row",
+                (instrument, account, replace(position, update_time_ms=0), account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+        )
+        for name, bundle in cases:
+            with self.subTest(name=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, "timestamp is zero"):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=5,
+                    )
+
+    async def test_strict_preflight_allows_documented_zero_timestamp_for_inactive_rows(self):
+        bundle = self._inactive_bundle()
+        bundle = (replace(bundle[0], source_time_ms=None), *bundle[1:])
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, bundle)
+
+        snapshot = await exchange.strict_account_preflight(
+            trading_pairs=[self.trading_pair],
+            known_position_trading_pairs=[],
+            max_age_seconds=5,
+        )
+
+        self.assertEqual(0, snapshot.account.positions[0].update_time_ms)
+        self.assertEqual(0, snapshot.positions[0].update_time_ms)
+        self.assertIsNone(snapshot.instruments[0].source_time_ms)
+
+    async def test_strict_preflight_reconciles_leverage_cap_and_exact_boundaries(self):
+        base = self._typed_bundle()
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = base
+        rejection_cases = (
+            (
+                "max notional mismatch",
+                (instrument, account, position, account_config,
+                 replace(symbol_config, max_notional_value=Decimal("1500.01")),
+                 multi_assets, position_mode, brackets),
+                "maxNotionalValue",
+            ),
+            (
+                "configured leverage unsupported",
+                (instrument, account, position, account_config,
+                 replace(symbol_config, leverage=21, max_notional_value=Decimal("1500")),
+                 multi_assets, position_mode, brackets),
+                "leverage",
+            ),
+            (
+                "exact cap enters next bracket",
+                self._bundle_with_notional(base, Decimal("1500")),
+                "leverage",
+            ),
+        )
+        for name, bundle, expected in rejection_cases:
+            with self.subTest(name=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, expected):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=5,
+                    )
+
+        allowed_boundary = self._bundle_with_notional(base, Decimal("1500"))
+        allowed_boundary = (
+            allowed_boundary[0],
+            allowed_boundary[1],
+            allowed_boundary[2],
+            allowed_boundary[3],
+            replace(allowed_boundary[4], leverage=10, max_notional_value=Decimal("7500")),
+            allowed_boundary[5],
+            allowed_boundary[6],
+            allowed_boundary[7],
+        )
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, allowed_boundary)
+        await exchange.strict_account_preflight(
+            trading_pairs=[self.trading_pair],
+            known_position_trading_pairs=[self.trading_pair],
+            max_age_seconds=5,
+        )
+
+        last_cap = self._bundle_with_notional(allowed_boundary, Decimal("7500"))
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, last_cap)
+        with self.assertRaisesRegex(BinancePerpetualPreflightError, "outside leverage brackets"):
+            await exchange.strict_account_preflight(
+                trading_pairs=[self.trading_pair],
+                known_position_trading_pairs=[self.trading_pair],
+                max_age_seconds=5,
+            )
+
+    async def test_strict_preflight_rejects_unknown_bid_or_ask_orders_with_zero_margin(self):
+        base = self._inactive_bundle()
+        for field in ("bid_notional", "ask_notional"):
+            with self.subTest(field=field):
+                (instrument, account, position, account_config, symbol_config,
+                 multi_assets, position_mode, brackets) = base
+                position = replace(
+                    position,
+                    **{field: Decimal("0.00000001"), "update_time_ms": int(self.data_time * 1e3)},
+                )
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(
+                    exchange,
+                    (instrument, account, position, account_config, symbol_config,
+                     multi_assets, position_mode, brackets),
+                )
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, "unknown position or open order"):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[],
+                        max_age_seconds=5,
+                    )
 
     async def test_strict_preflight_rejects_every_unsafe_or_inconsistent_state(self):
         base = self._typed_bundle()

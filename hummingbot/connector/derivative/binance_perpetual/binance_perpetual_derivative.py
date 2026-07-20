@@ -56,6 +56,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     SHORT_POLL_INTERVAL = 5.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     LONG_POLL_INTERVAL = 120.0
+    MAX_ACCOUNT_DATA_AGE_SECONDS = 5.0
 
     def __init__(
             self,
@@ -301,19 +302,28 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             raise BinancePerpetualPreflightError("related_trading_pairs must include every active trading pair")
         if not set(known_pairs).issubset(related_pairs):
             raise BinancePerpetualPreflightError("known positions must be a subset of related trading pairs")
+        if isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, (int, float, Decimal)):
+            raise BinancePerpetualPreflightError(
+                "max_age_seconds must be a finite number between 0 and 5 seconds"
+            )
         try:
             max_age = float(max_age_seconds)
         except (TypeError, ValueError) as exc:
-            raise BinancePerpetualPreflightError("max_age_seconds must be finite and non-negative") from exc
-        if not math.isfinite(max_age) or max_age < 0:
-            raise BinancePerpetualPreflightError("max_age_seconds must be finite and non-negative")
+            raise BinancePerpetualPreflightError(
+                "max_age_seconds must be a finite number between 0 and 5 seconds"
+            ) from exc
+        if not math.isfinite(max_age) or max_age < 0 or max_age > self.MAX_ACCOUNT_DATA_AGE_SECONDS:
+            raise BinancePerpetualPreflightError(
+                "max_age_seconds must be a finite number between 0 and 5 seconds"
+            )
         if (
                 not isinstance(consistency_tolerance, Decimal)
                 or not consistency_tolerance.is_finite()
                 or consistency_tolerance < 0
+                or consistency_tolerance > Decimal("0.01")
         ):
             raise BinancePerpetualPreflightError(
-                "consistency_tolerance must be a finite non-negative Decimal"
+                "consistency_tolerance must be a finite Decimal between 0 and 0.01"
             )
 
         async def authoritative_fetch(source: str, awaitable):
@@ -392,6 +402,44 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         for brackets in leverage_brackets:
             freshness_sources.append((f"leverage brackets {brackets.symbol}", brackets.data_time))
             freshness_sources.append((f"leverage bracket cache {brackets.symbol}", brackets.cache_time))
+
+        # Binance documents exchangeInfo.serverTime and accountConfig.updateTime as fields to ignore;
+        # their local receive times above are therefore the freshness authorities.
+        def add_source_timestamp(
+                source: str,
+                source_time_ms: int,
+                allow_zero_when_inactive: bool = False,
+                is_active: bool = True,
+        ) -> None:
+            if source_time_ms == 0:
+                if allow_zero_when_inactive and not is_active:
+                    return
+                raise BinancePerpetualPreflightError(
+                    f"{source} source timestamp is zero for active data"
+                )
+            freshness_sources.append((source, source_time_ms / 1e3))
+
+        for asset in account.assets:
+            add_source_timestamp(
+                f"Account Information V3 asset {asset.asset} updateTime",
+                asset.update_time_ms,
+                allow_zero_when_inactive=True,
+                is_active=asset.has_activity,
+            )
+        for position in account.positions:
+            add_source_timestamp(
+                f"Account Information V3 position {position.symbol} updateTime",
+                position.update_time_ms,
+                allow_zero_when_inactive=True,
+                is_active=position.has_activity,
+            )
+        for position in positions:
+            add_source_timestamp(
+                f"Position Information V3 {position.symbol} updateTime",
+                position.update_time_ms,
+                allow_zero_when_inactive=True,
+                is_active=position.has_activity,
+            )
         for source, source_time in freshness_sources:
             age = now - source_time
             if not math.isfinite(age) or age < 0 or age > max_age:
@@ -505,6 +553,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 (account_position.unrealized_profit, position.unrealized_profit),
                 (account_position.initial_margin, position.initial_margin),
                 (account_position.maint_margin, position.maint_margin),
+                (position.initial_margin,
+                 position.position_initial_margin + position.open_order_initial_margin),
             )
             if any(not reconciles(left, right) for left, right in comparisons):
                 raise BinancePerpetualPreflightError(
@@ -554,6 +604,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             if symbol not in bracket_by_symbol:
                 raise BinancePerpetualPreflightError(f"missing leverage brackets for {symbol}")
             config = symbol_config_by_symbol[symbol]
+            brackets = bracket_by_symbol[symbol]
             current_notional = max(
                 (
                     abs(position.notional)
@@ -562,16 +613,26 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 ),
                 default=Decimal("0"),
             )
-            if current_notional > config.max_notional_value:
-                raise BinancePerpetualPreflightError(
-                    f"current notional exceeds maxNotionalValue for {symbol}"
-                )
             try:
-                bracket_by_symbol[symbol].bracket_for_notional(current_notional)
+                current_bracket = brackets.bracket_for_notional(current_notional)
             except BinancePerpetualRiskDataError as exc:
                 raise BinancePerpetualPreflightError(
                     f"current notional is outside leverage brackets for {symbol}"
                 ) from exc
+            if config.leverage > current_bracket.initial_leverage:
+                raise BinancePerpetualPreflightError(
+                    f"configured leverage is not allowed by the current notional bracket for {symbol}"
+                )
+            try:
+                authoritative_cap = brackets.max_notional_for_leverage(config.leverage)
+            except BinancePerpetualRiskDataError as exc:
+                raise BinancePerpetualPreflightError(
+                    f"configured leverage is not allowed by leverage brackets for {symbol}"
+                ) from exc
+            if config.max_notional_value != authoritative_cap:
+                raise BinancePerpetualPreflightError(
+                    f"maxNotionalValue disagrees with leverage brackets for {symbol}"
+                )
 
         return BinancePerpetualPreflightSnapshot(
             account=account,

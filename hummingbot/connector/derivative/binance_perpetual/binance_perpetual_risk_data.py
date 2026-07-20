@@ -136,11 +136,12 @@ class BinancePerpetualInstrumentInfo:
         symbol = matches[0]
         symbol_context = f"exchangeInfo[{trading_pair}]"
         contract_type = _string(symbol, "contractType", symbol_context)
-        multiplier_field = next(
-            (field for field in ("contractSize", "contractMultiplier") if field in symbol),
-            None,
-        )
-        if multiplier_field is None:
+        multiplier_values = {
+            field: _decimal(symbol, field, symbol_context)
+            for field in ("contractSize", "contractMultiplier")
+            if field in symbol
+        }
+        if not multiplier_values:
             if contract_type == "PERPETUAL":
                 contract_multiplier = Decimal("1")
             else:
@@ -148,7 +149,11 @@ class BinancePerpetualInstrumentInfo:
                     f"{symbol_context} is missing an explicit contract multiplier"
                 )
         else:
-            contract_multiplier = _decimal(symbol, multiplier_field, symbol_context)
+            if len(set(multiplier_values.values())) != 1:
+                raise BinancePerpetualRiskDataError(
+                    f"{symbol_context} has conflicting contract multiplier fields"
+                )
+            contract_multiplier = next(iter(multiplier_values.values()))
         if contract_multiplier <= 0:
             raise BinancePerpetualRiskDataError(f"{symbol_context} contract multiplier must be positive")
 
@@ -223,6 +228,22 @@ class BinancePerpetualAccountAsset:
     max_withdraw_amount: Decimal
     update_time_ms: int
 
+    @property
+    def has_activity(self) -> bool:
+        return any(value != 0 for value in (
+            self.wallet_balance,
+            self.unrealized_profit,
+            self.margin_balance,
+            self.maint_margin,
+            self.initial_margin,
+            self.position_initial_margin,
+            self.open_order_initial_margin,
+            self.cross_wallet_balance,
+            self.cross_unrealized_profit,
+            self.available_balance,
+            self.max_withdraw_amount,
+        ))
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any], context: str) -> "BinancePerpetualAccountAsset":
         payload = _mapping(payload, context)
@@ -260,6 +281,7 @@ class BinancePerpetualAccountPosition:
     def has_activity(self) -> bool:
         return any(value != 0 for value in (
             self.position_amount,
+            self.unrealized_profit,
             self.isolated_margin,
             self.notional,
             self.isolated_wallet,
@@ -367,6 +389,7 @@ class BinancePerpetualPositionRiskSnapshot:
     def has_activity(self) -> bool:
         return any(value != 0 for value in (
             self.position_amount,
+            self.unrealized_profit,
             self.isolated_margin,
             self.notional,
             self.isolated_wallet,
@@ -374,6 +397,8 @@ class BinancePerpetualPositionRiskSnapshot:
             self.maint_margin,
             self.position_initial_margin,
             self.open_order_initial_margin,
+            self.bid_notional,
+            self.ask_notional,
         ))
 
     @classmethod
@@ -600,6 +625,10 @@ class BinancePerpetualLeverageBrackets:
                     raise BinancePerpetualRiskDataError(f"{context} bracket identifiers must be increasing")
                 if notional_floor != previous.notional_cap:
                     raise BinancePerpetualRiskDataError(f"{context} notional bounds must be contiguous")
+                if initial_leverage > previous.initial_leverage:
+                    raise BinancePerpetualRiskDataError(
+                        f"{context} initial leverage limits must be non-increasing"
+                    )
             parsed = BinancePerpetualLeverageBracket(
                 bracket=bracket_number,
                 initial_leverage=initial_leverage,
@@ -629,6 +658,19 @@ class BinancePerpetualLeverageBrackets:
         raise BinancePerpetualRiskDataError(
             f"absolute notional {abs(notional)} is outside the returned leverage brackets for {self.symbol}"
         )
+
+    def max_notional_for_leverage(self, leverage: int) -> Decimal:
+        if isinstance(leverage, bool) or not isinstance(leverage, int) or leverage <= 0:
+            raise BinancePerpetualRiskDataError("leverage must be a positive integer")
+        eligible = tuple(
+            bracket for bracket in self.brackets
+            if leverage <= bracket.initial_leverage
+        )
+        if not eligible:
+            raise BinancePerpetualRiskDataError(
+                f"leverage {leverage} is not allowed by the returned brackets for {self.symbol}"
+            )
+        return eligible[-1].adjusted_notional_cap
 
     def maintenance_margin(self, notional: Decimal) -> Decimal:
         absolute_notional = abs(notional)
