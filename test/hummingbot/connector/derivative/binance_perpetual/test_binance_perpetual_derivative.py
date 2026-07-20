@@ -306,6 +306,64 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             "priceProtect": False,
         }
 
+    def _track_submission_unknown_order(
+            self,
+            client_order_id: str,
+            exchange_order_id: Optional[str] = None,
+            trade_type: TradeType = TradeType.SELL,
+    ) -> InFlightOrder:
+        self.exchange.start_tracking_order(
+            order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=self.trading_pair,
+            trade_type=trade_type,
+            price=Decimal("10000.125"),
+            amount=Decimal("1.250"),
+            order_type=OrderType.LIMIT,
+            leverage=1,
+            position_action=PositionAction.OPEN,
+        )
+        self.exchange._unknown_submission_order_ids.add(client_order_id)
+        return self.exchange.in_flight_orders[client_order_id]
+
+    def _submission_unknown_user_event(
+            self,
+            client_order_id: str,
+            exchange_order_id: int = 8886774,
+            status: str = "NEW",
+            side: str = "SELL",
+    ) -> Dict[str, Any]:
+        return {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 1700000000124,
+            "T": 1700000000123,
+            "o": {
+                "s": self.symbol,
+                "c": client_order_id,
+                "S": side,
+                "o": "LIMIT",
+                "f": "GTC",
+                "q": "1.250",
+                "p": "10000.125",
+                "ap": "0",
+                "x": "NEW",
+                "X": status,
+                "i": exchange_order_id,
+                "l": "0",
+                "z": "0",
+                "L": "0",
+                "N": self.quote_asset,
+                "n": "0",
+                "T": 1700000000123,
+                "t": 0,
+                "m": False,
+                "R": False,
+                "ps": "BOTH",
+                "cp": False,
+                "rp": "0",
+            },
+        }
+
     def _get_reconciliation_trade(
             self,
             trade_id: int = 698759,
@@ -2397,6 +2455,321 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                 self.exchange._api_get = AsyncMock(side_effect=asyncio.CancelledError)
                 with self.assertRaises(asyncio.CancelledError):
                     await call()
+
+    async def test_submission_unknown_native_polling_keeps_four_not_found_observations_non_terminal(self):
+        client_order_id = "exec-sndk-snxx-0014-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._api_get = AsyncMock(return_value={
+            "code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE,
+            "msg": CONSTANTS.ORDER_NOT_EXIST_MESSAGE,
+        })
+        self.exchange._update_order_fills_from_trades = AsyncMock()
+        self.exchange._update_balances = AsyncMock()
+        self.exchange._update_positions = AsyncMock()
+
+        observed_states = []
+        for _ in range(4):
+            await self.exchange._status_polling_loop_fetch_updates()
+            observed_states.append((
+                tracked_order.current_state,
+                tracked_order.exchange_order_id,
+                self.exchange.is_order_submission_unknown(client_order_id),
+                self.exchange._order_tracker._order_not_found_records.get(client_order_id, 0),
+                client_order_id in self.exchange.in_flight_orders,
+            ))
+
+        self.assertEqual(
+            [(OrderState.PENDING_CREATE, None, True, 0, True)] * 4,
+            observed_states,
+        )
+        self.assertNotIn(client_order_id, self.exchange._order_tracker.lost_orders)
+        self.assertEqual(4, self.exchange._api_get.await_count)
+        for request in self.exchange._api_get.await_args_list:
+            self.assertEqual(CONSTANTS.ORDER_URL, request.kwargs["path_url"])
+            self.assertEqual(CONSTANTS.GET_ORDER_LIMIT_ID, request.kwargs["limit_id"])
+            self.assertTrue(request.kwargs["return_err"])
+
+    async def test_submission_unknown_cancel_not_found_never_counts_or_fails_order(self):
+        client_order_id = "exec-sndk-snxx-0015-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        self.exchange._api_delete = AsyncMock(return_value={
+            "code": CONSTANTS.UNKNOWN_ORDER_ERROR_CODE,
+            "msg": f"{CONSTANTS.UNKNOWN_ORDER_MESSAGE}.",
+        })
+
+        with patch.object(
+            self.exchange._order_tracker,
+            "process_order_not_found",
+            wraps=self.exchange._order_tracker.process_order_not_found,
+        ) as process_not_found:
+            result = await self.exchange._execute_order_cancel(tracked_order)
+
+        self.assertIsNone(result)
+        process_not_found.assert_not_awaited()
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(
+            0,
+            self.exchange._order_tracker._order_not_found_records.get(client_order_id, 0),
+        )
+        request = self.exchange._api_delete.await_args.kwargs
+        self.assertEqual(CONSTANTS.ORDER_URL, request["path_url"])
+        self.assertNotIn("limit_id", request)
+
+    async def test_submission_unknown_cancel_minus_2013_is_also_non_terminal(self):
+        client_order_id = "exec-sndk-snxx-0016-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        self.exchange._api_delete = AsyncMock(return_value={
+            "code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE,
+            "msg": CONSTANTS.ORDER_NOT_EXIST_MESSAGE,
+        })
+
+        result = await self.exchange._execute_order_cancel(tracked_order)
+
+        self.assertIsNone(result)
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(
+            0,
+            self.exchange._order_tracker._order_not_found_records.get(client_order_id, 0),
+        )
+
+    async def test_submission_unknown_native_positive_status_validates_updates_and_clears(self):
+        client_order_id = "exec-sndk-snxx-0017-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._api_get = AsyncMock(return_value=self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            status="NEW",
+            executed_quantity="0",
+        ))
+
+        await self.exchange._update_order_status()
+        await asyncio.sleep(0.001)
+
+        self.assertEqual(OrderState.OPEN, tracked_order.current_state)
+        self.assertEqual("8886774", tracked_order.exchange_order_id)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+        request = self.exchange._api_get.await_args.kwargs
+        self.assertEqual(CONSTANTS.GET_ORDER_LIMIT_ID, request["limit_id"])
+        self.assertNotIn(CONSTANTS.ORDERS_1MIN, request.values())
+        self.assertNotIn(CONSTANTS.ORDERS_1SEC, request.values())
+
+    async def test_submission_unknown_native_malformed_positive_status_cannot_mutate_or_clear(self):
+        client_order_id = "exec-sndk-snxx-0018-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        self.exchange._last_poll_timestamp = 0
+        malformed = self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            status="NEW",
+            executed_quantity="0",
+        )
+        del malformed["avgPrice"]
+        self.exchange._api_get = AsyncMock(return_value=malformed)
+
+        await self.exchange._update_order_status()
+        await asyncio.sleep(0.001)
+
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_submission_unknown_typed_not_found_then_positive_updates_exact_order_idempotently(self):
+        client_order_id = "exec-sndk-snxx-0019-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        created_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.SellOrderCreated, created_logger)
+        not_found = {
+            "code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE,
+            "msg": CONSTANTS.ORDER_NOT_EXIST_MESSAGE,
+        }
+        positive = self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            status="NEW",
+            executed_quantity="0",
+        )
+        self.exchange._api_get = AsyncMock(side_effect=[not_found, positive, positive.copy()])
+
+        not_found_fact = await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            client_order_id,
+        )
+
+        self.assertTrue(not_found_fact.is_not_found)
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(
+            0,
+            self.exchange._order_tracker._order_not_found_records.get(client_order_id, 0),
+        )
+
+        self.exchange._order_tracker._order_not_found_records[client_order_id] = 2
+        positive_fact = await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            client_order_id,
+        )
+        repeated_fact = await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            client_order_id,
+        )
+
+        self.assertFalse(positive_fact.is_not_found)
+        self.assertEqual(positive_fact, repeated_fact)
+        self.assertEqual(OrderState.OPEN, tracked_order.current_state)
+        self.assertEqual("8886774", tracked_order.exchange_order_id)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertNotIn(client_order_id, self.exchange._order_tracker._order_not_found_records)
+        self.assertEqual(1, len(created_logger.event_log))
+
+    async def test_submission_unknown_user_stream_malformed_and_wrong_id_events_do_not_clear(self):
+        malformed_id = "exec-sndk-snxx-0020-stock-0"
+        self._simulate_trading_rules_initialized()
+        malformed_order = self._track_submission_unknown_order(malformed_id)
+        secret_status = "private-response-payload-sentinel"
+        malformed_event = self._submission_unknown_user_event(
+            client_order_id=malformed_id,
+            status=secret_status,
+        )
+
+        with self.assertRaises(Exception) as malformed_error:
+            await self.exchange._process_user_stream_event(malformed_event)
+
+        self.assertNotIn(secret_status, str(malformed_error.exception))
+        self.assertIsNone(malformed_error.exception.__cause__)
+        self.assertIsNone(malformed_error.exception.__context__)
+        self.assertEqual(OrderState.PENDING_CREATE, malformed_order.current_state)
+        self.assertTrue(self.exchange.is_order_submission_unknown(malformed_id))
+
+        wrong_id = "exec-sndk-snxx-0021-stock-0"
+        wrong_id_order = self._track_submission_unknown_order(
+            wrong_id,
+            exchange_order_id="8886774",
+        )
+        wrong_id_event = self._submission_unknown_user_event(
+            client_order_id=wrong_id,
+            exchange_order_id=9999999,
+        )
+
+        with self.assertRaises(ValueError):
+            await self.exchange._process_user_stream_event(wrong_id_event)
+
+        self.assertEqual(OrderState.PENDING_CREATE, wrong_id_order.current_state)
+        self.assertEqual("8886774", wrong_id_order.exchange_order_id)
+        self.assertTrue(self.exchange.is_order_submission_unknown(wrong_id))
+
+    async def test_submission_unknown_valid_user_stream_event_updates_once_and_clears(self):
+        client_order_id = "exec-sndk-snxx-0022-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        created_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.SellOrderCreated, created_logger)
+        event = self._submission_unknown_user_event(client_order_id=client_order_id)
+
+        await self.exchange._process_user_stream_event(event)
+        await asyncio.sleep(0.001)
+        await self.exchange._process_user_stream_event(event)
+        await asyncio.sleep(0.001)
+
+        self.assertEqual(OrderState.OPEN, tracked_order.current_state)
+        self.assertEqual("8886774", tracked_order.exchange_order_id)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(1, len(created_logger.event_log))
+
+    async def test_submission_unknown_restore_pending_without_exchange_id_is_conservative(self):
+        client_order_id = "exec-sndk-snxx-0023-stock-0"
+        restored_order = InFlightOrder(
+            client_order_id=client_order_id,
+            exchange_order_id=None,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1.250"),
+            price=Decimal("10000.125"),
+            creation_timestamp=1700000000,
+            initial_state=OrderState.PENDING_CREATE,
+        )
+
+        self.exchange.restore_tracking_states({client_order_id: restored_order.to_json()})
+
+        tracked_order = self.exchange.in_flight_orders[client_order_id]
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+
+    async def test_submission_unknown_native_polling_redacts_errors_and_propagates_cancellation(self):
+        client_order_id = "exec-sndk-snxx-0024-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        self.exchange._last_poll_timestamp = 0
+        secret_payload = "private-key-and-response-payload-sentinel"
+        self.exchange._api_get = AsyncMock(side_effect=IOError(secret_payload))
+
+        await self.exchange._update_order_status()
+
+        self.assertFalse(any(secret_payload in record.getMessage() for record in self.log_records))
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(
+            0,
+            self.exchange._order_tracker._order_not_found_records.get(client_order_id, 0),
+        )
+
+        self.exchange._api_get = AsyncMock(side_effect=asyncio.CancelledError)
+        with self.assertRaises(asyncio.CancelledError):
+            await self.exchange._update_order_status()
+
+    async def test_submission_unknown_get_and_write_rate_limit_identities_remain_separate(self):
+        get_order_limit = next(
+            rate_limit
+            for rate_limit in CONSTANTS.RATE_LIMITS
+            if rate_limit.limit_id == CONSTANTS.GET_ORDER_LIMIT_ID
+        )
+        write_order_limit = next(
+            rate_limit
+            for rate_limit in CONSTANTS.RATE_LIMITS
+            if rate_limit.limit_id == CONSTANTS.ORDER_URL
+        )
+
+        self.assertEqual(
+            [(CONSTANTS.REQUEST_WEIGHT, 1)],
+            [(link.limit_id, link.weight) for link in get_order_limit.linked_limits],
+        )
+        self.assertEqual(
+            {
+                (CONSTANTS.REQUEST_WEIGHT, 1),
+                (CONSTANTS.ORDERS_1MIN, 1),
+                (CONSTANTS.ORDERS_1SEC, 1),
+            },
+            {(link.limit_id, link.weight) for link in write_order_limit.linked_limits},
+        )
+
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(return_value={
+            "updateTime": 1700000000000,
+            "status": "NEW",
+            "orderId": 8886774,
+        })
+        await self.exchange._place_order(
+            trade_type=TradeType.SELL,
+            order_id="exec-sndk-snxx-0025-stock-0",
+            trading_pair=self.trading_pair,
+            amount=Decimal("1.250"),
+            order_type=OrderType.LIMIT,
+            position_action=PositionAction.OPEN,
+            price=Decimal("10000.125"),
+        )
+
+        request = self.exchange._api_post.await_args.kwargs
+        self.assertEqual(CONSTANTS.ORDER_URL, request["path_url"])
+        self.assertNotIn("limit_id", request)
 
     @patch("hummingbot.connector.utils.get_tracking_nonce")
     async def test_client_order_id_on_order(self, mocked_nonce):
