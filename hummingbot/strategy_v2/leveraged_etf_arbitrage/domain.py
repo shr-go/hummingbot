@@ -5,6 +5,7 @@ from typing import Optional
 
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
     DecisionCertainty,
+    DecisionSemanticKind,
     DecisionValue,
     decision_decimal_context,
     validate_bounded_decimal,
@@ -118,15 +119,21 @@ class Opportunity:
         if not isinstance(self.direction, ArbitrageDirection):
             raise TypeError("direction must be an ArbitrageDirection")
         _validate_decimal(self.hedge_ratio, "hedge ratio", positive=True)
-        for decision_value, field_name in (
-            (self.theoretical_etf_price, "theoretical ETF price"),
-            (self.net_bp, "net bp"),
+        for decision_value, field_name, semantic_kind in (
+            (
+                self.theoretical_etf_price,
+                "theoretical ETF price",
+                DecisionSemanticKind.THEORETICAL_ETF_PRICE,
+            ),
+            (self.net_bp, "net bp", DecisionSemanticKind.OPPORTUNITY_NET_BP),
         ):
             if not isinstance(decision_value, DecisionValue):
                 raise TypeError(f"{field_name} must be a DecisionValue")
             decision_value.validate_integrity()
-            if decision_value.certainty is not DecisionCertainty.EXACT:
+            if decision_value.certainty is not DecisionCertainty.EXACT_DERIVED:
                 raise ValueError(f"{field_name} must retain exact decision authority")
+            if decision_value.semantic_kind is not semantic_kind:
+                raise ValueError(f"{field_name} has the wrong decision semantic kind")
         _validate_decimal(self.theoretical_etf_price.display, "theoretical ETF price", positive=True)
         _validate_decimal(self.gross_profit_quote, "gross profit quote", positive=True)
         _validate_decimal(self.raw_bp, "raw bp", positive=True)

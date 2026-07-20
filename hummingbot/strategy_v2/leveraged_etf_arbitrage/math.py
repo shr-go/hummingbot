@@ -16,7 +16,10 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
     RoundTripCosts,
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
+    DecisionSemanticKind,
     DecisionValue,
+    RawDecisionKind,
+    RawExactDecision,
     decision_decimal_context,
     validate_bounded_decimal,
 )
@@ -38,15 +41,12 @@ def _decision_parts(
     value: object,
     name: str,
     *,
+    semantic_kind: DecisionSemanticKind,
+    raw_kind: RawDecisionKind | None,
     positive: bool = False,
     nonnegative: bool = False,
 ) -> tuple[Decimal, Fraction | None]:
-    """Separate display from exact decision authority.
-
-    A plain Decimal is explicitly caller-supplied raw data and therefore has an
-    exact finite ratio. A DecisionValue is derived data and may only supply an
-    exact ratio when its serialized contract remains intact.
-    """
+    """Authorize only a recomputable derived value or a kind-bound raw value."""
 
     if isinstance(value, DecisionValue):
         value.validate_integrity()
@@ -57,14 +57,27 @@ def _decision_parts(
             nonnegative=nonnegative,
         )
         exact = value.exact_fraction
+        if exact is not None and value.semantic_kind is not semantic_kind:
+            return display, None
         if exact is not None:
             if positive and exact <= 0:
                 raise ValueError(f"{name} exact value must be positive")
             if nonnegative and exact < 0:
                 raise ValueError(f"{name} exact value must be nonnegative")
         return display, exact
+    if isinstance(value, RawExactDecision):
+        value.validate_integrity()
+        display = _decimal(
+            value.value,
+            f"{name} raw value",
+            positive=positive,
+            nonnegative=nonnegative,
+        )
+        if raw_kind is None or value.kind is not raw_kind:
+            return display, None
+        return display, value.exact_fraction
     display = _decimal(value, name, positive=positive, nonnegative=nonnegative)
-    return display, Fraction(display)
+    return display, None
 
 
 def _threshold_display(
@@ -228,23 +241,31 @@ def calculate_theoretical_etf_price(
     )
     if exact_price <= 0:
         raise ValueError("theoretical ETF price must be positive")
-    display = _display_exact_fraction(
-        exact_price,
-        "theoretical ETF price result",
-        positive=True,
+    return DecisionValue.from_theoretical_price_operands(
+        stock_price=stock_price,
+        stock_anchor=stock_anchor,
+        etf_anchor=etf_anchor,
+        etf_daily_multiplier=etf_daily_multiplier,
     )
-    return DecisionValue.from_exact_fraction(exact_price, display=display)
 
 
 @_fixed_decimal_context
 def determine_arbitrage_direction(
-    etf_price: Decimal | DecisionValue,
-    theoretical_etf_price: Decimal | DecisionValue,
+    etf_price: Decimal | RawExactDecision | DecisionValue,
+    theoretical_etf_price: Decimal | RawExactDecision | DecisionValue,
 ) -> Optional[ArbitrageDirection]:
-    _, exact_etf_price = _decision_parts(etf_price, "ETF price", positive=True)
+    _, exact_etf_price = _decision_parts(
+        etf_price,
+        "ETF price",
+        semantic_kind=DecisionSemanticKind.THEORETICAL_ETF_PRICE,
+        raw_kind=RawDecisionKind.ETF_PRICE,
+        positive=True,
+    )
     _, exact_theoretical_price = _decision_parts(
         theoretical_etf_price,
         "theoretical ETF price",
+        semantic_kind=DecisionSemanticKind.THEORETICAL_ETF_PRICE,
+        raw_kind=None,
         positive=True,
     )
     if exact_etf_price is None or exact_theoretical_price is None:
@@ -400,7 +421,7 @@ def calculate_opportunity(
         etf_contract_multiplier,
         stock_contract_multiplier,
     )
-    exact_gross_profit, _exact_raw_bp, exact_net_bp = _exact_opportunity_bp(
+    exact_gross_profit, _exact_raw_bp, _exact_net_bp = _exact_opportunity_bp(
         stock_anchor=stock_anchor,
         etf_anchor=etf_anchor,
         etf_daily_multiplier=etf_daily_multiplier,
@@ -426,6 +447,21 @@ def calculate_opportunity(
         maker_slippage_bp_per_fill,
     )
     net_bp_display = raw_bp_display - costs.total_bp
+    net_bp = DecisionValue.from_opportunity_net_bp_operands(
+        stock_anchor=stock_anchor,
+        etf_anchor=etf_anchor,
+        etf_daily_multiplier=etf_daily_multiplier,
+        stock_entry_price=stock_entry_price,
+        etf_entry_price=etf_entry_price,
+        etf_quantity=etf_quantity,
+        stock_contract_multiplier=stock_contract_multiplier,
+        etf_contract_multiplier=etf_contract_multiplier,
+        maker_fee_bp=maker_fee_bp,
+        taker_fee_bp=taker_fee_bp,
+        maker_slippage_bp_per_fill=maker_slippage_bp_per_fill,
+    )
+    if net_bp.display != net_bp_display:
+        raise ArithmeticError("semantic net bp display diverges from the opportunity ledger")
     return Opportunity(
         direction=direction,
         hedge_ratio=hedge_ratio,
@@ -435,7 +471,7 @@ def calculate_opportunity(
         gross_profit_quote=gross_profit_quote,
         raw_bp=raw_bp_display,
         costs=costs,
-        net_bp=DecisionValue.from_exact_fraction(exact_net_bp, display=net_bp_display),
+        net_bp=net_bp,
     )
 
 
@@ -516,10 +552,15 @@ def _ordered_tiers(
 
 @_fixed_decimal_context
 def select_entry_target(
-    net_bp: Decimal | DecisionValue,
+    net_bp: Decimal | RawExactDecision | DecisionValue,
     position_tiers: Mapping[Decimal | DecisionValue, Decimal],
 ) -> Decimal:
-    _, exact_net_bp = _decision_parts(net_bp, "net bp")
+    _, exact_net_bp = _decision_parts(
+        net_bp,
+        "net bp",
+        semantic_kind=DecisionSemanticKind.OPPORTUNITY_NET_BP,
+        raw_kind=RawDecisionKind.NET_BP,
+    )
     ordered_tiers, all_thresholds_trusted = _ordered_tiers(position_tiers)
     if exact_net_bp is None or not all_thresholds_trusted:
         return Decimal("0")
@@ -555,12 +596,17 @@ def advance_entry_confirmation(
 
 @_fixed_decimal_context
 def select_reduce_target(
-    net_bp: Decimal | DecisionValue,
+    net_bp: Decimal | RawExactDecision | DecisionValue,
     current_target: Decimal,
     position_tiers: Mapping[Decimal | DecisionValue, Decimal],
     reduce_bp_by_current_target: Mapping[Decimal, Decimal | DecisionValue],
 ) -> Decimal:
-    _, exact_net_bp = _decision_parts(net_bp, "net bp")
+    _, exact_net_bp = _decision_parts(
+        net_bp,
+        "net bp",
+        semantic_kind=DecisionSemanticKind.OPPORTUNITY_NET_BP,
+        raw_kind=RawDecisionKind.NET_BP,
+    )
     current_target = _decimal(current_target, "current target", nonnegative=True)
     ordered_tiers, all_tier_thresholds_trusted = _ordered_tiers(position_tiers)
     if current_target == 0:
