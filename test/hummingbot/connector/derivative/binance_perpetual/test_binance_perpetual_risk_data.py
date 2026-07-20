@@ -335,6 +335,42 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("1.2"), position.maint_margin)
         self.assertEqual(int(self.data_time * 1e3), position.update_time_ms)
 
+    def test_position_v3_notional_magnitude_uses_explicit_multiplier_and_tolerance(self):
+        position = BinancePerpetualPositionRiskSnapshot.from_payload(self._position_v3(), self.data_time)
+
+        position.validate_notional_magnitude(
+            position_amount_multiplier=Decimal("1"),
+            tolerance=Decimal("0"),
+        )
+        replace(position, notional=Decimal("0.5")).validate_notional_magnitude(
+            position_amount_multiplier=Decimal("0.01"),
+            tolerance=Decimal("0"),
+        )
+        replace(position, notional=Decimal("49.99")).validate_notional_magnitude(
+            position_amount_multiplier=Decimal("1"),
+            tolerance=Decimal("0.01"),
+        )
+
+        with self.assertRaisesRegex(BinancePerpetualRiskDataError, "notional magnitude"):
+            replace(position, notional=Decimal("49.989999")).validate_notional_magnitude(
+                position_amount_multiplier=Decimal("1"),
+                tolerance=Decimal("0.01"),
+            )
+        for multiplier in (Decimal("0"), Decimal("-1"), Decimal("NaN")):
+            with self.subTest(multiplier=multiplier):
+                with self.assertRaisesRegex(BinancePerpetualRiskDataError, "multiplier"):
+                    position.validate_notional_magnitude(
+                        position_amount_multiplier=multiplier,
+                        tolerance=Decimal("0.01"),
+                    )
+        for tolerance in (Decimal("-0.01"), Decimal("NaN"), Decimal("Infinity")):
+            with self.subTest(tolerance=tolerance):
+                with self.assertRaisesRegex(BinancePerpetualRiskDataError, "tolerance"):
+                    position.validate_notional_magnitude(
+                        position_amount_multiplier=Decimal("1"),
+                        tolerance=tolerance,
+                    )
+
     def test_instrument_requires_explicit_tradfi_multiplier_and_preserves_non_trading_status(self):
         instrument = BinancePerpetualInstrumentInfo.from_exchange_info(
             self._exchange_info(status="BREAK"), self.trading_pair, self.data_time
@@ -1203,6 +1239,106 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
                 max_age_seconds=5,
                 consistency_tolerance=Decimal("0.01"),
             )
+
+    async def test_risk_preflight_validates_signed_position_notional_magnitude(self):
+        base = self._typed_bundle()
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, brackets) = base
+
+        negative_account = replace(
+            account,
+            positions=(replace(
+                account.positions[0],
+                position_amount=Decimal("-2"),
+                notional=Decimal("-50"),
+            ),),
+        )
+        negative_position = replace(
+            position,
+            position_amount=Decimal("-2"),
+            notional=Decimal("-50"),
+        )
+        negative_bundle = (
+            instrument, negative_account, negative_position, account_config,
+            symbol_config, multi_assets, position_mode, brackets,
+        )
+
+        inactive = self._inactive_bundle()
+        flat_bundle = (
+            inactive[0],
+            inactive[1],
+            replace(
+                inactive[2],
+                entry_price=Decimal("0"),
+                break_even_price=Decimal("0"),
+                mark_price=Decimal("0"),
+            ),
+            *inactive[3:],
+        )
+        explicit_exchange_multiplier_bundle = (
+            replace(instrument, contract_multiplier=Decimal("0.02")),
+            *base[1:],
+        )
+        exact_tolerance_bundle = self._bundle_with_notional(base, Decimal("49.99"))
+        allowed_cases = (
+            ("positive exact", base, Decimal("0")),
+            ("negative exact", negative_bundle, Decimal("0")),
+            ("flat zero", flat_bundle, Decimal("0")),
+            ("exchange contract size is not double applied", explicit_exchange_multiplier_bundle, Decimal("0")),
+            ("exact tolerance boundary", exact_tolerance_bundle, Decimal("0.01")),
+        )
+
+        for name, bundle, tolerance in allowed_cases:
+            with self.subTest(case=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+
+                snapshot = await exchange.strict_account_preflight(
+                    trading_pairs=[self.trading_pair],
+                    related_trading_pairs=[self.trading_pair],
+                    known_position_trading_pairs=(
+                        [] if name == "flat zero" else [self.trading_pair]
+                    ),
+                    max_age_seconds=5,
+                    consistency_tolerance=tolerance,
+                )
+
+                self.assertEqual(bundle[2].notional, snapshot.positions[0].notional)
+                exchange._api_post.assert_not_awaited()
+
+        negative_bad_account = replace(
+            negative_account,
+            positions=(replace(negative_account.positions[0], notional=Decimal("-49")),),
+        )
+        negative_bad_position = replace(negative_position, notional=Decimal("-49"))
+        rejected_cases = (
+            ("matching positive contradiction", self._bundle_with_notional(base, Decimal("49"))),
+            (
+                "matching negative contradiction",
+                (instrument, negative_bad_account, negative_bad_position, account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+            ("outside tolerance", self._bundle_with_notional(base, Decimal("49.989999"))),
+            (
+                "exchange contract size cannot rescale Position V3 facts",
+                self._bundle_with_notional(base, Decimal("0.5")),
+            ),
+        )
+
+        for name, bundle in rejected_cases:
+            with self.subTest(case=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+
+                with self.assertRaisesRegex(BinancePerpetualPreflightError, "notional magnitude"):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        related_trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=5,
+                        consistency_tolerance=Decimal("0.01"),
+                    )
+                exchange._api_post.assert_not_awaited()
 
     async def test_strict_preflight_identifies_each_authoritative_fetch_failure(self):
         fetches = {

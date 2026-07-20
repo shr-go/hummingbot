@@ -2666,6 +2666,122 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         with self.assertRaisesRegex(ValueError, "conflicting client order ID"):
             await self.exchange.get_open_orders(self.trading_pair)
 
+    async def test_typed_open_orders_enforce_active_limit_price_domain(self):
+        self._simulate_trading_rules_initialized()
+        invalid_cases = (
+            ("NEW", "0", "0"),
+            ("PARTIALLY_FILLED", "0.125", "-0"),
+            ("NEW", "0", "-0.001"),
+            ("NEW", "0", "NaN"),
+            ("NEW", "0", "Infinity"),
+        )
+
+        for index, (status, executed_quantity, price) in enumerate(invalid_cases):
+            with self.subTest(status=status, price=price):
+                payload = self._get_reconciliation_order(
+                    client_order_id=f"risk-open-limit-price-{index}",
+                    exchange_order_id=8886800 + index,
+                    status=status,
+                    executed_quantity=executed_quantity,
+                )
+                payload["price"] = price
+                self.exchange._api_get = AsyncMock(return_value=[payload])
+
+                with self.assertRaises(BinancePerpetualOrderDataError):
+                    await self.exchange.get_open_orders(self.trading_pair)
+
+        valid = self._get_reconciliation_order(
+            client_order_id="risk-open-limit-price-valid-0",
+            exchange_order_id=8886810,
+            status="NEW",
+            executed_quantity="0",
+        )
+        self.exchange._api_get = AsyncMock(return_value=[valid])
+
+        facts = await self.exchange.get_open_orders(self.trading_pair)
+
+        self.assertEqual(1, len(facts))
+        self.assertEqual(OrderType.LIMIT, facts[0].order_type)
+        self.assertEqual(Decimal("10000.125"), facts[0].price)
+
+    async def test_order_status_reconciliation_enforces_limit_price_domain_before_side_effects(self):
+        self._simulate_trading_rules_initialized()
+        invalid_prices = ("0", "-0", "-0.001", "NaN", "Infinity")
+
+        for index, price in enumerate(invalid_prices):
+            with self.subTest(price=price):
+                client_order_id = f"risk-status-limit-price-{index}"
+                tracked_order = self._track_submission_unknown_order(client_order_id)
+                payload = self._get_reconciliation_order(
+                    client_order_id=client_order_id,
+                    exchange_order_id=8886820 + index,
+                    status="NEW",
+                    executed_quantity="0",
+                )
+                payload["price"] = price
+                self.exchange._api_get = AsyncMock(return_value=payload)
+                before = self._submission_unknown_mutation_snapshot(tracked_order)
+                observer_counts = self._terminal_observer_counts()
+
+                with self.assertRaises(BinancePerpetualOrderDataError):
+                    await self.exchange.get_order_status_by_client_order_id(
+                        self.trading_pair,
+                        client_order_id,
+                    )
+
+                self.assertEqual(before, self._submission_unknown_mutation_snapshot(tracked_order))
+                self.assertEqual(observer_counts, self._terminal_observer_counts())
+                self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+                self.exchange._api_get.assert_awaited_once()
+
+        valid_client_order_id = "risk-status-limit-price-valid-0"
+        valid_order = self._track_submission_unknown_order(valid_client_order_id)
+        valid_payload = self._get_reconciliation_order(
+            client_order_id=valid_client_order_id,
+            exchange_order_id=8886830,
+            status="NEW",
+            executed_quantity="0",
+        )
+
+        async def valid_response(path_url: str, **_: Any) -> Any:
+            if path_url == CONSTANTS.ORDER_URL:
+                return valid_payload
+            if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                return []
+            raise AssertionError(f"unexpected path {path_url}")
+
+        self.exchange._api_get = AsyncMock(side_effect=valid_response)
+
+        fact = await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            valid_client_order_id,
+        )
+
+        self.assertEqual(Decimal("10000.125"), fact.price)
+        self.assertEqual(OrderState.OPEN, valid_order.current_state)
+        self.assertFalse(self.exchange.is_order_submission_unknown(valid_client_order_id))
+
+    async def test_order_status_allows_documented_market_price_zero_sentinel(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "risk-status-market-price-sentinel-0"
+        payload = self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            exchange_order_id=8886840,
+            status="FILLED",
+            executed_quantity="1.250",
+        )
+        payload.update({"origType": "MARKET", "price": "0", "type": "MARKET"})
+        self.exchange._api_get = AsyncMock(return_value=payload)
+
+        fact = await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            client_order_id,
+        )
+
+        self.assertEqual(OrderType.MARKET, fact.order_type)
+        self.assertEqual(Decimal("0"), fact.price)
+        self.assertEqual(Decimal("1.250"), fact.executed_quantity)
+
     async def test_typed_account_trades_preserve_exact_decimals_and_deduplicate_trade_id(self):
         self._simulate_trading_rules_initialized()
         trade = self._get_reconciliation_trade()
