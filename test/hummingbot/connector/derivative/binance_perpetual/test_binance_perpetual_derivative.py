@@ -22,6 +22,8 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_api_ord
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative import BinancePerpetualDerivative
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_order_data import (
     BinancePerpetualOrderDataError,
+    BinancePerpetualOrderSubmissionFailureKind,
+    classify_binance_order_submission_failure,
 )
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 from hummingbot.connector.trading_rule import TradingRule
@@ -4369,6 +4371,203 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
         self.assertEqual(1, len(failure_logger.event_log))
         self.assertEqual(client_order_id, failure_logger.event_log[0].order_id)
+
+    async def test_feature_contradictory_submission_facts_preserve_public_unknown_lifecycle(self):
+        self._simulate_trading_rules_initialized()
+        cases = (
+            (
+                "raised-unknown-503-rejection-code",
+                IOError(
+                    "Error executing request POST /fapi/v1/order. HTTP status is 503. "
+                    "Error: {'code': -2010, 'msg': 'execution status unknown'}"
+                ),
+                None,
+            ),
+            (
+                "mapping-status-503-overload",
+                None,
+                {"status": 503, "code": -1003, "msg": "Too many requests; please try again."},
+            ),
+            (
+                "mapping-status-code-503-rejection",
+                None,
+                {"status_code": "503", "code": "-2010", "msg": "NEW_ORDER_REJECTED"},
+            ),
+            (
+                "mapping-http-status-400-explicit-unknown",
+                None,
+                {"http_status": 400, "code": -2010, "msg": "send status is unknown"},
+            ),
+        )
+
+        for index, (label, exception, payload) in enumerate(cases):
+            with self.subTest(boundary=label):
+                client_order_id = f"t006-contradiction-{index}"
+                failure_logger = EventLogger()
+                self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+                if exception is not None:
+                    self.exchange._api_post = AsyncMock(side_effect=exception)
+                else:
+                    self.exchange._api_post = AsyncMock(return_value=payload)
+
+                submitted_id = self.exchange.buy(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("3"),
+                    order_type=OrderType.MARKET,
+                    price=Decimal("10000"),
+                    client_order_id=client_order_id,
+                    position_action=PositionAction.OPEN,
+                )
+                await asyncio.sleep(0.01)
+
+                tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+                intent = self.exchange._unknown_submission_order_intents.get(client_order_id)
+                self.assertEqual(client_order_id, submitted_id)
+                self.assertEqual(client_order_id, tracked_order.client_order_id)
+                self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+                self.assertIsNone(tracked_order.exchange_order_id)
+                self.assertIn(client_order_id, self.exchange.in_flight_orders)
+                self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+                self.assertIsNotNone(intent)
+                self.assertEqual(
+                    (CONSTANTS.TIME_IN_FORCE_GTC, False, False, "BOTH"),
+                    (
+                        intent.time_in_force,
+                        intent.reduce_only,
+                        intent.close_position,
+                        intent.position_side,
+                    ),
+                )
+                self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+                self.assertEqual([], failure_logger.event_log)
+                self.exchange.remove_listener(MarketEvent.OrderFailure, failure_logger)
+
+    async def test_feature_consistent_mapping_rejection_remains_publicly_definitive(self):
+        client_order_id = "t006-consistent-reject-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "400",
+            "code": "-2010",
+            "msg": "NEW_ORDER_REJECTED",
+        })
+        failure_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+
+        submitted_id = self.exchange.buy(
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.MARKET,
+            price=Decimal("10000"),
+            client_order_id=client_order_id,
+            position_action=PositionAction.OPEN,
+        )
+        await asyncio.sleep(0.01)
+
+        tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+        self.assertEqual(client_order_id, submitted_id)
+        self.assertEqual(OrderState.FAILED, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+        self.assertNotIn(client_order_id, self.exchange._unknown_submission_order_intents)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(1, len(failure_logger.event_log))
+        self.assertEqual(client_order_id, failure_logger.event_log[0].order_id)
+
+    def test_feature_submission_failure_fact_matrix_fails_closed(self):
+        attribute_failure = IOError("NEW_ORDER_REJECTED")
+        attribute_failure.status_code = "503"
+        attribute_failure.code = -2010
+        ambiguous_cases = (
+            (
+                "raised-explicit-unknown",
+                IOError(
+                    "HTTP status is 503; "
+                    "{'code': -2010, 'msg': 'execution status unknown'}"
+                ),
+            ),
+            (
+                "mapping-status-int",
+                {"status": 503, "code": -1003, "msg": "Too many requests"},
+            ),
+            (
+                "mapping-status-code-string",
+                {"status_code": "503", "code": "-2010", "msg": "NEW_ORDER_REJECTED"},
+            ),
+            ("raised-status-attribute", attribute_failure),
+            (
+                "mapping-http-status-explicit-unknown",
+                {"http_status": 400, "code": -2010, "msg": "send status unknown"},
+            ),
+            (
+                "request-timeout-status",
+                {"status": 408, "code": -2010, "msg": "NEW_ORDER_REJECTED"},
+            ),
+            (
+                "unknown-code-without-status",
+                {"code": -9099, "msg": "unrecognized result"},
+            ),
+            (
+                "malformed-code",
+                {"status": 400, "code": "not-an-integer", "msg": "NEW_ORDER_REJECTED"},
+            ),
+            (
+                "nonintegral-status",
+                {"status": 503.5, "code": -2010, "msg": "NEW_ORDER_REJECTED"},
+            ),
+            (
+                "nonfinite-status",
+                {"status": float("inf"), "code": -2010, "msg": "NEW_ORDER_REJECTED"},
+            ),
+            (
+                "nested-response-5xx",
+                {
+                    "response": {"status": "503"},
+                    "code": -2010,
+                    "msg": "NEW_ORDER_REJECTED",
+                },
+            ),
+            (
+                "ambiguous-code-1006",
+                {"status": 400, "code": -1006, "msg": "UNEXPECTED_RESP"},
+            ),
+            (
+                "ambiguous-code-1007",
+                {"status": 400, "code": -1007, "msg": "TIMEOUT"},
+            ),
+        )
+        authoritative_cases = (
+            (
+                "mapping-consistent-400",
+                {"status": 400, "code": -2010, "msg": "NEW_ORDER_REJECTED"},
+            ),
+            (
+                "mapping-consistent-429",
+                {"status_code": "429", "code": "-2010", "msg": "NEW_ORDER_REJECTED"},
+            ),
+            ("mapping-status-only-400", {"http_status": "400", "msg": "Bad Request"}),
+            ("mapping-status-only-429", {"status": 429, "msg": "Too many requests"}),
+            (
+                "raised-consistent-400",
+                IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED"),
+            ),
+            (
+                "code-and-meaning-without-http",
+                {"code": -2010, "msg": "NEW_ORDER_REJECTED"},
+            ),
+        )
+
+        for label, failure in ambiguous_cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+                    classify_binance_order_submission_failure(failure),
+                )
+        for label, failure in authoritative_cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION,
+                    classify_binance_order_submission_failure(failure),
+                )
 
     async def test_risk_submission_ambiguous_boundaries_preserve_exact_unknown_id(self):
         self._simulate_trading_rules_initialized()
