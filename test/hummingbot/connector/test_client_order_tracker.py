@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import unittest
+import weakref
 from decimal import Decimal
 from typing import Awaitable, Dict
 from unittest.mock import patch
@@ -44,6 +46,29 @@ class MutableStateInFlightOrder(InFlightOrder):
         self.native_fill_audit.append(trade_update.trade_id)
         self.native_fill_count += 1
         return super().update_with_trade_update(trade_update)
+
+
+class EqualityEquivalentStagedToken:
+    def __init__(self, issued_token):
+        self.issued_token = issued_token
+
+    def __hash__(self):
+        return hash(self.issued_token)
+
+    def __eq__(self, other):
+        return other is self.issued_token
+
+
+def event_reusing_identity(identity: int, is_set: bool) -> asyncio.Event:
+    allocated_events = []
+    for _ in range(100_000):
+        candidate = asyncio.Event()
+        allocated_events.append(candidate)
+        if id(candidate) == identity:
+            if is_set:
+                candidate.set()
+            return candidate
+    raise AssertionError(f"CPython did not reuse asyncio.Event identity {identity}")
 
 
 class ClientOrderTrackerUnitTest(unittest.TestCase):
@@ -867,6 +892,221 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
                 len(self.order_filled_logger.event_log),
             ),
         )
+
+    def test_staged_trade_update_rejects_equality_surrogate_without_consuming_issued_token(self):
+        order, trade_update = self._staged_order_and_trade()
+        self.tracker.start_tracking_order(order)
+        completion_waiter = self.ev_loop.create_task(order.wait_until_completely_filled())
+        self.ev_loop.run_until_complete(asyncio.sleep(0))
+        staged_update = self.tracker.stage_trade_update(trade_update)
+        forged_update = EqualityEquivalentStagedToken(staged_update)
+
+        self.assertIsNot(forged_update, staged_update)
+        self.assertEqual(hash(staged_update), hash(forged_update))
+        self.assertEqual(staged_update, forged_update)
+
+        def invoke(callback):
+            try:
+                return None, callback()
+            except Exception as error:
+                return type(error).__name__, None
+
+        def mutation_snapshot():
+            return (
+                order.current_state,
+                order.exchange_order_id,
+                order.executed_amount_base,
+                order.executed_amount_quote,
+                tuple(order.order_fills.items()),
+                order.last_update_timestamp,
+                order.exchange_order_id_update_event.is_set(),
+                order.processed_by_exchange_event.is_set(),
+                order.completely_filled_event.is_set(),
+                self.tracker._in_flight_orders.get(order.client_order_id) is order,
+                len(self.order_filled_logger.event_log),
+                completion_waiter.done(),
+            )
+
+        before_forgery = mutation_snapshot()
+        forged_match = invoke(lambda: self.tracker.staged_trade_update_matches(
+            staged_update=forged_update,
+            expected_trade_update=trade_update,
+            expected_executed_amount_base=order.amount,
+            expected_executed_amount_quote=order.price * order.amount,
+        ))
+        forged_commit = invoke(lambda: self.tracker.commit_trade_update(forged_update))
+        self.ev_loop.run_until_complete(asyncio.sleep(0))
+        after_forgery = mutation_snapshot()
+        issued_match = invoke(lambda: self.tracker.staged_trade_update_matches(
+            staged_update=staged_update,
+            expected_trade_update=trade_update,
+            expected_executed_amount_base=order.amount,
+            expected_executed_amount_quote=order.price * order.amount,
+        ))
+        issued_commit = invoke(lambda: self.tracker.commit_trade_update(staged_update))
+        self.ev_loop.run_until_complete(asyncio.sleep(0))
+        issued_reuse = invoke(lambda: self.tracker.commit_trade_update(staged_update))
+
+        self.assertEqual(("ValueError", None), forged_match)
+        self.assertEqual(("ValueError", None), forged_commit)
+        self.assertEqual(before_forgery, after_forgery)
+        self.assertEqual((None, True), issued_match)
+        self.assertEqual((None, True), issued_commit)
+        self.assertEqual(("ValueError", None), issued_reuse)
+        self.assertEqual(order.amount, order.executed_amount_base)
+        self.assertEqual(trade_update, order.order_fills[trade_update.trade_id])
+        self.assertEqual(1, len(self.order_filled_logger.event_log))
+        self.assertTrue(completion_waiter.done())
+        self.assertEqual(0, len(self.tracker._staged_trade_updates))
+        self.ev_loop.run_until_complete(completion_waiter)
+
+    def test_staged_trade_update_rejects_each_lifecycle_replacement_and_reused_identity(self):
+        lifecycle_attributes = (
+            "exchange_order_id_update_event",
+            "processed_by_exchange_event",
+            "completely_filled_event",
+        )
+        observations = []
+
+        for index, attribute_name in enumerate(lifecycle_attributes):
+            connector = MockExchange()
+            connector._set_current_timestamp(1640000000.0)
+            tracker = ClientOrderTracker(connector=connector)
+            fill_logger = EventLogger()
+            connector.add_listener(MarketEvent.OrderFilled, fill_logger)
+            order, trade_update = self._staged_order_and_trade(
+                client_order_id=f"lifecycle-order-{index}"
+            )
+            tracker.start_tracking_order(order)
+            staged_update = tracker.stage_trade_update(trade_update)
+
+            original_event = getattr(order, attribute_name)
+            original_identity = id(original_event)
+            original_is_set = original_event.is_set()
+            original_reference = weakref.ref(original_event)
+            setattr(order, attribute_name, None)
+            del original_event
+            gc.collect()
+            original_retained = original_reference() is not None
+            if original_retained:
+                replacement_event = asyncio.Event()
+                if original_is_set:
+                    replacement_event.set()
+            else:
+                replacement_event = event_reusing_identity(
+                    identity=original_identity,
+                    is_set=original_is_set,
+                )
+            identity_was_reused = id(replacement_event) == original_identity
+            setattr(order, attribute_name, replacement_event)
+
+            completion_waiter = self.ev_loop.create_task(order.wait_until_completely_filled())
+            self.ev_loop.run_until_complete(asyncio.sleep(0))
+
+            def mutation_snapshot():
+                return (
+                    order.current_state,
+                    order.exchange_order_id,
+                    order.executed_amount_base,
+                    order.executed_amount_quote,
+                    tuple(order.order_fills.items()),
+                    order.last_update_timestamp,
+                    tuple(
+                        (
+                            event_attribute,
+                            id(getattr(order, event_attribute)),
+                            getattr(order, event_attribute).is_set(),
+                        )
+                        for event_attribute in lifecycle_attributes
+                    ),
+                    tracker._in_flight_orders.get(order.client_order_id) is order,
+                    len(fill_logger.event_log),
+                    completion_waiter.done(),
+                )
+
+            before_commit = mutation_snapshot()
+            commit_error = None
+            commit_result = None
+            try:
+                commit_result = tracker.commit_trade_update(staged_update)
+            except Exception as error:
+                commit_error = type(error).__name__
+            self.ev_loop.run_until_complete(asyncio.sleep(0))
+            after_commit = mutation_snapshot()
+            reuse_error = None
+            try:
+                tracker.commit_trade_update(staged_update)
+            except Exception as error:
+                reuse_error = type(error).__name__
+            gc.collect()
+            observations.append((
+                attribute_name,
+                original_retained,
+                identity_was_reused,
+                commit_error,
+                commit_result,
+                before_commit == after_commit,
+                tracker._in_flight_orders.get(order.client_order_id) is order,
+                len(tracker._staged_trade_updates),
+                reuse_error,
+                original_reference() is None,
+            ))
+
+            if completion_waiter.done():
+                self.ev_loop.run_until_complete(completion_waiter)
+            else:
+                completion_waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    self.ev_loop.run_until_complete(completion_waiter)
+
+        self.assertEqual(
+            [
+                (attribute_name, True, False, "RuntimeError", None, True, True, 0, "ValueError", True)
+                for attribute_name in lifecycle_attributes
+            ],
+            observations,
+        )
+
+    def test_staged_trade_update_registry_releases_abandoned_token_and_event_baseline(self):
+        order, trade_update = self._staged_order_and_trade()
+        self.tracker.start_tracking_order(order)
+        original_events = tuple(
+            getattr(order, attribute_name)
+            for attribute_name in (
+                "exchange_order_id_update_event",
+                "processed_by_exchange_event",
+                "completely_filled_event",
+            )
+        )
+        original_event_references = tuple(weakref.ref(event) for event in original_events)
+        staged_update = self.tracker.stage_trade_update(trade_update)
+        staged_update_reference = weakref.ref(staged_update)
+
+        for attribute_name, original_event in zip(
+                (
+                    "exchange_order_id_update_event",
+                    "processed_by_exchange_event",
+                    "completely_filled_event",
+                ),
+                original_events,
+        ):
+            replacement_event = asyncio.Event()
+            if original_event.is_set():
+                replacement_event.set()
+            setattr(order, attribute_name, replacement_event)
+
+        del original_event
+        del original_events
+        del staged_update
+        gc.collect()
+
+        self.assertIsNone(staged_update_reference())
+        self.assertTrue(all(event_reference() is None for event_reference in original_event_references))
+        self.assertEqual(0, len(self.tracker._staged_trade_updates))
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
+        self.assertEqual({}, order.order_fills)
+        self.assertEqual(0, len(self.order_filled_logger.event_log))
+        self.assertIs(order, self.tracker._in_flight_orders[order.client_order_id])
 
     def test_staged_trade_update_rejects_every_material_baseline_or_mapping_change(self):
         def replace_mapping_order(tracker, order):

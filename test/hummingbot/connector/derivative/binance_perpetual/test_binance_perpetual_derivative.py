@@ -1,7 +1,9 @@
 import asyncio
 import functools
+import gc
 import json
 import re
+import weakref
 from dataclasses import FrozenInstanceError
 from decimal import Decimal, Overflow, ROUND_DOWN, ROUND_UP, localcontext
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -28,6 +30,18 @@ from hummingbot.core.data_type.trade_fee import TokenAmount
 from hummingbot.core.event.event_forwarder import EventForwarder
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
+
+
+def event_reusing_identity(identity: int, is_set: bool) -> asyncio.Event:
+    allocated_events = []
+    for _ in range(100_000):
+        candidate = asyncio.Event()
+        allocated_events.append(candidate)
+        if id(candidate) == identity:
+            if is_set:
+                candidate.set()
+            return candidate
+    raise AssertionError(f"CPython did not reuse asyncio.Event identity {identity}")
 
 
 class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
@@ -3306,6 +3320,84 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(committed_snapshot, self._submission_unknown_mutation_snapshot(tracked_order))
         self.assertEqual(1, len(fill_logger.event_log))
+
+    async def test_submission_unknown_stream_rejects_reused_lifecycle_identity_without_observable_effects(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "exec-sndk-snxx-0123-stock-0"
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        tracker = self.exchange._order_tracker
+        fill_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFilled, fill_logger)
+        completion_waiter = asyncio.create_task(tracked_order.wait_until_completely_filled())
+        await asyncio.sleep(0)
+        event = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="FILLED",
+            last_fill_quantity="1.250",
+            cumulative_quantity="1.250",
+            trade_id=1,
+        )
+        before = self._submission_unknown_mutation_snapshot(tracked_order)
+        mapping_before = tracker._in_flight_orders.get(client_order_id)
+        original_matches = tracker.staged_trade_update_matches
+        lifecycle_observation = {}
+
+        def replace_lifecycle_event_after_validation(*args, **kwargs):
+            matches = original_matches(*args, **kwargs)
+            original_event = tracked_order.exchange_order_id_update_event
+            original_identity = id(original_event)
+            original_is_set = original_event.is_set()
+            original_reference = weakref.ref(original_event)
+            tracked_order.exchange_order_id_update_event = None
+            del original_event
+            gc.collect()
+            original_retained = original_reference() is not None
+            if original_retained:
+                replacement_event = asyncio.Event()
+                if original_is_set:
+                    replacement_event.set()
+            else:
+                replacement_event = event_reusing_identity(
+                    identity=original_identity,
+                    is_set=original_is_set,
+                )
+            tracked_order.exchange_order_id_update_event = replacement_event
+            lifecycle_observation.update({
+                "original_retained": original_retained,
+                "identity_reused": id(replacement_event) == original_identity,
+                "original_reference": original_reference,
+            })
+            return matches
+
+        error_name = None
+        with patch.object(
+            tracker,
+            "staged_trade_update_matches",
+            new=replace_lifecycle_event_after_validation,
+        ):
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except Exception as error:
+                error_name = type(error).__name__
+        await asyncio.sleep(0)
+        after = self._submission_unknown_mutation_snapshot(tracked_order)
+        gc.collect()
+
+        self.assertEqual("RuntimeError", error_name)
+        self.assertTrue(lifecycle_observation["original_retained"])
+        self.assertFalse(lifecycle_observation["identity_reused"])
+        self.assertIsNone(lifecycle_observation["original_reference"]())
+        self.assertEqual(before, after)
+        self.assertIs(mapping_before, tracker._in_flight_orders.get(client_order_id))
+        self.assertIs(tracked_order, tracker._in_flight_orders.get(client_order_id))
+        self.assertEqual(0, len(fill_logger.event_log))
+        self.assertFalse(completion_waiter.done())
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(0, len(tracker._staged_trade_updates))
+
+        completion_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await completion_waiter
 
     async def test_submission_unknown_fill_listener_cancellation_cannot_split_commit(self):
         self._simulate_trading_rules_initialized()
