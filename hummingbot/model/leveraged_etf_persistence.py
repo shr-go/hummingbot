@@ -629,10 +629,115 @@ def _canonicalize_sql_tokens(tokens: Sequence[_SQLiteToken]) -> CanonicalSql:
     return tuple(canonical)
 
 
+def _is_atomic_sql_expression(tokens: Sequence[_SQLiteToken]) -> bool:
+    canonical = _canonicalize_sql_tokens(tokens)
+    if not canonical:
+        return False
+    if len(canonical) == 1:
+        return canonical[0][0] in ("identifier", "number", "string")
+    if len(canonical) >= 3 and all(
+        token[0] == "identifier" if index % 2 == 0 else token == ("symbol", ".")
+        for index, token in enumerate(canonical)
+    ):
+        return True
+    function_at = 1
+    while (
+        function_at + 1 < len(canonical)
+        and canonical[function_at] == ("symbol", ".")
+        and canonical[function_at + 1][0] == "identifier"
+    ):
+        function_at += 2
+    if canonical[0][0] != "identifier" or canonical[function_at] != ("symbol", "("):
+        return False
+    depth = 0
+    for index, token in enumerate(canonical[function_at:], start=function_at):
+        if token == ("symbol", "("):
+            depth += 1
+        elif token == ("symbol", ")"):
+            depth -= 1
+            if depth < 0 or (depth == 0 and index != len(canonical) - 1):
+                return False
+    return depth == 0
+
+
+def _strip_redundant_operand_parentheses(tokens: Sequence[_SQLiteToken]) -> Tuple[_SQLiteToken, ...]:
+    """Remove grouping around atomic operands without changing operator precedence."""
+
+    normalized: List[_SQLiteToken] = []
+    cursor = 0
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token != _SQLiteToken("symbol", "("):
+            normalized.append(token)
+            cursor += 1
+            continue
+        inner, after_group = _extract_parenthesized_tokens(tokens, cursor)
+        normalized_inner = _strip_redundant_operand_parentheses(inner)
+        follows_identifier = bool(normalized and _token_is_identifier(normalized[-1]))
+        if _is_atomic_sql_expression(normalized_inner) and not follows_identifier:
+            normalized.extend(normalized_inner)
+        else:
+            normalized.append(_SQLiteToken("symbol", "("))
+            normalized.extend(normalized_inner)
+            normalized.append(_SQLiteToken("symbol", ")"))
+        cursor = after_group
+    return tuple(normalized)
+
+
+def _canonicalize_sql_expression_tokens(tokens: Sequence[_SQLiteToken]) -> CanonicalSql:
+    return _canonicalize_sql_tokens(_strip_redundant_operand_parentheses(tokens))
+
+
 def _normalize_sql(expression: object) -> CanonicalSql:
     """Canonicalize SQLite syntax while preserving literal and identifier boundaries."""
 
-    return _canonicalize_sql_tokens(_sqlite_tokens(expression))
+    return _canonicalize_sql_expression_tokens(_sqlite_tokens(expression))
+
+
+def _sqlite_trigger_target_span(tokens: Sequence[_SQLiteToken]) -> Tuple[int, int, int]:
+    begin_at = next(
+        (index for index, token in enumerate(tokens) if token == _SQLiteToken("word", "begin")),
+        len(tokens),
+    )
+    on_at = next(
+        (index for index, token in enumerate(tokens[:begin_at]) if token == _SQLiteToken("word", "on")),
+        -1,
+    )
+    if on_at < 0 or on_at + 1 >= begin_at or not _token_is_identifier(tokens[on_at + 1]):
+        raise RuntimeError("malformed SQLite trigger target")
+    target_at = on_at + 1
+    if (
+        target_at + 2 < begin_at
+        and tokens[target_at].value.lower() == "main"
+        and tokens[target_at + 1] == _SQLiteToken("symbol", ".")
+        and _token_is_identifier(tokens[target_at + 2])
+    ):
+        target_at += 2
+    return on_at, target_at, target_at + 1
+
+
+def _strip_trigger_main_schema_qualifiers(tokens: Sequence[_SQLiteToken]) -> Tuple[_SQLiteToken, ...]:
+    managed_table_names = {table.name.lower() for table in LEVERAGED_ETF_PERSISTENCE_TABLES}
+    normalized: List[_SQLiteToken] = []
+    cursor = 0
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        normalized.append(token)
+        if (
+            token.kind == "word"
+            and token.value in ("from", "join")
+            and cursor + 3 < len(tokens)
+            and _token_is_identifier(tokens[cursor + 1])
+            and tokens[cursor + 1].value.lower() == "main"
+            and tokens[cursor + 2] == _SQLiteToken("symbol", ".")
+            and _token_is_identifier(tokens[cursor + 3])
+            and tokens[cursor + 3].value.lower() in managed_table_names
+        ):
+            normalized.append(tokens[cursor + 3])
+            cursor += 4
+            continue
+        cursor += 1
+    return tuple(normalized)
 
 
 def _normalize_trigger_sql(expression: object) -> CanonicalSql:
@@ -661,28 +766,22 @@ def _normalize_trigger_sql(expression: object) -> CanonicalSql:
         _SQLiteToken("word", "exists"),
     ):
         del tokens[optional_clause_at : optional_clause_at + 3]
+    on_at, target_at, after_target = _sqlite_trigger_target_span(tokens)
+    if tuple(tokens[after_target : after_target + 3]) == (
+        _SQLiteToken("word", "for"),
+        _SQLiteToken("word", "each"),
+        _SQLiteToken("word", "row"),
+    ):
+        del tokens[after_target : after_target + 3]
+    if target_at != on_at + 1:
+        del tokens[on_at + 1 : target_at]
+    tokens = list(_strip_trigger_main_schema_qualifiers(tokens))
     return _canonicalize_sql_tokens(tokens)
 
 
 def _sqlite_trigger_target(expression: object) -> str:
     tokens = _sqlite_tokens(expression)
-    begin_at = next(
-        (index for index, token in enumerate(tokens) if token == _SQLiteToken("word", "begin")),
-        len(tokens),
-    )
-    on_at = next(
-        (index for index, token in enumerate(tokens[:begin_at]) if token == _SQLiteToken("word", "on")),
-        -1,
-    )
-    if on_at < 0 or on_at + 1 >= begin_at or not _token_is_identifier(tokens[on_at + 1]):
-        raise RuntimeError("malformed SQLite trigger target")
-    target_at = on_at + 1
-    if (
-        target_at + 2 < begin_at
-        and tokens[target_at + 1] == _SQLiteToken("symbol", ".")
-        and _token_is_identifier(tokens[target_at + 2])
-    ):
-        target_at += 2
+    _, target_at, _ = _sqlite_trigger_target_span(tokens)
     return tokens[target_at].value.lower()
 
 
@@ -765,7 +864,7 @@ def _sqlite_check_expressions(connection: Connection, table_name: str) -> Tuple[
         if opening_at >= len(tokens) or tokens[opening_at] != _SQLiteToken("symbol", "("):
             raise RuntimeError(f"malformed SQLite CHECK constraint on {table_name}")
         expression, search_from = _extract_parenthesized_tokens(tokens, opening_at)
-        expressions.append(_canonicalize_sql_tokens(expression))
+        expressions.append(_canonicalize_sql_expression_tokens(expression))
     return tuple(expressions)
 
 
@@ -848,6 +947,24 @@ class _IndexSignature(NamedTuple):
     definition: Optional[Tuple[str, Tuple[CanonicalSql, ...], CanonicalSql]]
 
 
+def _canonicalize_index_key_tokens(tokens: Sequence[_SQLiteToken]) -> CanonicalSql:
+    """Compare key expressions while index_xinfo owns effective order and collation."""
+
+    expression_tokens = list(tokens)
+    if expression_tokens and expression_tokens[-1] == _SQLiteToken("word", "asc"):
+        expression_tokens.pop()
+    if (
+        len(expression_tokens) >= 2
+        and expression_tokens[-2] == _SQLiteToken("word", "collate")
+        and _token_is_identifier(expression_tokens[-1])
+        and expression_tokens[-1].value.lower() == "binary"
+    ):
+        del expression_tokens[-2:]
+    if not expression_tokens:
+        raise RuntimeError("malformed SQLite CREATE INDEX key expression")
+    return _canonicalize_sql_expression_tokens(expression_tokens)
+
+
 def _index_definition_signature(
     create_sql: Optional[str],
 ) -> Optional[Tuple[str, Tuple[CanonicalSql, ...], CanonicalSql]]:
@@ -871,14 +988,14 @@ def _index_definition_signature(
     if opening_at >= len(tokens) or tokens[opening_at] != _SQLiteToken("symbol", "("):
         raise RuntimeError("malformed SQLite CREATE INDEX key list")
     key_tokens, after_keys = _extract_parenthesized_tokens(tokens, opening_at)
-    keys = tuple(_canonicalize_sql_tokens(key) for key in _split_top_level_tokens(key_tokens))
+    keys = tuple(_canonicalize_index_key_tokens(key) for key in _split_top_level_tokens(key_tokens))
     remainder = list(tokens[after_keys:])
     while remainder and remainder[-1] == _SQLiteToken("symbol", ";"):
         remainder.pop()
     if remainder:
         if remainder[0] != _SQLiteToken("word", "where"):
             raise RuntimeError("malformed SQLite CREATE INDEX predicate")
-        predicate = _canonicalize_sql_tokens(remainder[1:])
+        predicate = _canonicalize_sql_expression_tokens(remainder[1:])
     else:
         predicate = tuple()
     return tokens[target_at].value.lower(), keys, predicate
