@@ -20,6 +20,9 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_api_ord
     BinancePerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative import BinancePerpetualDerivative
+from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_order_data import (
+    BinancePerpetualOrderDataError,
+)
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import get_new_client_order_id
@@ -531,6 +534,14 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             tracked_order.is_pending_create,
             tracked_order.is_open,
             tracked_order.is_done,
+        )
+
+    def _terminal_observer_counts(self) -> tuple:
+        return (
+            len(self.order_filled_logger.event_log),
+            len(self.buy_order_completed_logger.event_log),
+            len(self.sell_order_completed_logger.event_log),
+            len(self.order_cancelled_logger.event_log),
         )
 
     @staticmethod
@@ -4408,6 +4419,151 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.125"), tracked_order.executed_amount_base)
         self.assertEqual(Decimal("1250.015625"), tracked_order.executed_amount_quote)
         self.assertEqual(1, len(self.order_filled_logger.event_log))
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_risk_rest_status_rejects_one_tick_average_mismatch_before_side_effects(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "risk-rest-average-tick-0"
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        payload = self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            status="FILLED",
+            executed_quantity="1.250",
+        )
+        payload["avgPrice"] = "10000.126"
+        trade = self._get_reconciliation_trade(
+            quantity="1.250",
+            quote_quantity="12500.156250",
+        )
+
+        async def response(path_url: str, **_: Any) -> Any:
+            if path_url == CONSTANTS.ORDER_URL:
+                return payload
+            if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                return [trade]
+            raise AssertionError(f"unexpected path {path_url}")
+
+        self.exchange._api_get = AsyncMock(side_effect=response)
+        before = self._submission_unknown_mutation_snapshot(tracked_order)
+        observer_counts = self._terminal_observer_counts()
+
+        with self.assertRaises(BinancePerpetualOrderDataError):
+            await self.exchange.get_order_status_by_client_order_id(
+                self.trading_pair,
+                client_order_id,
+            )
+
+        self.assertEqual(before, self._submission_unknown_mutation_snapshot(tracked_order))
+        self.assertEqual(observer_counts, self._terminal_observer_counts())
+        self.assertEqual(
+            [CONSTANTS.ORDER_URL],
+            [call.kwargs["path_url"] for call in self.exchange._api_get.await_args_list],
+        )
+
+    async def test_risk_rest_status_rejects_fully_executed_non_filled_terminals(self):
+        self._simulate_trading_rules_initialized()
+        statuses = ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH")
+
+        for index, status in enumerate(statuses):
+            with self.subTest(status=status):
+                client_order_id = f"risk-rest-full-non-fill-{index}"
+                tracked_order = self._track_submission_unknown_order(client_order_id)
+                payload = self._get_reconciliation_order(
+                    client_order_id=client_order_id,
+                    status=status,
+                    executed_quantity="1.250",
+                )
+                trade = self._get_reconciliation_trade(
+                    trade_id=710000 + index,
+                    quantity="1.250",
+                    quote_quantity="12500.156250",
+                )
+
+                async def response(path_url: str, **_: Any) -> Any:
+                    if path_url == CONSTANTS.ORDER_URL:
+                        return payload
+                    if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                        return [trade]
+                    raise AssertionError(f"unexpected path {path_url}")
+
+                self.exchange._api_get = AsyncMock(side_effect=response)
+                before = self._submission_unknown_mutation_snapshot(tracked_order)
+                observer_counts = self._terminal_observer_counts()
+
+                with self.assertRaises(BinancePerpetualOrderDataError):
+                    await self.exchange.get_order_status_by_client_order_id(
+                        self.trading_pair,
+                        client_order_id,
+                    )
+
+                self.assertEqual(before, self._submission_unknown_mutation_snapshot(tracked_order))
+                self.assertEqual(observer_counts, self._terminal_observer_counts())
+                self.assertEqual(
+                    [CONSTANTS.ORDER_URL],
+                    [call.kwargs["path_url"] for call in self.exchange._api_get.await_args_list],
+                )
+
+    async def test_risk_unknown_cancel_rejects_average_mismatch_and_full_execution(self):
+        self._simulate_trading_rules_initialized()
+        cases = (
+            ("one-tick average", "0.125", "10000.126", "0.125", "1250.015625"),
+            ("fully executed cancel", "1.250", "10000.125", "1.250", "12500.156250"),
+        )
+
+        for index, (label, executed, average, trade_quantity, trade_quote) in enumerate(cases):
+            with self.subTest(case=label):
+                client_order_id = f"risk-cancel-cumulative-{index}"
+                tracked_order = self._track_submission_unknown_order(client_order_id)
+                payload = self._get_reconciliation_order(
+                    client_order_id=client_order_id,
+                    status="CANCELED",
+                    executed_quantity=executed,
+                )
+                payload["avgPrice"] = average
+                self.exchange._api_delete = AsyncMock(return_value=payload)
+                self.exchange._api_get = AsyncMock(return_value=[self._get_reconciliation_trade(
+                    trade_id=720000 + index,
+                    quantity=trade_quantity,
+                    quote_quantity=trade_quote,
+                )])
+                before = self._submission_unknown_mutation_snapshot(tracked_order)
+                observer_counts = self._terminal_observer_counts()
+
+                result = await self.exchange._execute_order_cancel(tracked_order)
+
+                self.assertIsNone(result)
+                self.assertEqual(before, self._submission_unknown_mutation_snapshot(tracked_order))
+                self.assertEqual(observer_counts, self._terminal_observer_counts())
+                self.exchange._api_get.assert_not_awaited()
+
+    async def test_risk_rest_average_accepts_exact_authoritative_half_tick_boundary(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "risk-rest-average-half-tick-0"
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        payload = self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            status="CANCELED",
+            executed_quantity="0.125",
+        )
+        payload["avgPrice"] = "10000.1255"
+
+        async def response(path_url: str, **_: Any) -> Any:
+            if path_url == CONSTANTS.ORDER_URL:
+                return payload
+            if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                return [self._get_reconciliation_trade()]
+            raise AssertionError(f"unexpected path {path_url}")
+
+        self.exchange._api_get = AsyncMock(side_effect=response)
+
+        fact = await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            client_order_id,
+        )
+
+        self.assertEqual(Decimal("10000.1255"), fact.average_price)
+        self.assertEqual(OrderState.CANCELED, tracked_order.current_state)
+        self.assertEqual(Decimal("0.125"), tracked_order.executed_amount_base)
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
 
     async def test_risk_unknown_rest_status_rejects_each_execution_intent_mismatch(self):

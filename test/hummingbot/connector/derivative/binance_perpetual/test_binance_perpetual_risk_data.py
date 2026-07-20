@@ -902,6 +902,201 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         )
         self.assertFalse(inactive.has_activity)
 
+    def test_risk_position_v3_flat_order_activity_requires_positive_mark_price(self):
+        activity_cases = (
+            ("openOrderInitialMargin", "3"),
+            ("bidNotional", "30"),
+            ("askNotional", "30"),
+        )
+        base = {
+            "positionAmt": "0",
+            "notional": "0",
+            "entryPrice": "0",
+            "breakEvenPrice": "0",
+            "markPrice": "0",
+            "unRealizedProfit": "0",
+            "isolatedMargin": "0",
+            "isolatedWallet": "0",
+            "initialMargin": "0",
+            "maintMargin": "0",
+            "positionInitialMargin": "0",
+            "openOrderInitialMargin": "0",
+            "bidNotional": "0",
+            "askNotional": "0",
+        }
+
+        for field, value in activity_cases:
+            with self.subTest(activity=field):
+                updates = {**base, field: value}
+                if field == "openOrderInitialMargin":
+                    updates["initialMargin"] = value
+                with self.assertRaisesRegex(BinancePerpetualRiskDataError, "markPrice"):
+                    BinancePerpetualPositionRiskSnapshot.from_payload(
+                        self._position_v3(**updates),
+                        self.data_time,
+                    )
+
+                valid = BinancePerpetualPositionRiskSnapshot.from_payload(
+                    self._position_v3(**{**updates, "markPrice": "0.01"}),
+                    self.data_time,
+                )
+                self.assertTrue(valid.has_activity)
+                self.assertEqual(Decimal("0"), valid.entry_price)
+                self.assertEqual(Decimal("0"), valid.break_even_price)
+
+    def test_risk_dtos_require_maintenance_margin_at_or_below_initial_margin(self):
+        account_equality = self._account_v3(totalMaintMargin="13")
+        self.assertEqual(
+            Decimal("13"),
+            BinancePerpetualAccountRiskSnapshot.from_payload(
+                account_equality,
+                self.data_time,
+            ).total_maint_margin,
+        )
+        with self.assertRaises(BinancePerpetualRiskDataError):
+            BinancePerpetualAccountRiskSnapshot.from_payload(
+                self._account_v3(totalMaintMargin="13.00000001"),
+                self.data_time,
+            )
+
+        asset_equality = self._account_v3()
+        asset_equality["assets"][0]["maintMargin"] = "13"
+        self.assertEqual(
+            Decimal("13"),
+            BinancePerpetualAccountRiskSnapshot.from_payload(
+                asset_equality,
+                self.data_time,
+            ).assets[0].maint_margin,
+        )
+        invalid_asset = self._account_v3()
+        invalid_asset["assets"][0]["maintMargin"] = "13.00000001"
+        with self.assertRaises(BinancePerpetualRiskDataError):
+            BinancePerpetualAccountRiskSnapshot.from_payload(invalid_asset, self.data_time)
+
+        account_position_equality = self._account_v3()
+        account_position_equality["positions"][0]["maintMargin"] = "13"
+        self.assertEqual(
+            Decimal("13"),
+            BinancePerpetualAccountRiskSnapshot.from_payload(
+                account_position_equality,
+                self.data_time,
+            ).positions[0].maint_margin,
+        )
+        invalid_account_position = self._account_v3()
+        invalid_account_position["positions"][0]["maintMargin"] = "13.00000001"
+        with self.assertRaises(BinancePerpetualRiskDataError):
+            BinancePerpetualAccountRiskSnapshot.from_payload(
+                invalid_account_position,
+                self.data_time,
+            )
+
+        self.assertEqual(
+            Decimal("13"),
+            BinancePerpetualPositionRiskSnapshot.from_payload(
+                self._position_v3(maintMargin="13"),
+                self.data_time,
+            ).maint_margin,
+        )
+        with self.assertRaises(BinancePerpetualRiskDataError):
+            BinancePerpetualPositionRiskSnapshot.from_payload(
+                self._position_v3(maintMargin="13.00000001"),
+                self.data_time,
+            )
+
+    async def test_risk_preflight_rejects_matching_flat_open_order_with_zero_mark_price(self):
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, brackets) = self._inactive_bundle()
+        source_time_ms = int(self.data_time * 1e3)
+        account = replace(
+            account,
+            total_initial_margin=Decimal("3"),
+            total_maint_margin=Decimal("1"),
+            total_open_order_initial_margin=Decimal("3"),
+            assets=(replace(
+                account.assets[0],
+                initial_margin=Decimal("3"),
+                maint_margin=Decimal("1"),
+                open_order_initial_margin=Decimal("3"),
+            ),),
+            positions=(replace(
+                account.positions[0],
+                initial_margin=Decimal("3"),
+                maint_margin=Decimal("1"),
+                update_time_ms=source_time_ms,
+            ),),
+        )
+        position = replace(
+            position,
+            entry_price=Decimal("0"),
+            break_even_price=Decimal("0"),
+            mark_price=Decimal("0"),
+            initial_margin=Decimal("3"),
+            maint_margin=Decimal("1"),
+            open_order_initial_margin=Decimal("3"),
+            bid_notional=Decimal("30"),
+            update_time_ms=source_time_ms,
+        )
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(
+            exchange,
+            (instrument, account, position, account_config, symbol_config,
+             multi_assets, position_mode, brackets),
+        )
+
+        with self.assertRaisesRegex(BinancePerpetualPreflightError, "economic domains"):
+            await exchange.strict_account_preflight(
+                trading_pairs=[self.trading_pair],
+                related_trading_pairs=[self.trading_pair],
+                known_position_trading_pairs=[self.trading_pair],
+                max_age_seconds=5,
+            )
+        exchange._api_post.assert_not_awaited()
+
+    async def test_risk_preflight_rejects_matching_impossible_margins_and_allows_equality(self):
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, brackets) = self._typed_bundle()
+
+        def margin_bundle(maintenance_margin: Decimal) -> Tuple[Any, ...]:
+            matching_account = replace(
+                account,
+                total_maint_margin=maintenance_margin,
+                assets=(replace(account.assets[0], maint_margin=maintenance_margin),),
+                positions=(replace(account.positions[0], maint_margin=maintenance_margin),),
+            )
+            matching_position = replace(position, maint_margin=maintenance_margin)
+            return (
+                instrument,
+                matching_account,
+                matching_position,
+                account_config,
+                symbol_config,
+                multi_assets,
+                position_mode,
+                brackets,
+            )
+
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, margin_bundle(Decimal("20")))
+        with self.assertRaisesRegex(BinancePerpetualPreflightError, "economic domains"):
+            await exchange.strict_account_preflight(
+                trading_pairs=[self.trading_pair],
+                related_trading_pairs=[self.trading_pair],
+                known_position_trading_pairs=[self.trading_pair],
+                max_age_seconds=5,
+            )
+        exchange._api_post.assert_not_awaited()
+
+        equality_exchange = self._new_exchange()
+        self._configure_preflight_sources(equality_exchange, margin_bundle(Decimal("13")))
+        snapshot = await equality_exchange.strict_account_preflight(
+            trading_pairs=[self.trading_pair],
+            related_trading_pairs=[self.trading_pair],
+            known_position_trading_pairs=[self.trading_pair],
+            max_age_seconds=5,
+        )
+        self.assertEqual(snapshot.account.total_initial_margin, snapshot.account.total_maint_margin)
+        equality_exchange._api_post.assert_not_awaited()
+
     async def test_risk_preflight_revalidates_typed_domains_and_signed_notional_views(self):
         base = self._typed_bundle()
         instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = base
