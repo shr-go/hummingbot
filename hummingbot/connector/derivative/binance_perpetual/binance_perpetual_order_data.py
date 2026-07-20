@@ -353,6 +353,14 @@ class BinancePerpetualOrderSnapshot:
             )
         if status is BinancePerpetualOrderStatus.FILLED and executed_quantity != original_quantity:
             raise BinancePerpetualOrderDataError("FILLED order reconciliation must have the full quantity executed")
+        if status in {
+            BinancePerpetualOrderStatus.CANCELED,
+            BinancePerpetualOrderStatus.EXPIRED,
+            BinancePerpetualOrderStatus.EXPIRED_IN_MATCH,
+        } and executed_quantity >= original_quantity:
+            raise BinancePerpetualOrderDataError(
+                f"{status.value} order reconciliation must have less than the full quantity executed"
+            )
         if status is BinancePerpetualOrderStatus.REJECTED and executed_quantity != 0:
             raise BinancePerpetualOrderDataError("REJECTED order reconciliation must have zero executed quantity")
         if executed_quantity == 0 and (average_price != 0 or cumulative_quote_quantity != 0):

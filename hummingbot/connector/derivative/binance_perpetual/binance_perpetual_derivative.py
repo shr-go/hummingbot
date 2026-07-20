@@ -362,8 +362,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             field=field,
         )
 
-    def _unknown_stream_authoritative_price_increment(self, tracked_order: InFlightOrder) -> Decimal:
-        trading_rule = self._trading_rules.get(tracked_order.trading_pair)
+    def _authoritative_price_increment(self, trading_pair: str, context: str) -> Decimal:
+        trading_rule = self._trading_rules.get(trading_pair)
         price_increment = None if trading_rule is None else trading_rule.min_price_increment
         if (
             not isinstance(price_increment, Decimal)
@@ -371,13 +371,19 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             or price_increment <= 0
         ):
             raise BinancePerpetualOrderDataError(
-                "user stream authoritative price increment is unavailable"
+                f"{context} authoritative price increment is unavailable"
             )
         self._unknown_stream_exact_decimal_components(
             price_increment,
-            "user stream authoritative price increment",
+            f"{context} authoritative price increment",
         )
         return price_increment
+
+    def _unknown_stream_authoritative_price_increment(self, tracked_order: InFlightOrder) -> Decimal:
+        return self._authoritative_price_increment(
+            trading_pair=tracked_order.trading_pair,
+            context="user stream",
+        )
 
     @classmethod
     def _unknown_stream_price_is_tick_aligned(
@@ -412,7 +418,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         return scaled_price % scaled_increment == 0
 
     @classmethod
-    def _unknown_stream_average_quote_tolerance(
+    def _authoritative_average_quote_tolerance(
             cls,
             price_increment: Decimal,
             cumulative_fill_base_amount: Decimal,
@@ -420,12 +426,12 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         half_tick = cls._unknown_stream_exact_decimal_multiply(
             price_increment,
             Decimal("0.5"),
-            "user stream average price tolerance",
+            "authoritative average price tolerance",
         )
         return cls._unknown_stream_exact_decimal_multiply(
             half_tick,
             cumulative_fill_base_amount,
-            "user stream average price tolerance",
+            "authoritative average price tolerance",
         )
 
     @classmethod
@@ -458,6 +464,48 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             and tracked_quote.is_finite()
             and tracked_quote == expected_quote
         )
+
+    def _validate_rest_order_snapshot_cumulative_price(
+            self,
+            snapshot: BinancePerpetualOrderSnapshot,
+    ) -> None:
+        if snapshot.is_not_found:
+            return
+        average_price = snapshot.average_price
+        executed_quantity = snapshot.executed_quantity
+        cumulative_quote_quantity = snapshot.cumulative_quote_quantity
+        if not all(isinstance(value, Decimal) and value.is_finite() for value in (
+            average_price,
+            executed_quantity,
+            cumulative_quote_quantity,
+        )):
+            raise BinancePerpetualOrderDataError(
+                "REST order snapshot cumulative execution facts are unavailable"
+            )
+        if executed_quantity == 0:
+            return
+        price_increment = self._authoritative_price_increment(
+            trading_pair=snapshot.trading_pair,
+            context="REST order snapshot",
+        )
+        reported_quote_quantity = self._unknown_stream_exact_decimal_multiply(
+            average_price,
+            executed_quantity,
+            "REST order snapshot average quote quantity",
+        )
+        quote_difference = self._unknown_stream_exact_decimal_add(
+            reported_quote_quantity,
+            cumulative_quote_quantity.copy_negate(),
+            "REST order snapshot average quote difference",
+        ).copy_abs()
+        quote_tolerance = self._authoritative_average_quote_tolerance(
+            price_increment=price_increment,
+            cumulative_fill_base_amount=executed_quantity,
+        )
+        if quote_difference > quote_tolerance:
+            raise BinancePerpetualOrderDataError(
+                "REST order snapshot average price contradicts cumulative execution facts"
+            )
 
     def _validate_snapshot_matches_tracked_order(
             self,
@@ -669,6 +717,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         tracked_order = self._order_tracker.all_updatable_orders.get(snapshot.client_order_id)
         if tracked_order is None:
             return False
+        self._validate_rest_order_snapshot_cumulative_price(snapshot)
         self._validate_snapshot_matches_tracked_order(snapshot, tracked_order)
         if not await self._reconcile_authoritative_order_fills(snapshot, tracked_order):
             return False
@@ -771,6 +820,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             expected_client_order_id=client_order_id,
             data_time=data_time,
         )
+        self._validate_rest_order_snapshot_cumulative_price(fact)
         await self._apply_authoritative_order_snapshot(fact)
         return fact
 
@@ -798,6 +848,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 trading_pair=trading_pair,
                 data_time=data_time,
             )
+            self._validate_rest_order_snapshot_cumulative_price(fact)
             if fact.status not in {
                 BinancePerpetualOrderStatus.NEW,
                 BinancePerpetualOrderStatus.PARTIALLY_FILLED,
@@ -2039,7 +2090,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 expected_cumulative_fill_quote_amount.copy_negate(),
                 "user stream average fill quote difference",
             ).copy_abs()
-            average_quote_tolerance = self._unknown_stream_average_quote_tolerance(
+            average_quote_tolerance = self._authoritative_average_quote_tolerance(
                 price_increment=price_increment,
                 cumulative_fill_base_amount=cumulative_fill_base_amount,
             )

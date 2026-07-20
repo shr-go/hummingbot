@@ -109,6 +109,17 @@ def _validate_decimal_value(
         raise BinancePerpetualRiskDataError(f"{field} must be non-negative")
 
 
+def _validate_maintenance_margin_relationship(
+        maintenance_margin: Decimal,
+        initial_margin: Decimal,
+        context: str,
+) -> None:
+    if maintenance_margin > initial_margin:
+        raise BinancePerpetualRiskDataError(
+            f"{context}.maintMargin must not exceed initialMargin"
+        )
+
+
 def _validate_position_identity_and_notional(
         position_side: Any,
         position_amount: Any,
@@ -316,6 +327,11 @@ class BinancePerpetualAccountAsset:
                 f"{context}.{field}",
                 non_negative=field in non_negative_fields,
             )
+        _validate_maintenance_margin_relationship(
+            maintenance_margin=self.maint_margin,
+            initial_margin=self.initial_margin,
+            context=context,
+        )
         _validate_non_negative_integer_value(self.update_time_ms, f"{context}.updateTime")
 
     @classmethod
@@ -387,6 +403,11 @@ class BinancePerpetualAccountPosition:
                 f"{context}.{field}",
                 non_negative=non_negative,
             )
+        _validate_maintenance_margin_relationship(
+            maintenance_margin=self.maint_margin,
+            initial_margin=self.initial_margin,
+            context=context,
+        )
         _validate_non_negative_integer_value(self.update_time_ms, f"{context}.updateTime")
 
     @classmethod
@@ -451,6 +472,11 @@ class BinancePerpetualAccountRiskSnapshot:
                 f"{context}.{field}",
                 non_negative=field in non_negative_fields,
             )
+        _validate_maintenance_margin_relationship(
+            maintenance_margin=self.total_maint_margin,
+            initial_margin=self.total_initial_margin,
+            context=context,
+        )
 
         asset_identities = set()
         for index, asset in enumerate(self.assets):
@@ -592,12 +618,20 @@ class BinancePerpetualPositionRiskSnapshot:
             for field, value in (
                 ("entryPrice", self.entry_price),
                 ("breakEvenPrice", self.break_even_price),
-                ("markPrice", self.mark_price),
             ):
                 if value <= 0:
                     raise BinancePerpetualRiskDataError(
                         f"{context}.{field} must be positive for an active position"
                     )
+        if self.has_activity and self.mark_price <= 0:
+            raise BinancePerpetualRiskDataError(
+                f"{context}.markPrice must be positive for active risk data"
+            )
+        _validate_maintenance_margin_relationship(
+            maintenance_margin=self.maint_margin,
+            initial_margin=self.initial_margin,
+            context=context,
+        )
         _validate_non_negative_integer_value(self.adl, f"{context}.adl")
         if self.adl > 4:
             raise BinancePerpetualRiskDataError(f"{context}.adl must be between 0 and 4")
