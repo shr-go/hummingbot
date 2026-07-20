@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import unittest
 from collections import defaultdict, deque
 from dataclasses import FrozenInstanceError, replace
@@ -181,6 +182,20 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
             target_session_date=TARGET_SESSION_DATE,
             official_close_utc=OFFICIAL_CLOSE,
         )
+
+    async def finalized_with_distinct_evidence(self):
+        first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
+        second_at = first_at + timedelta(seconds=5.15)
+        provider = ScriptedPairProvider(
+            observation_pair(first_at, stock_hash="1", etf_hash="2"),
+            observation_pair(second_at, stock_hash="3", etf_hash="4"),
+        )
+        clock = FakeClock(first_at)
+        acquisition = self.acquisition(clock, provider)
+        first = await acquisition.advance(self.new_checkpoint(acquisition), "SNDK", "SNXX")
+        clock.advance(5.15)
+        final = await acquisition.advance(first.checkpoint, "SNDK", "SNXX")
+        return acquisition, final
 
     async def test_checkpoint_deadline_is_fixed_from_official_close_not_restart_time(self):
         clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=137))
@@ -592,7 +607,8 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
 
         assert replayed.status is AnchorAcquisitionStatus.FINALIZABLE
         assert replayed.checkpoint.confirmation_count == self.nav_config.anchor_confirmation_count
-        persisted = AnchorPollingCheckpoint.from_contract_fields(replayed.checkpoint.to_contract_fields())
+        persisted = AnchorPollingCheckpoint.from_recovery_fields(replayed.checkpoint.to_recovery_fields())
+        assert persisted.confirmation_evidence == confirmed.checkpoint.confirmation_evidence
         replay_clock.current = persisted.next_poll_utc
         replay_clock.monotonic_value += 15
         replayed_again = await restarted.advance(persisted, "SNDK", "SNXX")
@@ -744,3 +760,202 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert assessment.status is FinalizedAnchorStatus.UNCHANGED
         assert assessment.candidate is final.candidate
         assert assessment.revision_observation is None
+
+    async def test_candidate_binds_full_ordered_confirmation_trail_and_round_trips_adapter_fields(self):
+        _, final = await self.finalized_with_distinct_evidence()
+
+        candidate = final.candidate
+        assert candidate.evidence_version == 2
+        assert candidate.pair_id == "sndk_snxx"
+        assert candidate.anchor_source == self.nav_config.anchor_source
+        assert candidate.official_close_utc == OFFICIAL_CLOSE
+        assert candidate.acquisition_started_at_utc == OFFICIAL_CLOSE
+        assert candidate.etf_daily_multiplier == Decimal("2")
+        assert candidate.hedge_ratio == Decimal("0.24")
+        assert candidate.anchor_confirmation_count == self.nav_config.anchor_confirmation_count
+        assert candidate.observed_confirmation_count == self.nav_config.anchor_confirmation_count
+        assert len(candidate.confirmation_evidence) == 2
+        assert [record.confirmation_index for record in candidate.confirmation_evidence] == [1, 2]
+        assert [record.stock_raw_response_hash for record in candidate.confirmation_evidence] == [
+            "1" * 64,
+            "3" * 64,
+        ]
+        assert [record.etf_raw_response_hash for record in candidate.confirmation_evidence] == [
+            "2" * 64,
+            "4" * 64,
+        ]
+        assert all(record.stock_source_url.endswith("/SNDK") for record in candidate.confirmation_evidence)
+        assert all(record.etf_source_url.endswith("/SNXX") for record in candidate.confirmation_evidence)
+        assert candidate.verify_evidence_hash()
+
+        persisted = candidate.to_evidence_fields()
+        restored = type(candidate).from_evidence_fields(persisted)
+
+        assert restored == candidate
+        assert restored.to_evidence_fields() == persisted
+
+    async def test_candidate_hash_binds_every_decision_field_before_revision_classification(self):
+        acquisition, final = await self.finalized_with_distinct_evidence()
+        candidate = final.candidate
+        current_stock, current_etf = observation_pair(candidate.finalized_at_utc + timedelta(seconds=1))
+        corruptions = (
+            ("pair identity", {"pair_id": "intc_intw"}),
+            ("symbol", {"stock_symbol": "INTC"}),
+            ("stock anchor", {"stock_close": Decimal("251")}),
+            ("ETF anchor", {"etf_close": Decimal("31")}),
+            (
+                "session date",
+                {
+                    "cycle_id": "xnys-2026-07-16",
+                    "target_session_date": date(2026, 7, 16),
+                },
+            ),
+            ("multiplier", {"etf_daily_multiplier": Decimal("3")}),
+            ("derived hedge", {"hedge_ratio": Decimal("0.25")}),
+            ("official close", {"official_close_utc": candidate.official_close_utc + timedelta(seconds=1)}),
+            ("acquisition time", {"acquisition_started_at_utc": candidate.acquisition_started_at_utc + timedelta(seconds=1)}),
+            ("finalization time", {"finalized_at_utc": candidate.finalized_at_utc + timedelta(seconds=1)}),
+            ("deadline", {"deadline_utc": candidate.deadline_utc - timedelta(seconds=1)}),
+            ("required count", {"anchor_confirmation_count": candidate.anchor_confirmation_count + 1}),
+            ("observed count", {"observed_confirmation_count": candidate.observed_confirmation_count - 1}),
+            (
+                "confirmation interval",
+                {"anchor_confirmation_interval_seconds": candidate.anchor_confirmation_interval_seconds + 1},
+            ),
+            (
+                "minimum finalize delay",
+                {"anchor_min_finalize_delay_seconds": candidate.anchor_min_finalize_delay_seconds + 1},
+            ),
+            (
+                "pair skew",
+                {"anchor_pair_fetch_max_skew_seconds": candidate.anchor_pair_fetch_max_skew_seconds + 1},
+            ),
+            ("evidence order", {"confirmation_evidence": tuple(reversed(candidate.confirmation_evidence))}),
+            ("evidence drop", {"confirmation_evidence": candidate.confirmation_evidence[1:]}),
+            (
+                "evidence duplicate",
+                {"confirmation_evidence": candidate.confirmation_evidence + candidate.confirmation_evidence[-1:]},
+            ),
+            (
+                "evidence mutation",
+                {
+                    "confirmation_evidence": (
+                        replace(candidate.confirmation_evidence[0], stock_source_url="https://example.invalid/SNDK"),
+                        candidate.confirmation_evidence[1],
+                    )
+                },
+            ),
+        )
+
+        for label, changes in corruptions:
+            with self.subTest(label=label):
+                corrupted = replace(candidate, **changes)
+                assert not corrupted.verify_evidence_hash()
+                assessment = acquisition.assess_finalized(corrupted, current_stock, current_etf)
+                assert assessment.status is FinalizedAnchorStatus.RECOVERY_REQUIRED
+                assert assessment.revision_observation is None
+
+    async def test_candidate_adapter_rejects_reorder_drop_duplicate_and_mutation_with_old_hash(self):
+        _, final = await self.finalized_with_distinct_evidence()
+        candidate = final.candidate
+        fields = candidate.to_evidence_fields()
+        mutations = []
+
+        reordered = copy.deepcopy(fields)
+        reordered["confirmation_evidence"].reverse()
+        mutations.append(("reordered", reordered))
+        dropped = copy.deepcopy(fields)
+        dropped["confirmation_evidence"].pop(0)
+        mutations.append(("dropped", dropped))
+        duplicated = copy.deepcopy(fields)
+        duplicated["confirmation_evidence"].append(copy.deepcopy(duplicated["confirmation_evidence"][-1]))
+        mutations.append(("duplicated", duplicated))
+        changed_hash = copy.deepcopy(fields)
+        changed_hash["confirmation_evidence"][0]["stock_raw_response_hash"] = "a" * 64
+        mutations.append(("raw hash", changed_hash))
+        changed_provenance = copy.deepcopy(fields)
+        changed_provenance["confirmation_evidence"][0]["stock_source_url"] = "https://example.invalid/SNDK"
+        mutations.append(("provenance", changed_provenance))
+
+        for label, corrupted_fields in mutations:
+            with self.subTest(label=label):
+                with self.assertRaises(CheckpointIntegrityError):
+                    type(candidate).from_evidence_fields(corrupted_fields)
+
+    async def test_checkpoint_recovery_adapter_retains_and_integrity_binds_crash_state(self):
+        first_at = OFFICIAL_CLOSE
+        second_at = first_at + timedelta(seconds=5.15)
+        provider = ScriptedPairProvider(
+            observation_pair(first_at, stock_hash="1", etf_hash="2"),
+            observation_pair(second_at, stock_hash="3", etf_hash="4"),
+        )
+        clock = FakeClock(first_at)
+        acquisition = self.acquisition(clock, provider)
+        first = await acquisition.advance(self.new_checkpoint(acquisition), "SNDK", "SNXX")
+        clock.advance(5.15)
+        confirmed = await acquisition.advance(first.checkpoint, "SNDK", "SNXX")
+        assert confirmed.status is AnchorAcquisitionStatus.POLLING
+        assert confirmed.checkpoint.confirmation_count == 2
+
+        recovery_fields = confirmed.checkpoint.to_recovery_fields()
+        restored = AnchorPollingCheckpoint.from_recovery_fields(recovery_fields)
+
+        assert restored == confirmed.checkpoint
+        assert len(restored.confirmation_evidence) == 2
+        corruptions = []
+        reordered = copy.deepcopy(recovery_fields)
+        reordered["confirmation_evidence"].reverse()
+        corruptions.append(reordered)
+        dropped = copy.deepcopy(recovery_fields)
+        dropped["confirmation_evidence"].pop()
+        corruptions.append(dropped)
+        duplicated = copy.deepcopy(recovery_fields)
+        duplicated["confirmation_evidence"].append(copy.deepcopy(duplicated["confirmation_evidence"][-1]))
+        corruptions.append(duplicated)
+        mutated = copy.deepcopy(recovery_fields)
+        mutated["confirmation_evidence"][0]["etf_source_url"] = "https://example.invalid/SNXX"
+        corruptions.append(mutated)
+        for corrupted in corruptions:
+            with self.assertRaises(CheckpointIntegrityError):
+                AnchorPollingCheckpoint.from_recovery_fields(corrupted)
+
+    async def test_crash_before_finalize_and_repeated_finalize_are_full_trail_idempotent(self):
+        first_at = OFFICIAL_CLOSE
+        second_at = first_at + timedelta(seconds=5.15)
+        boundary = OFFICIAL_CLOSE + timedelta(seconds=self.nav_config.anchor_min_finalize_delay_seconds)
+        initial_provider = ScriptedPairProvider(
+            observation_pair(first_at, stock_hash="1", etf_hash="2"),
+            observation_pair(second_at, stock_hash="3", etf_hash="4"),
+        )
+        initial_clock = FakeClock(first_at)
+        initial = self.acquisition(initial_clock, initial_provider)
+        first = await initial.advance(self.new_checkpoint(initial), "SNDK", "SNXX")
+        initial_clock.advance(5.15)
+        confirmed = await initial.advance(first.checkpoint, "SNDK", "SNXX")
+        persisted = confirmed.checkpoint.to_recovery_fields()
+
+        candidates = []
+        for offset, hash_pair in ((0, ("5", "6")), (10, ("7", "8"))):
+            restart_at = boundary + timedelta(seconds=offset)
+            restart_clock = FakeClock(restart_at, monotonic_value=100 + offset)
+            restart_provider = ScriptedPairProvider(
+                observation_pair(
+                    restart_at,
+                    stock_hash=hash_pair[0],
+                    etf_hash=hash_pair[1],
+                    etf_delay_seconds=0,
+                )
+            )
+            restarted = self.acquisition(restart_clock, restart_provider)
+            restored = AnchorPollingCheckpoint.from_recovery_fields(copy.deepcopy(persisted))
+            finalized = await restarted.advance(restored, "SNDK", "SNXX")
+            assert finalized.status is AnchorAcquisitionStatus.FINALIZABLE
+            assert len(finalized.candidate.confirmation_evidence) == 2
+            candidates.append(finalized.candidate)
+
+        assert candidates[0] == candidates[1]
+        assert candidates[0].finalized_at_utc == boundary
+        assert [record.stock_raw_response_hash for record in candidates[0].confirmation_evidence] == [
+            "1" * 64,
+            "3" * 64,
+        ]

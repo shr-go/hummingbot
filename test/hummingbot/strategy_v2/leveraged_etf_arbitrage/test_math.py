@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal, getcontext, localcontext
 from enum import Enum
 
 import pytest
@@ -468,3 +468,113 @@ def test_domain_and_math_results_are_frozen_values():
         level.price = D("11")
     with pytest.raises(FrozenInstanceError):
         state.consecutive_count = 1
+
+
+def _risk_decision_snapshot() -> dict[str, object]:
+    theoretical = calculate_theoretical_etf_price(
+        stock_price=D("110.0049"),
+        stock_anchor=D("100"),
+        etf_anchor=D("50"),
+        etf_daily_multiplier=D("2"),
+    )
+    opportunity = calculate_opportunity(
+        stock_anchor=D("100"),
+        etf_anchor=D("50"),
+        etf_daily_multiplier=D("2"),
+        stock_entry_price=D("110"),
+        etf_entry_price=D("60.25"),
+        etf_quantity=D("10"),
+        stock_contract_multiplier=D("2"),
+        etf_contract_multiplier=D("0.5"),
+        maker_fee_bp=D("1"),
+        taker_fee_bp=D("4"),
+        maker_slippage_bp_per_fill=D("2"),
+    )
+    entry_target = select_entry_target(
+        opportunity.net_bp,
+        {D("0"): D("1"), D("7.395"): D("3"), D("44.58"): D("8")},
+    )
+    reduce_target = select_reduce_target(
+        opportunity.net_bp,
+        D("3"),
+        {D("0"): D("1"), D("8"): D("3")},
+        {D("1"): D("0"), D("3"): D("7.395")},
+    )
+    vwap = depth_vwap(
+        (DepthLevel(D("10.01"), D("2")), DepthLevel(D("10.02"), D("3"))),
+        D("4"),
+        BookSide.BUY,
+    )
+    return {
+        "theoretical": theoretical,
+        "direction": determine_arbitrage_direction(D("60.002"), theoretical),
+        "hedge_ratio": opportunity.hedge_ratio,
+        "quantities": opportunity.quantities,
+        "notionals": opportunity.notionals,
+        "gross_profit_quote": opportunity.gross_profit_quote,
+        "raw_bp": opportunity.raw_bp,
+        "costs": opportunity.costs,
+        "net_bp": opportunity.net_bp,
+        "entry_target": entry_target,
+        "reduce_target": reduce_target,
+        "vwap": vwap,
+        "walk_bp": stock_book_walk_bp(vwap, D("10.01"), BookSide.BUY),
+        "quantized": quantize_quantity(opportunity.quantities.stock_quantity, D("0.0001")),
+    }
+
+
+@pytest.mark.parametrize("precision", [4, 5, 6, 28, 80])
+@pytest.mark.parametrize("rounding", [ROUND_HALF_EVEN, ROUND_DOWN, ROUND_UP])
+def test_every_financial_decision_is_ambient_decimal_context_independent_and_does_not_leak(
+    precision,
+    rounding,
+):
+    with localcontext() as baseline_context:
+        baseline_context.prec = 28
+        baseline_context.rounding = ROUND_HALF_EVEN
+        expected = _risk_decision_snapshot()
+
+    with localcontext() as caller_context:
+        caller_context.prec = precision
+        caller_context.rounding = rounding
+        before = getcontext().copy()
+
+        actual = _risk_decision_snapshot()
+
+        assert actual == expected
+        assert str(getcontext()) == str(before)
+
+
+def test_theoretical_direction_uses_exact_zero_and_first_values_on_either_side():
+    theoretical = calculate_theoretical_etf_price(D("110.0049"), D("100"), D("50"), D("2"))
+
+    assert theoretical == D("60.004900")
+    assert determine_arbitrage_direction(theoretical, theoretical) is None
+    assert determine_arbitrage_direction(
+        theoretical - D("0.000000000000000001"), theoretical
+    ) is ArbitrageDirection.LONG_ETF_SHORT_STOCK
+    assert determine_arbitrage_direction(
+        theoretical + D("0.000000000000000001"), theoretical
+    ) is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+
+
+@pytest.mark.parametrize(
+    "outside_value",
+    [
+        D("1234567890123.1234567890123456"),  # 29 coefficient digits
+        D("1E+13"),  # adjusted exponent above the canonical price/notional range
+        D("1E-19"),  # scale above the canonical 18 decimal places
+        D("-0"),
+        D("NaN"),
+        D("Infinity"),
+    ],
+)
+def test_financial_math_rejects_values_outside_the_bounded_canonical_decimal_domain(outside_value):
+    with pytest.raises(ValueError, match="finite|canonical|signed zero|domain"):
+        select_entry_target(outside_value, {D("0"): D("1")})
+
+
+def test_financial_math_accepts_the_boundary_maximum_canonical_decimal():
+    boundary_maximum = D("9999999999999.123456789012345")
+
+    assert calculate_hedge_ratio(boundary_maximum, boundary_maximum, D("2")) == D("2")

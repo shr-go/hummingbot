@@ -1,6 +1,6 @@
 import copy
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -127,3 +127,48 @@ def test_evidence_hash_helper_rejects_noncanonical_sha256_inputs(bad_hash):
             stock_raw_response_hash=bad_hash,
             etf_raw_response_hash="2" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    "untrusted_decimal",
+    [
+        "1e100000",
+        "1e-100000",
+        "1234567890123.1234567890123456",
+        "1.0000000000000000000",
+        "-0",
+        "NaN",
+        "Infinity",
+    ],
+)
+def test_checkpoint_decimal_fields_are_bounded_before_canonical_fixed_point_rendering(untrusted_decimal):
+    wire_fields = copy.deepcopy(contract_vectors()["fixtures"]["checkpoint_confirmed"])
+    wire_fields["candidate_stock_close"] = untrusted_decimal
+
+    with pytest.raises(CheckpointIntegrityError, match="decimal|digits|exponent|scale|zero|canonical"):
+        AnchorPollingCheckpoint.from_contract_fields(wire_fields)
+
+
+def test_checkpoint_decimal_boundary_maximum_round_trips_canonically():
+    boundary_maximum = "9999999999999.123456789012345"
+    wire_fields = copy.deepcopy(contract_vectors()["fixtures"]["checkpoint_confirmed"])
+    wire_fields["candidate_stock_close"] = boundary_maximum
+
+    checkpoint = AnchorPollingCheckpoint.from_contract_fields(wire_fields)
+
+    assert checkpoint.candidate_stock_close == Decimal(boundary_maximum)
+    assert checkpoint.to_contract_fields()["candidate_stock_close"] == boundary_maximum
+
+
+class FixedPointRenderBomb(Decimal):
+    def __format__(self, format_spec):
+        raise AssertionError("fixed-point rendering ran before Decimal tuple bounds")
+
+
+def test_checkpoint_constructor_rejects_extreme_decimal_without_fixed_point_rendering():
+    checkpoint = AnchorPollingCheckpoint.from_contract_fields(
+        contract_vectors()["fixtures"]["checkpoint_confirmed"]
+    )
+
+    with pytest.raises(CheckpointIntegrityError, match="exponent|domain|decimal"):
+        replace(checkpoint, candidate_stock_close=FixedPointRenderBomb("1e100000"))

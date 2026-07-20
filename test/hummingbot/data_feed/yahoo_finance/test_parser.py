@@ -258,3 +258,29 @@ def test_split_ratio_must_be_exactly_consistent_with_numeric_split_fields(
 
     with pytest.raises(YahooChartParseError, match="splitRatio|consistent"):
         parse_sndk(dump_payload(payload))
+
+
+@pytest.mark.parametrize(
+    "untrusted_number",
+    [
+        "1e100000",
+        "1e-100000",
+        "1234567890123.1234567890123456",
+        "1.0000000000000000000",
+        "-0.0",
+    ],
+)
+def test_untrusted_yahoo_decimals_are_tuple_bounded_before_financial_use(untrusted_number):
+    raw_text = fixture_text("sndk_chart.json").replace("250.125", untrusted_number, 1)
+
+    with pytest.raises(YahooChartParseError, match="decimal|digits|exponent|scale|zero|close"):
+        parse_sndk(raw_text)
+
+
+def test_untrusted_yahoo_decimal_boundary_maximum_is_accepted_without_normalization():
+    boundary_maximum = "9999999999999.123456789012345"
+    raw_text = fixture_text("sndk_chart.json").replace("250.125", boundary_maximum, 1)
+
+    observation = parse_sndk(raw_text)
+
+    assert observation.close == Decimal(boundary_maximum)
