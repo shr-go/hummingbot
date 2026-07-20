@@ -1,4 +1,6 @@
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+import json
+import pickle
+from dataclasses import FrozenInstanceError, asdict, dataclass, fields, is_dataclass
 from decimal import (
     ROUND_DOWN,
     ROUND_HALF_EVEN,
@@ -13,7 +15,9 @@ from enum import Enum
 from fractions import Fraction
 
 import pytest
+from pydantic import create_model
 
+from hummingbot.strategy_v2.leveraged_etf_arbitrage import decimal_policy
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
     ArbitrageDirection,
     BookSide,
@@ -581,7 +585,7 @@ def test_theoretical_direction_retains_exact_provenance_when_display_rounds_acro
     expected_direction: ArbitrageDirection,
 ):
     theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), multiplier)
-    observed_at_displayed_boundary = D(theoretical)
+    observed_at_displayed_boundary = D(theoretical.display)
 
     assert Fraction(observed_at_displayed_boundary) != exact_theoretical
     assert determine_arbitrage_direction(observed_at_displayed_boundary, theoretical) is expected_direction
@@ -609,7 +613,7 @@ def test_entry_and_reduce_boundaries_use_exact_net_bp_not_rounded_up_display_equ
     tiers = {D("0"): D("1"), opportunity.net_bp: D("3")}
     reductions = {D("1"): D("0"), D("3"): opportunity.net_bp}
 
-    assert Fraction(opportunity.net_bp) > exact_net_bp
+    assert Fraction(opportunity.net_bp.display) > exact_net_bp
     assert select_entry_target(opportunity.net_bp, tiers) == D("1")
     assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("1")
 
@@ -620,7 +624,7 @@ def test_entry_and_reduce_boundaries_do_not_fail_closed_when_exact_net_bp_is_abo
     tiers = {D("0"): D("1"), opportunity.net_bp: D("3")}
     reductions = {D("1"): D("0"), D("3"): opportunity.net_bp}
 
-    assert Fraction(opportunity.net_bp) < exact_net_bp
+    assert Fraction(opportunity.net_bp.display) < exact_net_bp
     assert select_entry_target(opportunity.net_bp, tiers) == D("3")
     assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("3")
 
@@ -656,10 +660,161 @@ def test_exact_boundary_decisions_ignore_caller_precision_rounding_and_enabled_i
         assert select_entry_target(opportunity.net_bp, tiers) == D("1")
         assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("1")
         assert (
-            determine_arbitrage_direction(D(theoretical), theoretical)
+            determine_arbitrage_direction(D(theoretical.display), theoretical)
             is ArbitrageDirection.SHORT_ETF_LONG_STOCK
         )
         assert str(getcontext()) == str(before)
+
+
+def test_explicit_decision_value_blocks_decimal_reconstruction_and_preserves_noop_arithmetic():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    tiers = {D("0"): D("1"), opportunity.net_bp: D("3")}
+    reductions = {D("1"): D("0"), D("3"): opportunity.net_bp}
+
+    assert isinstance(opportunity.net_bp, decision_type)
+    assert opportunity.net_bp.exact_fraction == Fraction(10000, 17001)
+    with pytest.raises(TypeError):
+        D(opportunity.net_bp)
+
+    for preserved in (
+        +opportunity.net_bp,
+        opportunity.net_bp + D("0"),
+        D("0") + opportunity.net_bp,
+        opportunity.net_bp - D("0"),
+    ):
+        assert isinstance(preserved, decision_type)
+        assert preserved.exact_fraction == Fraction(10000, 17001)
+        assert select_entry_target(preserved, tiers) == D("1")
+        assert select_reduce_target(preserved, D("3"), tiers, reductions) == D("1")
+
+
+def test_decision_value_round_trips_losslessly_across_dataclass_pydantic_json_and_pickle():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+
+    @dataclass(frozen=True)
+    class DataclassEnvelope:
+        decision: object
+
+    native_fields = asdict(DataclassEnvelope(opportunity.net_bp))["decision"]
+    dataclass_restored = decision_type(**native_fields)
+
+    pydantic_model = create_model("DecisionEnvelope", decision=(decision_type, ...))
+    pydantic_payload = pydantic_model(decision=opportunity.net_bp).model_dump_json()
+    pydantic_restored = pydantic_model.model_validate_json(pydantic_payload).decision
+
+    serialized_fields = json.loads(json.dumps(opportunity.net_bp.to_fields()))
+    json_restored = decision_type.from_fields(serialized_fields)
+    pickle_restored = pickle.loads(pickle.dumps(opportunity.net_bp))
+
+    tiers = {D("0"): D("1"), opportunity.net_bp.display: D("3")}
+    reductions = {D("1"): D("0"), D("3"): opportunity.net_bp.display}
+    for restored in (dataclass_restored, pydantic_restored, json_restored, pickle_restored):
+        assert restored == opportunity.net_bp
+        assert restored.exact_fraction == Fraction(10000, 17001)
+        assert select_entry_target(restored, tiers) == D("1")
+        assert select_reduce_target(restored, D("3"), tiers, reductions) == D("1")
+
+
+def test_missing_or_forged_decision_provenance_is_rejected_and_display_only_is_fail_closed():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    fields_payload = opportunity.net_bp.to_fields()
+
+    missing = dict(fields_payload)
+    missing.pop("exact_numerator")
+    forged = dict(fields_payload)
+    forged["exact_numerator"] = "10001"
+    for invalid_fields in (missing, forged):
+        with pytest.raises(integrity_error):
+            decision_type.from_fields(invalid_fields)
+
+    reconstructed_display = D(opportunity.net_bp.display)
+    untrusted = decision_type.from_untrusted_derived(reconstructed_display)
+    tiers = {D("0"): D("1"), reconstructed_display: D("3")}
+    reductions = {D("1"): D("0"), D("3"): reconstructed_display}
+
+    assert untrusted.exact_fraction is None
+    assert select_entry_target(untrusted, tiers) == D("0")
+    assert select_reduce_target(untrusted, D("3"), tiers, reductions) == D("1")
+
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    untrusted_theoretical = decision_type.from_untrusted_derived(theoretical.display)
+    assert determine_arbitrage_direction(theoretical.display, untrusted_theoretical) is None
+
+
+@pytest.mark.parametrize(
+    ("etf_entry_price", "exact_net_bp", "expected_target"),
+    [
+        (D("60.01"), Fraction(10000, 17001), D("1")),
+        (D("60.02"), Fraction(10000, 8501), D("3")),
+        (D("90"), Fraction(1500), D("3")),
+    ],
+)
+def test_serialized_exact_decision_contract_preserves_both_sides_and_equality_of_boundary(
+    etf_entry_price: Decimal,
+    exact_net_bp: Fraction,
+    expected_target: Decimal,
+):
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    opportunity = _zero_cost_boundary_opportunity(etf_entry_price)
+    restored = decision_type.from_fields(json.loads(json.dumps(opportunity.net_bp.to_fields())))
+    tiers = {D("0"): D("1"), restored.display: D("3")}
+    reductions = {D("1"): D("0"), D("3"): restored.display}
+
+    assert restored.exact_fraction == exact_net_bp
+    assert select_entry_target(restored, tiers) == expected_target
+    assert select_reduce_target(restored, D("3"), tiers, reductions) == expected_target
+
+
+def test_direction_uses_exact_contract_after_noop_json_and_pickle_round_trips():
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    json_restored = decision_type.from_fields(json.loads(json.dumps(theoretical.to_fields())))
+    pickle_restored = pickle.loads(pickle.dumps(theoretical))
+
+    for preserved in (+theoretical, theoretical + D("0"), json_restored, pickle_restored):
+        assert preserved.exact_fraction == Fraction(5, 3)
+        assert (
+            determine_arbitrage_direction(D(preserved.display), preserved)
+            is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+        )
+
+
+@pytest.mark.parametrize("precision", [4, 28, 80])
+@pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP])
+def test_serialized_decision_contract_and_noop_arithmetic_ignore_ambient_context_and_traps(
+    precision,
+    rounding,
+):
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    with localcontext() as caller_context:
+        caller_context.prec = precision
+        caller_context.rounding = rounding
+        caller_context.traps[Inexact] = True
+        caller_context.traps[Rounded] = True
+        before = getcontext().copy()
+
+        opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+        restored = decision_type.from_fields(json.loads(json.dumps(opportunity.net_bp.to_fields())))
+        preserved = +restored + D("0")
+        tiers = {D("0"): D("1"), restored.display: D("3")}
+        reductions = {D("1"): D("0"), D("3"): restored.display}
+
+        assert select_entry_target(preserved, tiers) == D("1")
+        assert select_reduce_target(preserved, D("3"), tiers, reductions) == D("1")
+        assert str(getcontext()) == str(before)
+
+
+def test_plain_decimal_inputs_remain_the_explicit_exact_raw_value_contract():
+    tiers = {D("0"): D("1"), D("22.29"): D("3"), D("44.58"): D("8")}
+    reductions = {D("1"): D("0"), D("3"): D("17"), D("8"): D("39")}
+
+    assert determine_arbitrage_direction(D("62"), D("60")) is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+    assert select_entry_target(D("22.29"), tiers) == D("3")
+    assert select_reduce_target(D("17"), D("3"), tiers, reductions) == D("3")
 
 
 @pytest.mark.parametrize(
