@@ -1,7 +1,7 @@
 import asyncio
 import math
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, AsyncIterable, Collection, Dict, List, Mapping, Optional, Tuple
 
 from bidict import bidict
@@ -65,6 +65,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     LONG_POLL_INTERVAL = 120.0
     MAX_ACCOUNT_DATA_AGE_SECONDS = 5
+    MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS = 128
 
     def __init__(
             self,
@@ -188,23 +189,165 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             raise BinancePerpetualOrderDataError(f"{field} must be a finite decimal")
         return parsed
 
+    @classmethod
+    def _unknown_stream_exact_decimal_components(
+            cls,
+            value: Decimal,
+            field: str,
+    ) -> Tuple[int, int]:
+        if not isinstance(value, Decimal) or not value.is_finite():
+            raise BinancePerpetualOrderDataError(f"{field} must be a supported finite decimal")
+        sign, digits, exponent = value.as_tuple()
+        if (
+            not isinstance(exponent, int)
+            or len(digits) > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+            or abs(exponent) > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+        ):
+            raise BinancePerpetualOrderDataError(f"{field} exceeds supported decimal precision")
+        coefficient = 0
+        for digit in digits:
+            coefficient = coefficient * 10 + digit
+        if sign:
+            coefficient = -coefficient
+        return coefficient, exponent
+
+    @classmethod
+    def _unknown_stream_decimal_from_exact_components(
+            cls,
+            coefficient: int,
+            exponent: int,
+            field: str,
+    ) -> Decimal:
+        while coefficient != 0 and coefficient % 10 == 0:
+            coefficient //= 10
+            exponent += 1
+        coefficient_digits = str(abs(coefficient))
+        if (
+            len(coefficient_digits) > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+            or abs(exponent) > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+        ):
+            raise BinancePerpetualOrderDataError(f"{field} exceeds supported decimal precision")
+        try:
+            result = Decimal((
+                1 if coefficient < 0 else 0,
+                tuple(int(digit) for digit in coefficient_digits),
+                exponent,
+            ))
+        except (InvalidOperation, OverflowError, ValueError):
+            raise BinancePerpetualOrderDataError(f"{field} exceeds supported decimal precision") from None
+        if not result.is_finite():
+            raise BinancePerpetualOrderDataError(f"{field} must be a supported finite decimal")
+        return result
+
+    @classmethod
+    def _unknown_stream_exact_decimal_multiply(
+            cls,
+            left: Decimal,
+            right: Decimal,
+            field: str,
+    ) -> Decimal:
+        left_coefficient, left_exponent = cls._unknown_stream_exact_decimal_components(left, field)
+        right_coefficient, right_exponent = cls._unknown_stream_exact_decimal_components(right, field)
+        return cls._unknown_stream_decimal_from_exact_components(
+            coefficient=left_coefficient * right_coefficient,
+            exponent=left_exponent + right_exponent,
+            field=field,
+        )
+
+    @classmethod
+    def _unknown_stream_exact_decimal_add(
+            cls,
+            left: Decimal,
+            right: Decimal,
+            field: str,
+    ) -> Decimal:
+        left_coefficient, left_exponent = cls._unknown_stream_exact_decimal_components(left, field)
+        right_coefficient, right_exponent = cls._unknown_stream_exact_decimal_components(right, field)
+        if left_coefficient == 0:
+            return right
+        if right_coefficient == 0:
+            return left
+        result_exponent = min(left_exponent, right_exponent)
+        left_shift = left_exponent - result_exponent
+        right_shift = right_exponent - result_exponent
+        left_width = len(str(abs(left_coefficient))) + left_shift
+        right_width = len(str(abs(right_coefficient))) + right_shift
+        if max(left_width, right_width) > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS:
+            raise BinancePerpetualOrderDataError(f"{field} exceeds supported decimal precision")
+        return cls._unknown_stream_decimal_from_exact_components(
+            coefficient=(
+                left_coefficient * (10 ** left_shift)
+                + right_coefficient * (10 ** right_shift)
+            ),
+            exponent=result_exponent,
+            field=field,
+        )
+
+    def _unknown_stream_authoritative_price_increment(self, tracked_order: InFlightOrder) -> Decimal:
+        trading_rule = self._trading_rules.get(tracked_order.trading_pair)
+        price_increment = None if trading_rule is None else trading_rule.min_price_increment
+        if (
+            not isinstance(price_increment, Decimal)
+            or not price_increment.is_finite()
+            or price_increment <= 0
+        ):
+            raise BinancePerpetualOrderDataError(
+                "user stream authoritative price increment is unavailable"
+            )
+        self._unknown_stream_exact_decimal_components(
+            price_increment,
+            "user stream authoritative price increment",
+        )
+        return price_increment
+
+    @classmethod
+    def _unknown_stream_price_is_tick_aligned(
+            cls,
+            price: Decimal,
+            price_increment: Decimal,
+    ) -> bool:
+        price_coefficient, price_exponent = cls._unknown_stream_exact_decimal_components(
+            price,
+            "user stream last fill price",
+        )
+        increment_coefficient, increment_exponent = cls._unknown_stream_exact_decimal_components(
+            price_increment,
+            "user stream authoritative price increment",
+        )
+        if price < price_increment:
+            return False
+        common_exponent = min(price_exponent, increment_exponent)
+        price_shift = price_exponent - common_exponent
+        increment_shift = increment_exponent - common_exponent
+        if (
+            len(str(abs(price_coefficient))) + price_shift
+            > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+            or len(str(abs(increment_coefficient))) + increment_shift
+            > cls.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+        ):
+            raise BinancePerpetualOrderDataError(
+                "user stream last fill price exceeds supported decimal precision"
+            )
+        scaled_price = price_coefficient * (10 ** price_shift)
+        scaled_increment = increment_coefficient * (10 ** increment_shift)
+        return scaled_price % scaled_increment == 0
+
+    @classmethod
     def _unknown_stream_average_quote_tolerance(
-            self,
-            tracked_order: InFlightOrder,
-            average_fill_price: Decimal,
+            cls,
+            price_increment: Decimal,
             cumulative_fill_base_amount: Decimal,
     ) -> Decimal:
-        # Binance can round or truncate `ap`. One reported least-significant
-        # price unit is therefore the conservative bound, capped by the symbol
-        # tick when that authoritative precision is finer than the report.
-        reported_price_quantum = Decimal(1).scaleb(average_fill_price.as_tuple().exponent)
-        price_tolerance = reported_price_quantum
-        trading_rule = self._trading_rules.get(tracked_order.trading_pair)
-        if trading_rule is not None:
-            symbol_price_quantum = trading_rule.min_price_increment
-            if symbol_price_quantum.is_finite() and symbol_price_quantum > 0:
-                price_tolerance = min(price_tolerance, symbol_price_quantum)
-        return price_tolerance * cumulative_fill_base_amount
+        half_tick = cls._unknown_stream_exact_decimal_multiply(
+            price_increment,
+            Decimal("0.5"),
+            "user stream average price tolerance",
+        )
+        return cls._unknown_stream_exact_decimal_multiply(
+            half_tick,
+            cumulative_fill_base_amount,
+            "user stream average price tolerance",
+        )
 
     def _validate_snapshot_matches_tracked_order(
             self,
@@ -1317,6 +1460,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         expected_symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
         if order_message.get("s") not in {expected_symbol, tracked_order.trading_pair}:
             raise BinancePerpetualOrderDataError("user stream symbol is contradictory")
+        price_increment = self._unknown_stream_authoritative_price_increment(tracked_order)
         expected_side = "BUY" if tracked_order.trade_type is TradeType.BUY else "SELL"
         if order_message.get("S") != expected_side:
             raise BinancePerpetualOrderDataError("user stream side is contradictory")
@@ -1390,6 +1534,21 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 order_message.get("Z"),
                 "user stream cumulative fill quote amount",
             )
+        supported_decimal_values = [
+            (original_quantity, "user stream order quantity"),
+            (order_price, "user stream order price"),
+            (last_fill_base_amount, "user stream last fill quantity"),
+            (cumulative_fill_base_amount, "user stream cumulative fill quantity"),
+            (average_fill_price, "user stream average fill price"),
+            (last_fill_price, "user stream last fill price"),
+        ]
+        if cumulative_fill_quote_amount is not None:
+            supported_decimal_values.append((
+                cumulative_fill_quote_amount,
+                "user stream cumulative fill quote amount",
+            ))
+        for value, field in supported_decimal_values:
+            self._unknown_stream_exact_decimal_components(value, field)
         non_negative_fill_values = [
             last_fill_base_amount,
             cumulative_fill_base_amount,
@@ -1431,6 +1590,10 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 raise BinancePerpetualOrderDataError(
                     "user stream fill price and quantity must be positive"
                 )
+            if not self._unknown_stream_price_is_tick_aligned(last_fill_price, price_increment):
+                raise BinancePerpetualOrderDataError(
+                    "user stream last fill price is outside the authoritative price increment"
+                )
             if (
                 raw_status == "PARTIALLY_FILLED"
                 and not Decimal("0") < cumulative_fill_base_amount < original_quantity
@@ -1448,6 +1611,10 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             )
             if fee_amount < 0:
                 raise BinancePerpetualOrderDataError("user stream fee amount must be non-negative")
+            self._unknown_stream_exact_decimal_components(
+                fee_amount,
+                "user stream fee amount",
+            )
             fee_asset = order_message.get("N") or tracked_order.quote_asset
             if not isinstance(fee_asset, str) or fee_asset == "":
                 raise BinancePerpetualOrderDataError("user stream fee asset must be a string")
@@ -1471,6 +1638,11 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 percent_token=fee_asset,
                 flat_fees=flat_fees,
             )
+            last_fill_quote_amount = self._unknown_stream_exact_decimal_multiply(
+                last_fill_price,
+                last_fill_base_amount,
+                "user stream last fill quote amount",
+            )
             candidate_trade_update = TradeUpdate(
                 trade_id=trade_id,
                 client_order_id=client_order_id,
@@ -1479,7 +1651,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 fill_timestamp=fill_timestamp_ms * 1e-3,
                 fill_price=last_fill_price,
                 fill_base_amount=last_fill_base_amount,
-                fill_quote_amount=last_fill_price * last_fill_base_amount,
+                fill_quote_amount=last_fill_quote_amount,
                 fee=fee,
             )
             existing_fill = tracked_order.order_fills.get(trade_id)
@@ -1493,15 +1665,19 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                     )
                 expected_cumulative_fill_quote_amount = tracked_order.executed_amount_quote
             else:
-                if (
-                    cumulative_fill_base_amount
-                    != tracked_order.executed_amount_base + last_fill_base_amount
-                ):
+                expected_cumulative_fill_base_amount = self._unknown_stream_exact_decimal_add(
+                    tracked_order.executed_amount_base,
+                    last_fill_base_amount,
+                    "user stream cumulative fill quantity",
+                )
+                if cumulative_fill_base_amount != expected_cumulative_fill_base_amount:
                     raise BinancePerpetualOrderDataError(
                         "user stream cumulative and last fill facts are contradictory"
                     )
-                expected_cumulative_fill_quote_amount = (
-                    tracked_order.executed_amount_quote + candidate_trade_update.fill_quote_amount
+                expected_cumulative_fill_quote_amount = self._unknown_stream_exact_decimal_add(
+                    tracked_order.executed_amount_quote,
+                    candidate_trade_update.fill_quote_amount,
+                    "user stream cumulative fill quote amount",
                 )
                 trade_update = candidate_trade_update
         else:
@@ -1528,18 +1704,26 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 raise BinancePerpetualOrderDataError(
                     "user stream zero cumulative fill has contradictory price facts"
                 )
-        elif average_fill_price <= 0 or expected_cumulative_fill_quote_amount <= 0:
+        elif (
+            average_fill_price < price_increment
+            or expected_cumulative_fill_quote_amount <= 0
+        ):
             raise BinancePerpetualOrderDataError(
                 "user stream cumulative fill price facts are contradictory"
             )
         else:
-            average_quote_difference = (
-                average_fill_price * cumulative_fill_base_amount
-                - expected_cumulative_fill_quote_amount
+            reported_cumulative_fill_quote_amount = self._unknown_stream_exact_decimal_multiply(
+                average_fill_price,
+                cumulative_fill_base_amount,
+                "user stream average fill quote amount",
+            )
+            average_quote_difference = self._unknown_stream_exact_decimal_add(
+                reported_cumulative_fill_quote_amount,
+                expected_cumulative_fill_quote_amount.copy_negate(),
+                "user stream average fill quote difference",
             ).copy_abs()
             average_quote_tolerance = self._unknown_stream_average_quote_tolerance(
-                tracked_order=tracked_order,
-                average_fill_price=average_fill_price,
+                price_increment=price_increment,
                 cumulative_fill_base_amount=cumulative_fill_base_amount,
             )
             if average_quote_difference > average_quote_tolerance:
@@ -1573,7 +1757,9 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                     tracked_order=tracked_order,
                 )
                 if trade_update is not None:
-                    self._order_tracker.process_trade_update(trade_update)
+                    with localcontext() as tracker_decimal_context:
+                        tracker_decimal_context.prec = self.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+                        self._order_tracker.process_trade_update(trade_update)
                     if tracked_order.order_fills.get(trade_update.trade_id) != trade_update:
                         raise BinancePerpetualOrderDataError(
                             "user stream trade update was not applied"
