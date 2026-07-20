@@ -291,7 +291,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         assert result.status is AnchorAcquisitionStatus.POLLING
         assert result.checkpoint.confirmation_count == 0
         assert result.checkpoint.attempt == 1
-        assert result.checkpoint.next_poll_utc == received_at + timedelta(seconds=2)
+        assert result.checkpoint.next_poll_utc == etf.received_at_utc + timedelta(seconds=2)
         assert "synthetic 503" in result.failure_reason
 
     async def test_conservative_remaining_schedule_budget_fails_closed_before_impossible_poll(self):
