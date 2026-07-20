@@ -728,10 +728,7 @@ def test_round4_explicit_index_key_semantics_are_rejected_before_version_stamp(
     db_path = _materialize_legacy_database(tmp_path)
     with sqlite3.connect(db_path) as connection:
         _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
-        connection.execute(
-            "CREATE INDEX lepf_snapshot_updated "
-            f"ON LeveragedEtfExecutorSnapshot ({index_key_sql})"
-        )
+        connection.execute("CREATE INDEX lepf_snapshot_updated " f"ON LeveragedEtfExecutorSnapshot ({index_key_sql})")
 
     with pytest.raises(DatabaseMigrationError, match="schema|index"):
         _open_manager(db_path)
@@ -774,12 +771,9 @@ def test_round4_unique_autoindex_collation_is_rejected_before_version_stamp(tmp_
             ),
         )
         autoindex_name = connection.execute(
-            "SELECT name FROM pragma_index_list('LeveragedEtfStrategyReservation') "
-            "WHERE origin = 'u'"
+            "SELECT name FROM pragma_index_list('LeveragedEtfStrategyReservation') " "WHERE origin = 'u'"
         ).fetchone()[0]
-        assert "NOCASE" in {
-            row[4] for row in connection.execute(f'PRAGMA index_xinfo("{autoindex_name}")') if row[5]
-        }
+        assert "NOCASE" in {row[4] for row in connection.execute(f'PRAGMA index_xinfo("{autoindex_name}")') if row[5]}
 
     with pytest.raises(DatabaseMigrationError, match="schema|column|index|UNIQUE"):
         _open_manager(db_path)
@@ -1422,12 +1416,12 @@ def test_round4_snapshot_identity_guard_blocks_insert_or_replace_after_reopen(tm
                 )
 
         with reopened.engine.connect() as connection:
-            assert connection.execute(
-                text(
-                    "SELECT snapshot_json FROM LeveragedEtfExecutorSnapshot "
-                    "WHERE executor_id = 'executor-1'"
-                )
-            ).scalar_one() == "original"
+            assert (
+                connection.execute(
+                    text("SELECT snapshot_json FROM LeveragedEtfExecutorSnapshot " "WHERE executor_id = 'executor-1'")
+                ).scalar_one()
+                == "original"
+            )
     finally:
         reopened.engine.dispose()
 
