@@ -166,7 +166,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.nav_config = load_nav_config()
 
-    def acquisition(self, clock, provider):
+    def acquisition(self, clock, provider, *, etf_daily_multiplier=Decimal("2")):
         return YahooAnchorAcquisition(
             nav_config=self.nav_config,
             provider=provider,
@@ -174,6 +174,7 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
             monotonic_clock=clock.monotonic,
             sleep=clock.sleep,
             jitter=lambda upper_bound: 0.0,
+            etf_daily_multiplier=etf_daily_multiplier,
         )
 
     def new_checkpoint(self, acquisition):
@@ -918,6 +919,93 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         for corrupted in corruptions:
             with self.assertRaises(CheckpointIntegrityError):
                 AnchorPollingCheckpoint.from_recovery_fields(corrupted)
+
+    async def test_checkpoint_integrity_hash_binds_every_recovery_field(self):
+        _, final = await self.finalized_with_distinct_evidence()
+        recovery_fields = final.checkpoint.to_recovery_fields()
+
+        def shifted_utc(value):
+            parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+            return (parsed + timedelta(microseconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        changed_evidence = copy.deepcopy(recovery_fields["confirmation_evidence"])
+        changed_evidence[0]["stock_source_url"] = "https://example.invalid/SNDK"
+        mutations = {
+            "schema_version": 2,
+            "cycle_id": "xnys-2026-07-18",
+            "target_session_date": "2026-07-18",
+            "official_close_utc": shifted_utc(recovery_fields["official_close_utc"]),
+            "deadline_utc": shifted_utc(recovery_fields["deadline_utc"]),
+            "attempt": recovery_fields["attempt"] + 1,
+            "next_poll_utc": shifted_utc(recovery_fields["next_poll_utc"]),
+            "confirmation_count": recovery_fields["confirmation_count"] + 1,
+            "candidate_stock_close": "251",
+            "candidate_etf_close": "31",
+            "candidate_stock_raw_response_hash": "a" * 64,
+            "candidate_etf_raw_response_hash": "b" * 64,
+            "stock_received_at_utc": shifted_utc(recovery_fields["stock_received_at_utc"]),
+            "etf_received_at_utc": shifted_utc(recovery_fields["etf_received_at_utc"]),
+            "revision": recovery_fields["revision"] + 1,
+            "integrity_version": 1,
+            "stock_symbol": "INTC",
+            "etf_symbol": "INTW",
+            "confirmation_evidence": changed_evidence,
+            "anchor_source": "synthetic_anchor_source",
+            "etf_daily_multiplier": "3",
+            "hedge_ratio": "0.25",
+            "acquisition_config_hash": "e" * 64,
+            "integrity_hash": "f" * 64,
+        }
+        assert set(mutations) == set(recovery_fields)
+
+        for field_name, changed_value in mutations.items():
+            with self.subTest(field_name=field_name):
+                corrupted = copy.deepcopy(recovery_fields)
+                corrupted[field_name] = changed_value
+                with self.assertRaises(CheckpointIntegrityError):
+                    AnchorPollingCheckpoint.from_recovery_fields(corrupted)
+
+    async def test_empty_v1_checkpoint_upgrades_to_lossless_v2_recovery_state(self):
+        first_at = OFFICIAL_CLOSE + timedelta(seconds=60)
+        provider = ScriptedPairProvider(observation_pair(first_at))
+        clock = FakeClock(first_at)
+        acquisition = self.acquisition(clock, provider)
+        pristine_v2 = self.new_checkpoint(acquisition)
+
+        legacy_fields = pristine_v2.to_contract_fields()
+        legacy_v1 = AnchorPollingCheckpoint.from_contract_fields(legacy_fields)
+        upgraded = await acquisition.advance(legacy_v1, "SNDK", "SNXX")
+
+        assert legacy_v1.integrity_version == 1
+        assert legacy_v1.confirmation_count == 0
+        assert upgraded.checkpoint.integrity_version == 2
+        assert upgraded.checkpoint.anchor_source == self.nav_config.anchor_source
+        assert upgraded.checkpoint.etf_daily_multiplier == Decimal("2")
+        assert upgraded.checkpoint.hedge_ratio == Decimal("0.24")
+        assert len(upgraded.checkpoint.acquisition_config_hash) == 64
+        recovery_fields = upgraded.checkpoint.to_recovery_fields()
+        assert AnchorPollingCheckpoint.from_recovery_fields(recovery_fields) == upgraded.checkpoint
+
+    async def test_confirmed_v2_checkpoint_cannot_be_serialized_through_lossy_v1_contract(self):
+        _, final = await self.finalized_with_distinct_evidence()
+
+        with self.assertRaisesRegex(CheckpointIntegrityError, "lossy|version-1|recovery"):
+            final.checkpoint.to_contract_fields()
+
+    async def test_checkpoint_recovery_rejects_original_multiplier_or_config_mismatch_before_fetch(self):
+        _, final = await self.finalized_with_distinct_evidence()
+        provider = ScriptedPairProvider()
+        clock = FakeClock(final.checkpoint.next_poll_utc)
+        mismatched = self.acquisition(
+            clock,
+            provider,
+            etf_daily_multiplier=Decimal("3"),
+        )
+
+        with self.assertRaisesRegex(CheckpointIntegrityError, "multiplier|config"):
+            await mismatched.advance(final.checkpoint, "SNDK", "SNXX")
+
+        assert provider.calls == []
 
     async def test_crash_before_finalize_and_repeated_finalize_are_full_trail_idempotent(self):
         first_at = OFFICIAL_CLOSE

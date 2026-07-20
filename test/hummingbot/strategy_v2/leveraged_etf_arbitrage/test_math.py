@@ -1,6 +1,16 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass
-from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal, getcontext, localcontext
+from decimal import (
+    ROUND_DOWN,
+    ROUND_HALF_EVEN,
+    ROUND_UP,
+    Decimal,
+    Inexact,
+    Rounded,
+    getcontext,
+    localcontext,
+)
 from enum import Enum
+from fractions import Fraction
 
 import pytest
 
@@ -556,6 +566,100 @@ def test_theoretical_direction_uses_exact_zero_and_first_values_on_either_side()
     assert determine_arbitrage_direction(
         theoretical + D("0.000000000000000001"), theoretical
     ) is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+
+
+@pytest.mark.parametrize(
+    ("multiplier", "exact_theoretical", "expected_direction"),
+    [
+        (D("1"), Fraction(4, 3), ArbitrageDirection.LONG_ETF_SHORT_STOCK),
+        (D("2"), Fraction(5, 3), ArbitrageDirection.SHORT_ETF_LONG_STOCK),
+    ],
+)
+def test_theoretical_direction_retains_exact_provenance_when_display_rounds_across_equality(
+    multiplier: Decimal,
+    exact_theoretical: Fraction,
+    expected_direction: ArbitrageDirection,
+):
+    theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), multiplier)
+    observed_at_displayed_boundary = D(theoretical)
+
+    assert Fraction(observed_at_displayed_boundary) != exact_theoretical
+    assert determine_arbitrage_direction(observed_at_displayed_boundary, theoretical) is expected_direction
+
+
+def _zero_cost_boundary_opportunity(etf_entry_price: Decimal):
+    return calculate_opportunity(
+        stock_anchor=D("100"),
+        etf_anchor=D("50"),
+        etf_daily_multiplier=D("2"),
+        stock_entry_price=D("110"),
+        etf_entry_price=etf_entry_price,
+        etf_quantity=D("1"),
+        stock_contract_multiplier=D("1"),
+        etf_contract_multiplier=D("1"),
+        maker_fee_bp=D("0"),
+        taker_fee_bp=D("0"),
+        maker_slippage_bp_per_fill=D("0"),
+    )
+
+
+def test_entry_and_reduce_boundaries_use_exact_net_bp_not_rounded_up_display_equality():
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    exact_net_bp = Fraction(10000, 17001)
+    tiers = {D("0"): D("1"), opportunity.net_bp: D("3")}
+    reductions = {D("1"): D("0"), D("3"): opportunity.net_bp}
+
+    assert Fraction(opportunity.net_bp) > exact_net_bp
+    assert select_entry_target(opportunity.net_bp, tiers) == D("1")
+    assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("1")
+
+
+def test_entry_and_reduce_boundaries_do_not_fail_closed_when_exact_net_bp_is_above_rounded_down_display():
+    opportunity = _zero_cost_boundary_opportunity(D("60.02"))
+    exact_net_bp = Fraction(10000, 8501)
+    tiers = {D("0"): D("1"), opportunity.net_bp: D("3")}
+    reductions = {D("1"): D("0"), D("3"): opportunity.net_bp}
+
+    assert Fraction(opportunity.net_bp) < exact_net_bp
+    assert select_entry_target(opportunity.net_bp, tiers) == D("3")
+    assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("3")
+
+
+def test_entry_and_reduce_boundaries_preserve_exact_equality_semantics():
+    opportunity = _zero_cost_boundary_opportunity(D("90"))
+    assert opportunity.net_bp == D("1500")
+    tiers = {D("0"): D("1"), D("1500"): D("3")}
+    reductions = {D("1"): D("0"), D("3"): D("1500")}
+
+    assert select_entry_target(opportunity.net_bp, tiers) == D("3")
+    assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("3")
+
+
+@pytest.mark.parametrize("precision", [4, 28, 80])
+@pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP])
+def test_exact_boundary_decisions_ignore_caller_precision_rounding_and_enabled_inexact_traps(
+    precision,
+    rounding,
+):
+    with localcontext() as caller_context:
+        caller_context.prec = precision
+        caller_context.rounding = rounding
+        caller_context.traps[Inexact] = True
+        caller_context.traps[Rounded] = True
+        before = getcontext().copy()
+
+        opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+        tiers = {D("0"): D("1"), opportunity.net_bp: D("3")}
+        reductions = {D("1"): D("0"), D("3"): opportunity.net_bp}
+        theoretical = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+
+        assert select_entry_target(opportunity.net_bp, tiers) == D("1")
+        assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("1")
+        assert (
+            determine_arbitrage_direction(D(theoretical), theoretical)
+            is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+        )
+        assert str(getcontext()) == str(before)
 
 
 @pytest.mark.parametrize(
