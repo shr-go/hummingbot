@@ -1,15 +1,22 @@
 import asyncio
 import copy
 import logging
+import weakref
 from collections import defaultdict
 from decimal import Decimal
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, Dict, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, NamedTuple, Optional
 
 from cachetools import TTLCache
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import (
+    InFlightOrder,
+    OrderState,
+    OrderUpdate,
+    PerpetualDerivativeInFlightOrder,
+    TradeUpdate,
+)
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -30,16 +37,28 @@ if TYPE_CHECKING:
 cot_logger = None
 
 
-class StagedTradeUpdate(NamedTuple):
+class _StagedTradeUpdateToken:
+    __slots__ = ("__weakref__",)
+
+
+class _EventState(NamedTuple):
+    identity: Optional[int]
+    is_set: bool
+
+
+class _StagedTradeUpdateData(NamedTuple):
     tracked_order: InFlightOrder
     staged_order: InFlightOrder
     trade_update: TradeUpdate
-    original_executed_amount_base: Decimal
-    original_executed_amount_quote: Decimal
-    original_order_fills: Dict[str, TradeUpdate]
-    original_last_update_timestamp: float
-    original_completely_filled_event_is_set: bool
+    source_orders: Any
+    baseline_state: Dict[str, Any]
+    previous_executed_amount_base: Decimal
     updated: bool
+    transition_is_exact: bool
+
+
+_NATIVE_TRADE_UPDATE = InFlightOrder.update_with_trade_update
+_SUPPORTED_STAGED_ORDER_TYPES = (InFlightOrder, PerpetualDerivativeInFlightOrder)
 
 
 class ClientOrderTracker:
@@ -74,6 +93,7 @@ class ClientOrderTracker:
         self._order_tracking_task: Optional[asyncio.Task] = None
         self._last_poll_timestamp: int = -1
         self._order_not_found_records: Dict[str, int] = defaultdict(lambda: 0)
+        self._staged_trade_updates = weakref.WeakKeyDictionary()
 
     @property
     def active_orders(self) -> Dict[str, InFlightOrder]:
@@ -231,77 +251,157 @@ class ClientOrderTracker:
                     exchange_order_id=trade_update.exchange_order_id,
                 )
 
+    def _fillable_order_location(self, client_order_id: str):
+        for orders in (self._lost_orders, self._cached_orders, self._in_flight_orders):
+            tracked_order = orders.get(client_order_id)
+            if tracked_order is not None:
+                return orders, tracked_order
+        return None, None
+
     @staticmethod
     def _isolated_order_for_trade_update(tracked_order: InFlightOrder) -> InFlightOrder:
         staged_order = copy.copy(tracked_order)
-        staged_order.order_fills = copy.deepcopy(tracked_order.order_fills)
         for attribute_name, attribute_value in vars(tracked_order).items():
             if isinstance(attribute_value, asyncio.Event):
                 isolated_event = asyncio.Event()
                 if attribute_value.is_set():
                     isolated_event.set()
                 setattr(staged_order, attribute_name, isolated_event)
+            else:
+                setattr(staged_order, attribute_name, copy.deepcopy(attribute_value))
         return staged_order
 
-    def stage_trade_update(self, trade_update: TradeUpdate) -> Optional[StagedTradeUpdate]:
+    @staticmethod
+    def _order_state(tracked_order: InFlightOrder, bind_event_identity: bool) -> Dict[str, Any]:
+        state = {"__order_type__": type(tracked_order)}
+        for attribute_name, attribute_value in vars(tracked_order).items():
+            if isinstance(attribute_value, asyncio.Event):
+                state[attribute_name] = _EventState(
+                    identity=id(attribute_value) if bind_event_identity else None,
+                    is_set=attribute_value.is_set(),
+                )
+            else:
+                state[attribute_name] = copy.deepcopy(attribute_value)
+        return state
+
+    def _staged_trade_update_data(self, staged_update: object) -> _StagedTradeUpdateData:
+        try:
+            return self._staged_trade_updates[staged_update]
+        except (KeyError, TypeError):
+            raise ValueError("staged trade update is not owned by this tracker")
+
+    def _consume_staged_trade_update(self, staged_update: object) -> _StagedTradeUpdateData:
+        try:
+            return self._staged_trade_updates.pop(staged_update)
+        except (KeyError, TypeError):
+            raise ValueError("staged trade update is forged, reused, or owned by another tracker")
+
+    def stage_trade_update(self, trade_update: TradeUpdate) -> Optional[_StagedTradeUpdateToken]:
         """Apply a trade to isolated order state without publishing or mutating the tracked order."""
-        tracked_order = self.all_fillable_orders.get(trade_update.client_order_id)
+        source_orders, tracked_order = self._fillable_order_location(trade_update.client_order_id)
         if tracked_order is None:
             return None
+        if type(tracked_order) not in _SUPPORTED_STAGED_ORDER_TYPES:
+            raise TypeError(
+                f"unsupported staged trade order type: {type(tracked_order).__name__}"
+            )
 
-        original_order_fills = copy.deepcopy(tracked_order.order_fills)
+        baseline_state = self._order_state(tracked_order, bind_event_identity=True)
         staged_order = self._isolated_order_for_trade_update(tracked_order)
         expected_trade_update = copy.deepcopy(trade_update)
         applied_trade_update = copy.deepcopy(expected_trade_update)
         updated = type(staged_order).update_with_trade_update(staged_order, applied_trade_update)
-        return StagedTradeUpdate(
+
+        update_method = type(staged_order).update_with_trade_update
+        transition_is_exact = True
+        if update_method is not _NATIVE_TRADE_UPDATE:
+            expected_order = self._isolated_order_for_trade_update(tracked_order)
+            expected_updated = _NATIVE_TRADE_UPDATE(
+                expected_order,
+                copy.deepcopy(expected_trade_update),
+            )
+            transition_is_exact = (
+                updated == expected_updated
+                and self._order_state(staged_order, bind_event_identity=False)
+                == self._order_state(expected_order, bind_event_identity=False)
+            )
+
+        staged_update = _StagedTradeUpdateToken()
+        self._staged_trade_updates[staged_update] = _StagedTradeUpdateData(
             tracked_order=tracked_order,
             staged_order=staged_order,
             trade_update=expected_trade_update,
-            original_executed_amount_base=tracked_order.executed_amount_base,
-            original_executed_amount_quote=tracked_order.executed_amount_quote,
-            original_order_fills=original_order_fills,
-            original_last_update_timestamp=tracked_order.last_update_timestamp,
-            original_completely_filled_event_is_set=tracked_order.completely_filled_event.is_set(),
+            source_orders=source_orders,
+            baseline_state=baseline_state,
+            previous_executed_amount_base=tracked_order.executed_amount_base,
             updated=updated,
+            transition_is_exact=transition_is_exact,
+        )
+        return staged_update
+
+    def staged_trade_update_matches(
+            self,
+            staged_update: object,
+            expected_trade_update: TradeUpdate,
+            expected_executed_amount_base: Decimal,
+            expected_executed_amount_quote: Decimal,
+    ) -> bool:
+        staged_data = self._staged_trade_update_data(staged_update)
+        staged_order = staged_data.staged_order
+        return (
+            staged_data.transition_is_exact
+            and staged_data.updated
+            and staged_data.trade_update == expected_trade_update
+            and staged_order.order_fills.get(expected_trade_update.trade_id) == expected_trade_update
+            and staged_order.executed_amount_base == expected_executed_amount_base
+            and staged_order.executed_amount_quote == expected_executed_amount_quote
         )
 
-    def commit_trade_update(self, staged_update: StagedTradeUpdate) -> bool:
+    def commit_trade_update(self, staged_update: object) -> bool:
         """Commit a non-stale staged trade and only then publish its lifecycle effects."""
-        tracked_order = staged_update.tracked_order
-        current_order = self.all_fillable_orders.get(tracked_order.client_order_id)
-        current_state = (
-            tracked_order.executed_amount_base,
-            tracked_order.executed_amount_quote,
-            tracked_order.order_fills,
-            tracked_order.last_update_timestamp,
-            tracked_order.completely_filled_event.is_set(),
-        )
-        original_state = (
-            staged_update.original_executed_amount_base,
-            staged_update.original_executed_amount_quote,
-            staged_update.original_order_fills,
-            staged_update.original_last_update_timestamp,
-            staged_update.original_completely_filled_event_is_set,
-        )
-        if current_order is not tracked_order or current_state != original_state:
-            raise RuntimeError("tracked order changed before staged trade update commit")
-        if not staged_update.updated:
+        staged_data = self._consume_staged_trade_update(staged_update)
+        tracked_order = staged_data.tracked_order
+        current_orders, current_order = self._fillable_order_location(tracked_order.client_order_id)
+        if (
+            current_orders is not staged_data.source_orders
+            or current_order is not tracked_order
+            or staged_data.source_orders.get(tracked_order.client_order_id) is not tracked_order
+            or self._order_state(tracked_order, bind_event_identity=True) != staged_data.baseline_state
+        ):
+            raise RuntimeError("tracked order or mapping changed before staged trade update commit")
+        if not staged_data.transition_is_exact or not staged_data.updated:
             return False
 
-        committed_fill = staged_update.staged_order.order_fills.get(staged_update.trade_update.trade_id)
-        if committed_fill != staged_update.trade_update:
+        staged_order = staged_data.staged_order
+        committed_fill = staged_order.order_fills.get(staged_data.trade_update.trade_id)
+        if committed_fill != staged_data.trade_update:
             raise RuntimeError("staged trade update does not contain the expected fill")
 
-        tracked_order.order_fills[committed_fill.trade_id] = copy.deepcopy(committed_fill)
-        tracked_order.executed_amount_base = staged_update.staged_order.executed_amount_base
-        tracked_order.executed_amount_quote = staged_update.staged_order.executed_amount_quote
-        tracked_order.last_update_timestamp = staged_update.staged_order.last_update_timestamp
-        if staged_update.staged_order.completely_filled_event.is_set():
-            tracked_order.completely_filled_event.set()
+        prepared_state = {
+            attribute_name: copy.deepcopy(attribute_value)
+            for attribute_name, attribute_value in vars(staged_order).items()
+            if not isinstance(attribute_value, asyncio.Event)
+        }
+        staged_events = {
+            attribute_name: attribute_value.is_set()
+            for attribute_name, attribute_value in vars(staged_order).items()
+            if isinstance(attribute_value, asyncio.Event)
+        }
+        for attribute_name, attribute_value in prepared_state.items():
+            if attribute_name == "order_fills":
+                tracked_order.order_fills.clear()
+                tracked_order.order_fills.update(attribute_value)
+            else:
+                setattr(tracked_order, attribute_name, attribute_value)
+        for attribute_name, should_be_set in staged_events.items():
+            event = getattr(tracked_order, attribute_name)
+            if should_be_set and not event.is_set():
+                event.set()
+
+        committed_fill = tracked_order.order_fills[committed_fill.trade_id]
         self._trigger_order_fills(
             tracked_order=tracked_order,
-            prev_executed_amount_base=staged_update.original_executed_amount_base,
+            prev_executed_amount_base=staged_data.previous_executed_amount_base,
             fill_amount=committed_fill.fill_base_amount,
             fill_price=committed_fill.fill_price,
             fill_fee=committed_fill.fee,

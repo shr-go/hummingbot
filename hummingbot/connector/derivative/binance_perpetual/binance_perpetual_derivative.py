@@ -1813,13 +1813,11 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                         staged_update = self._order_tracker.stage_trade_update(trade_update)
                         if (
                             staged_update is None
-                            or not staged_update.updated
-                            or staged_update.staged_order.order_fills.get(trade_update.trade_id)
-                            != trade_update
-                            or not self._unknown_stream_tracked_totals_are_exact(
-                                tracked_order=staged_update.staged_order,
-                                expected_base=expected_base,
-                                expected_quote=expected_quote,
+                            or not self._order_tracker.staged_trade_update_matches(
+                                staged_update=staged_update,
+                                expected_trade_update=trade_update,
+                                expected_executed_amount_base=expected_base,
+                                expected_executed_amount_quote=expected_quote,
                             )
                         ):
                             raise BinancePerpetualOrderDataError(
