@@ -17,7 +17,12 @@ import hummingbot.model.db_migration.migrator as migrator_module
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.model.db_migration.migrator import Migrator
-from hummingbot.model.leveraged_etf_persistence import LeveragedEtfExecutorSnapshot, LeveragedEtfJournalEvent
+from hummingbot.model.leveraged_etf_persistence import (
+    SQLITE_GUARD_DDL,
+    LeveragedEtfExecutorSnapshot,
+    LeveragedEtfJournalEvent,
+    LeveragedEtfStrategyReservation,
+)
 from hummingbot.model.sql_connection_manager import DatabaseMigrationError, SQLConnectionManager, SQLConnectionType
 
 TARGET_VERSION = "20260719"
@@ -56,6 +61,15 @@ def _materialize_legacy_database(tmp_path: Path, name: str = "legacy.sqlite") ->
     db_path = tmp_path / name
     with sqlite3.connect(db_path) as connection:
         connection.executescript(LEGACY_FIXTURE.read_text(encoding="utf-8"))
+    return db_path
+
+
+def _materialize_encoded_legacy_database(tmp_path: Path, encoding: str) -> Path:
+    db_path = tmp_path / f"legacy-{encoding.lower()}.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(f"PRAGMA encoding = '{encoding}'")
+        connection.executescript(LEGACY_FIXTURE.read_text(encoding="utf-8"))
+        assert connection.execute("PRAGMA encoding").fetchone()[0].lower() == encoding.lower()
     return db_path
 
 
@@ -533,6 +547,246 @@ def test_same_named_incompatible_trigger_is_rejected_before_version_stamp(
     _assert_legacy_data_unchanged(db_path)
 
 
+def test_round4_wrong_target_trigger_with_embedded_identifier_token_is_rejected_before_stamp(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    shadow_table = "LeveragedEtfIfNotExistsExecutorSnapshot"
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        connection.execute(f"CREATE TABLE {shadow_table} (executor_id TEXT)")
+        connection.execute(
+            SQLITE_GUARD_DDL["lepf_snapshot_identity_insert"].replace(
+                "LeveragedEtfExecutorSnapshot",
+                shadow_table,
+                2,
+            )
+        )
+
+    with pytest.raises(DatabaseMigrationError, match="trigger|schema"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+def test_round4_trigger_comparison_preserves_embedded_literal_tokens(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        connection.execute(
+            SQLITE_GUARD_DDL["lepf_snapshot_identity_insert"].replace(
+                "identity already exists",
+                "ifnotexistsidentity already exists",
+            )
+        )
+
+    with pytest.raises(DatabaseMigrationError, match="trigger|schema"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+def test_round4_trigger_comparison_preserves_multi_table_body_references(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    journal_shadow = "LeveragedEtfIfNotExistsJournalEvent"
+    reservation_shadow = "LeveragedEtfIfNotExistsStrategyReservation"
+    trigger_sql = SQLITE_GUARD_DDL["lepf_snapshot_referenced_no_delete"]
+    trigger_sql = trigger_sql.replace("LeveragedEtfJournalEvent", journal_shadow)
+    trigger_sql = trigger_sql.replace("LeveragedEtfStrategyReservation", reservation_shadow)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        connection.execute(f"CREATE TABLE {journal_shadow} (executor_id TEXT)")
+        connection.execute(f"CREATE TABLE {reservation_shadow} (executor_id TEXT)")
+        connection.execute(trigger_sql)
+
+    with pytest.raises(DatabaseMigrationError, match="trigger|schema"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+@pytest.mark.parametrize(
+    "extra_check_sql",
+    [
+        "/* ' */ CHECK (snapshot_json <> 'blocked') /* ' */",
+        "-- ' CHECK (ignored)\n\tCHECK (snapshot_json <> 'blocked')",
+        "/* CHECK (ignored) \" [ ( */ CHECK ((snapshot_json <> 'blocked'))",
+        "CHECK (snapshot_json <> 'escaped '' CHECK(token)')",
+        'CHECK ("CHECK(snapshot_json)" IS NULL)',
+    ],
+    ids=[
+        "block_comment_quote",
+        "line_comment_quote",
+        "block_comment_check_and_delimiters",
+        "escaped_string_check_token",
+        "quoted_identifier_check_token",
+    ],
+)
+def test_round4_comment_quote_and_check_token_collisions_cannot_hide_extra_constraints(
+    tmp_path: Path,
+    extra_check_sql: str,
+):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: _append_compiled_constraint(create_sql, extra_check_sql),
+        )
+
+    with pytest.raises(DatabaseMigrationError, match="schema|CHECK|constraint"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+def test_round4_check_parser_accepts_comments_inside_an_equivalent_expression(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "CHECK (schema_version = 1)",
+                "CHECK (((schema_version /* CHECK ('ignored') */ == 1)))",
+            ),
+        )
+
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+    assert _version(db_path) == TARGET_VERSION
+
+    reopened = _open_manager(db_path)
+    reopened.engine.dispose()
+
+
+@pytest.mark.parametrize("generated_kind", ["STORED", "VIRTUAL"])
+def test_round4_generated_snapshot_hash_column_is_rejected_before_version_stamp(
+    tmp_path: Path,
+    generated_kind: str,
+):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "snapshot_hash TEXT NOT NULL",
+                f"snapshot_hash TEXT GENERATED ALWAYS AS ('{HASH_A}') {generated_kind} NOT NULL",
+                1,
+            ),
+        )
+
+    with pytest.raises(DatabaseMigrationError, match="schema|column"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+@pytest.mark.parametrize(
+    ("replacement", "case_name"),
+    [
+        ("snapshot_json VARCHAR NOT NULL", "declared_type"),
+        ("snapshot_json TEXT COLLATE NOCASE NOT NULL", "column_collation"),
+    ],
+)
+def test_round4_same_affinity_column_behavior_drift_is_rejected_before_version_stamp(
+    tmp_path: Path,
+    replacement: str,
+    case_name: str,
+):
+    db_path = _materialize_legacy_database(tmp_path, f"column-{case_name}.sqlite")
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "snapshot_json TEXT NOT NULL",
+                replacement,
+                1,
+            ),
+        )
+
+    with pytest.raises(DatabaseMigrationError, match="schema|column"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+@pytest.mark.parametrize(
+    "index_key_sql",
+    [
+        "updated_at_utc COLLATE NOCASE",
+        "updated_at_utc DESC",
+        "lower(updated_at_utc)",
+        "updated_at_utc) WHERE updated_at_utc IS NOT NULL --",
+    ],
+    ids=["collation", "descending", "expression", "predicate"],
+)
+def test_round4_explicit_index_key_semantics_are_rejected_before_version_stamp(
+    tmp_path: Path,
+    index_key_sql: str,
+):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        connection.execute(
+            "CREATE INDEX lepf_snapshot_updated "
+            f"ON LeveragedEtfExecutorSnapshot ({index_key_sql})"
+        )
+
+    with pytest.raises(DatabaseMigrationError, match="schema|index"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+def test_round4_partial_unique_index_collation_is_rejected_before_version_stamp(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        _create_compiled_table(connection, LeveragedEtfJournalEvent.__table__)
+        connection.execute("""
+            CREATE UNIQUE INDEX lepf_journal_trade_dedup
+            ON LeveragedEtfJournalEvent (
+                connector_name COLLATE NOCASE,
+                trading_pair,
+                exchange_trade_id
+            )
+            WHERE exchange_trade_id IS NOT NULL
+            """)
+
+    with pytest.raises(DatabaseMigrationError, match="schema|index"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
+def test_round4_unique_autoindex_collation_is_rejected_before_version_stamp(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        _create_compiled_table(
+            connection,
+            LeveragedEtfStrategyReservation.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "reservation_key TEXT NOT NULL",
+                "reservation_key TEXT COLLATE NOCASE NOT NULL",
+                1,
+            ),
+        )
+        autoindex_name = connection.execute(
+            "SELECT name FROM pragma_index_list('LeveragedEtfStrategyReservation') "
+            "WHERE origin = 'u'"
+        ).fetchone()[0]
+        assert "NOCASE" in {
+            row[4] for row in connection.execute(f'PRAGMA index_xinfo("{autoindex_name}")') if row[5]
+        }
+
+    with pytest.raises(DatabaseMigrationError, match="schema|column|index|UNIQUE"):
+        _open_manager(db_path)
+
+    _assert_legacy_data_unchanged(db_path)
+
+
 @pytest.mark.parametrize(
     ("table_transform", "attached_object_sql"),
     [
@@ -995,6 +1249,187 @@ BAD_HASH_INSERTS = {
         ) VALUES ('xnys-2026-07-17', :bad_hash, :updated_at)
     """,
 }
+
+
+ROUND4_INVALID_HASH_VALUES = (
+    HASH_A + "\x00suffix",
+    HASH_A.encode("ascii"),
+    "é" * 64,
+    HASH_A.upper(),
+    BAD_HASH,
+    "a" * 63,
+)
+
+ROUND4_INVALID_DECIMAL_VALUES = (
+    "1\x00suffix",
+    b"1",
+    "１",
+    "+1",
+    "-1",
+    "1e3",
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "00",
+    "01",
+    "0.0",
+    "0.00",
+    "1.0",
+    ".5",
+    "0.",
+    " 1",
+    "1 ",
+)
+
+
+def _seed_round4_hash_prerequisites(manager: SQLConnectionManager) -> None:
+    with manager.engine.begin() as connection:
+        _insert_snapshot(connection)
+        connection.execute(
+            text("""
+                INSERT INTO LeveragedEtfAnchorState (
+                    cycle_id, schema_version, state_kind, revision, target_session_date,
+                    official_close_utc, deadline_utc, evidence_hash, payload_json,
+                    payload_hash, created_at_utc, updated_at_utc
+                ) VALUES ('xnys-2026-07-17', 1, 'FINALIZED', 1, '2026-07-17', NULL,
+                          '2026-07-17T20:10:00.000000Z', :hash_b, '{}', :hash_a,
+                          :created_at, :updated_at)
+                """),
+            {
+                "hash_a": HASH_A,
+                "hash_b": HASH_B,
+                "created_at": CREATED_AT,
+                "updated_at": UPDATED_AT,
+            },
+        )
+
+
+def _assert_round4_hash_insert(
+    manager: SQLConnectionManager,
+    insert_sql: str,
+    candidate,
+    accepted: bool,
+) -> None:
+    with manager.engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            parameters = {
+                "bad_hash": candidate,
+                "hash_a": HASH_A,
+                "created_at": CREATED_AT,
+                "updated_at": UPDATED_AT,
+            }
+            if accepted:
+                connection.execute(text(insert_sql), parameters)
+            else:
+                with pytest.raises(IntegrityError):
+                    connection.execute(text(insert_sql), parameters)
+        finally:
+            transaction.rollback()
+
+
+def _assert_round4_decimal_insert(
+    manager: SQLConnectionManager,
+    quantity,
+    notional_cap,
+    accepted: bool,
+) -> None:
+    with manager.engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            statement = text("""
+                INSERT INTO LeveragedEtfStrategyReservation (
+                    reservation_id, executor_id, reservation_key, connector_name,
+                    trading_pair, leg, quantity, leverage, notional_cap, payload_json,
+                    payload_hash, created_at_utc, updated_at_utc, released_at_utc
+                ) VALUES ('round4-reservation', 'executor-1', 'round4-reservation-key',
+                          'binance_perpetual', 'SNXX-USDT', 'ETF', :quantity, 20,
+                          :notional_cap, '{}', :payload_hash, :created_at, :updated_at,
+                          :updated_at)
+                """)
+            parameters = {
+                "quantity": quantity,
+                "notional_cap": notional_cap,
+                "payload_hash": HASH_A,
+                "created_at": CREATED_AT,
+                "updated_at": UPDATED_AT,
+            }
+            if accepted:
+                connection.execute(statement, parameters)
+            else:
+                with pytest.raises(IntegrityError):
+                    connection.execute(statement, parameters)
+        finally:
+            transaction.rollback()
+
+
+@pytest.mark.parametrize("encoding", ["UTF-8", "UTF-16le", "UTF-16be"])
+def test_round4_encoded_text_domain_matrix_survives_migration_and_reopen(
+    tmp_path: Path,
+    encoding: str,
+):
+    db_path = _materialize_encoded_legacy_database(tmp_path, encoding)
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+    assert _version(db_path) == TARGET_VERSION
+
+    reopened = _open_manager(db_path)
+    try:
+        with reopened.engine.connect() as connection:
+            assert connection.execute(text("PRAGMA encoding")).scalar_one().lower() == encoding.lower()
+        _seed_round4_hash_prerequisites(reopened)
+
+        for insert_sql in BAD_HASH_INSERTS.values():
+            _assert_round4_hash_insert(reopened, insert_sql, HASH_A, accepted=True)
+            for invalid_hash in ROUND4_INVALID_HASH_VALUES:
+                _assert_round4_hash_insert(reopened, insert_sql, invalid_hash, accepted=False)
+
+        for valid_quantity in ("0", "1", "0.1", "10.01", "1000"):
+            _assert_round4_decimal_insert(reopened, valid_quantity, "1000", accepted=True)
+        for valid_notional_cap in ("1", "0.1", "10.01", "1000"):
+            _assert_round4_decimal_insert(reopened, "1", valid_notional_cap, accepted=True)
+
+        for invalid_quantity in ROUND4_INVALID_DECIMAL_VALUES:
+            _assert_round4_decimal_insert(reopened, invalid_quantity, "1000", accepted=False)
+        for invalid_notional_cap in ("0", *ROUND4_INVALID_DECIMAL_VALUES):
+            _assert_round4_decimal_insert(reopened, "1", invalid_notional_cap, accepted=False)
+    finally:
+        reopened.engine.dispose()
+
+
+def test_round4_snapshot_identity_guard_blocks_insert_or_replace_after_reopen(tmp_path: Path):
+    db_path = tmp_path / "round4-replace.sqlite"
+    manager = _open_manager(db_path)
+    with manager.engine.begin() as connection:
+        _insert_snapshot(connection)
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        with pytest.raises(IntegrityError):
+            with reopened.engine.begin() as connection:
+                connection.execute(
+                    text("""
+                        INSERT OR REPLACE INTO LeveragedEtfExecutorSnapshot (
+                            executor_id, controller_id, pair_id, nav_cycle_id, schema_version,
+                            state, snapshot_json, snapshot_hash, last_journal_sequence,
+                            created_at_utc, updated_at_utc
+                        ) VALUES ('executor-1', 'controller-1', 'sndk_snxx',
+                                  'xnys-2026-07-17', 1, 'CREATED', 'replaced', :hash_a,
+                                  0, :created_at, :updated_at)
+                        """),
+                    {"hash_a": HASH_A, "created_at": CREATED_AT, "updated_at": UPDATED_AT},
+                )
+
+        with reopened.engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT snapshot_json FROM LeveragedEtfExecutorSnapshot "
+                    "WHERE executor_id = 'executor-1'"
+                )
+            ).scalar_one() == "original"
+    finally:
+        reopened.engine.dispose()
 
 
 @pytest.mark.parametrize(("case_name", "insert_sql"), BAD_HASH_INSERTS.items())
