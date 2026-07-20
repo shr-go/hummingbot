@@ -1,9 +1,14 @@
+import hashlib
 import json
+import math
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from hummingbot.client.config.client_config_map import ClientConfigMap
@@ -21,6 +26,7 @@ from hummingbot.model.leveraged_etf_repository import (
     JournalIntegrityError,
     LeveragedEtfJournalRepository,
     OpaqueAnchorCheckpointV1,
+    OpaqueAnchorFinalizedV1,
     StrategyReservationV1,
 )
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
@@ -28,6 +34,27 @@ from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types imp
 
 CREATED_AT = "2026-07-17T14:01:02.000000Z"
 UPDATED_AT = "2026-07-17T14:01:03.123456Z"
+LATER_AT = "2026-07-17T14:01:04.123456Z"
+DEADLINE_AT = "2026-07-17T14:02:00.000000Z"
+
+_STATE_FIELDS = (
+    "schema_version",
+    "executor_id",
+    "state",
+    "etf_submitted_quantity",
+    "etf_filled_quantity",
+    "etf_remaining_quantity",
+    "stock_submitted_quantity",
+    "stock_filled_quantity",
+    "stock_remaining_quantity",
+    "hedge_dust_quantity",
+    "maker_order_ids",
+    "stock_order_ids",
+    "leverage_reservation",
+    "updated_at_utc",
+    "close_reason",
+    "last_journal_sequence",
+)
 
 
 def _contract_vectors() -> dict:
@@ -110,74 +137,264 @@ def _snapshot_at(
     return LeveragedEtfPairExecutorSnapshotV1.model_validate(payload)
 
 
-def _prepared_event(payload_value: str = "40") -> JournalEventV1:
+def _snapshot_with_leg_fill(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    *,
+    sequence: int,
+    state: str,
+    leg: str,
+    submitted: str,
+    filled: str,
+    updated_at_utc: str = UPDATED_AT,
+) -> LeveragedEtfPairExecutorSnapshotV1:
+    payload = snapshot.model_dump(mode="json")
+    target_field = "etf_target_quantity" if leg == "ETF" else "stock_target_quantity"
+    prefix = "etf" if leg == "ETF" else "stock"
+    payload.update(
+        {
+            "state": state,
+            f"{prefix}_submitted_quantity": submitted,
+            f"{prefix}_filled_quantity": filled,
+            f"{prefix}_remaining_quantity": str(Decimal(payload[target_field]) - Decimal(filled)),
+            "updated_at_utc": updated_at_utc,
+            "last_journal_sequence": sequence,
+        }
+    )
+    return LeveragedEtfPairExecutorSnapshotV1.model_validate(payload)
+
+
+def _state_payload(snapshot: LeveragedEtfPairExecutorSnapshotV1) -> dict:
+    serialized = snapshot.model_dump(mode="json")
+    return {field_name: serialized[field_name] for field_name in _STATE_FIELDS}
+
+
+def _side_effect_identity(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    *,
+    action: str = "ETF_MAKER",
+    leg: str = "ETF",
+    logical_quantity: str = "40",
+    order_quantity: str | None = None,
+    attempt: int = 1,
+    intent_id: str = "intent-maker-1",
+    client_order_id: str = "exec-sndk-snxx-0001-maker-1",
+) -> dict:
+    serialized = snapshot.model_dump(mode="json")
+    operation = serialized["operation"]
+    connector_name = serialized["etf_connector_name"] if leg == "ETF" else serialized["stock_connector_name"]
+    trading_pair = serialized["etf_trading_pair"] if leg == "ETF" else serialized["stock_trading_pair"]
+    return {
+        "schema_version": 1,
+        "executor_id": snapshot.executor_id,
+        "operation": operation,
+        "action": action,
+        "leg": leg,
+        "logical_quantity": logical_quantity,
+        "order_quantity": logical_quantity if order_quantity is None else order_quantity,
+        "attempt": attempt,
+        "intent_id": intent_id,
+        "idempotency_key": f"{snapshot.executor_id}:{operation}:{leg}:{logical_quantity}:{attempt}",
+        "connector_name": connector_name,
+        "trading_pair": trading_pair,
+        "client_order_id": client_order_id,
+        "deadline_utc": DEADLINE_AT,
+    }
+
+
+def _journal_payload(kind: str, value: dict) -> CanonicalOpaquePayload:
+    return CanonicalOpaquePayload.from_value(
+        schema_version=1,
+        kind=kind,
+        value={"schema_version": 1, "kind": kind, **value},
+    )
+
+
+def _payload_value(payload) -> dict:
+    if hasattr(payload, "value"):
+        return payload.value()
+    return payload.model_dump(mode="json")
+
+
+def _prepared_event(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    next_snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    *,
+    payload_value: str = "40",
+    action: str = "ETF_MAKER",
+    leg: str = "ETF",
+    attempt: int = 1,
+    event_id: str = "event-maker-prepared-1",
+    intent_id: str = "intent-maker-1",
+    client_order_id: str = "exec-sndk-snxx-0001-maker-1",
+    identity_overrides: dict | None = None,
+    payload_overrides: dict | None = None,
+) -> JournalEventV1:
+    identity = _side_effect_identity(
+        snapshot,
+        action=action,
+        leg=leg,
+        logical_quantity=payload_value,
+        attempt=attempt,
+        intent_id=intent_id,
+        client_order_id=client_order_id,
+    )
+    identity.update(identity_overrides or {})
+    payload_value_dict = {
+        "identity": identity,
+        "next_state": _state_payload(next_snapshot),
+        **(payload_overrides or {}),
+    }
     return JournalEventV1(
-        event_id="event-maker-prepared-1",
+        event_id=event_id,
         event_type=JournalEventType.PREPARED,
-        intent_id="intent-maker-1",
-        idempotency_key="exec-sndk-snxx-0001:OPEN:ETF:40:1",
-        connector_name="binance_perpetual",
-        trading_pair="SNXX-USDT",
-        client_order_id="exec-sndk-snxx-0001-maker-1",
-        payload=CanonicalOpaquePayload.from_value(
-            schema_version=1,
-            kind="ORDER_INTENT",
-            value={
-                "exposure_increasing": True,
-                "leg": "ETF",
-                "logical_quantity": payload_value,
-                "operation": "OPEN",
-            },
-        ),
-        created_at_utc=UPDATED_AT,
+        intent_id=identity.get("intent_id"),
+        idempotency_key=identity.get("idempotency_key"),
+        connector_name=identity.get("connector_name"),
+        trading_pair=identity.get("trading_pair"),
+        client_order_id=identity.get("client_order_id"),
+        payload=_journal_payload("PREPARED", payload_value_dict),
+        created_at_utc=next_snapshot.model_dump(mode="json")["updated_at_utc"],
     )
 
 
 def _followup_event(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    next_snapshot: LeveragedEtfPairExecutorSnapshotV1,
     event_type: JournalEventType,
     event_id: str,
     *,
+    action: str = "ETF_MAKER",
+    leg: str = "ETF",
+    logical_quantity: str = "40",
+    attempt: int = 1,
+    intent_id: str = "intent-maker-1",
+    client_order_id: str = "exec-sndk-snxx-0001-maker-1",
     terminal: bool = False,
+    exchange_order_id: str | None = None,
+    exchange_trade_id: str | None = None,
+    fill_quantity: str = "1",
+    cumulative_filled_quantity: str = "1",
 ) -> JournalEventV1:
+    identity = _side_effect_identity(
+        snapshot,
+        action=action,
+        leg=leg,
+        logical_quantity=logical_quantity,
+        attempt=attempt,
+        intent_id=intent_id,
+        client_order_id=client_order_id,
+    )
+    payload_kind = {
+        JournalEventType.ACKNOWLEDGED: "ACKNOWLEDGED",
+        JournalEventType.REJECTED: "REJECTED",
+        JournalEventType.SUBMIT_UNKNOWN: "SUBMIT_UNKNOWN",
+        JournalEventType.ORDER_CREATED: "ORDER_CREATED",
+        JournalEventType.FILL: "FILL",
+        JournalEventType.CANCEL_REQUESTED: "CANCEL",
+        JournalEventType.CANCEL_CONFIRMED: "CANCEL",
+        JournalEventType.HEDGE_REQUESTED: "HEDGE",
+        JournalEventType.HEDGE_CONFIRMED: "HEDGE",
+        JournalEventType.ROLLBACK_REQUESTED: "ROLLBACK",
+        JournalEventType.ROLLBACK_CONFIRMED: "ROLLBACK",
+        JournalEventType.RECONCILIATION: "RECONCILIATION",
+    }[event_type]
+    payload_value = {
+        "identity": identity,
+        "next_state": _state_payload(next_snapshot),
+    }
+    if event_type == JournalEventType.SUBMIT_UNKNOWN:
+        payload_value["uncertainty_started_at_utc"] = next_snapshot.model_dump(mode="json")["updated_at_utc"]
+    elif event_type == JournalEventType.REJECTED:
+        payload_value["reason"] = "connector rejected request"
+    elif event_type == JournalEventType.ORDER_CREATED:
+        payload_value["exchange_order_id"] = exchange_order_id
+    elif event_type == JournalEventType.FILL:
+        payload_value.update(
+            {
+                "exchange_order_id": exchange_order_id,
+                "exchange_trade_id": exchange_trade_id,
+                "price": "30",
+                "fill_quantity": fill_quantity,
+                "cumulative_filled_quantity": cumulative_filled_quantity,
+                "outcome": "FILLED" if terminal else "PARTIAL",
+                "terminal": terminal,
+            }
+        )
+    elif event_type in {JournalEventType.CANCEL_REQUESTED, JournalEventType.CANCEL_CONFIRMED}:
+        payload_value.update(
+            {
+                "phase": "REQUESTED" if event_type == JournalEventType.CANCEL_REQUESTED else "CONFIRMED",
+                "final_cumulative_filled_quantity": cumulative_filled_quantity,
+            }
+        )
+    elif event_type in {JournalEventType.HEDGE_REQUESTED, JournalEventType.HEDGE_CONFIRMED}:
+        payload_value["phase"] = "REQUESTED" if event_type == JournalEventType.HEDGE_REQUESTED else "CONFIRMED"
+    elif event_type in {JournalEventType.ROLLBACK_REQUESTED, JournalEventType.ROLLBACK_CONFIRMED}:
+        payload_value["phase"] = "REQUESTED" if event_type == JournalEventType.ROLLBACK_REQUESTED else "CONFIRMED"
+    elif event_type == JournalEventType.RECONCILIATION:
+        payload_value["outcome"] = "CANCELED" if terminal else "NEW"
+        payload_value["terminal"] = terminal
     return JournalEventV1(
         event_id=event_id,
         event_type=event_type,
-        intent_id="intent-maker-1",
-        idempotency_key="exec-sndk-snxx-0001:OPEN:ETF:40:1",
-        connector_name="binance_perpetual",
-        trading_pair="SNXX-USDT",
-        client_order_id="exec-sndk-snxx-0001-maker-1",
-        payload=CanonicalOpaquePayload.from_value(
-            schema_version=1,
-            kind="ORDER_STATUS",
-            value={"terminal": terminal},
-        ),
-        created_at_utc=UPDATED_AT,
+        intent_id=identity["intent_id"],
+        idempotency_key=identity["idempotency_key"],
+        connector_name=identity["connector_name"],
+        trading_pair=identity["trading_pair"],
+        client_order_id=identity["client_order_id"],
+        exchange_order_id=exchange_order_id,
+        exchange_trade_id=exchange_trade_id,
+        payload=_journal_payload(payload_kind, payload_value),
+        created_at_utc=next_snapshot.model_dump(mode="json")["updated_at_utc"],
     )
 
 
 def _reservation(
     reservation_id: str = "reservation-1",
-    reservation_key: str = "exec-sndk-snxx-0001:ETF:40",
+    reservation_key: str | None = None,
+    *,
+    executor_id: str = "exec-sndk-snxx-0001",
+    connector_name: str = "binance_perpetual",
+    trading_pair: str = "SNXX-USDT",
+    leg: str = "ETF",
+    quantity: str = "40",
+    leverage: int = 20,
+    notional_cap: str = "1000000",
+    created_at_utc: str = CREATED_AT,
+    updated_at_utc: str = CREATED_AT,
+    released_at_utc: str | None = None,
+    payload_overrides: dict | None = None,
 ) -> StrategyReservationV1:
+    reservation_key = reservation_key or f"{executor_id}:{leg}:{quantity}"
+    payload_value = {
+        "schema_version": 1,
+        "kind": "LEVERAGE_RESERVATION",
+        "reservation_key": reservation_key,
+        "executor_id": executor_id,
+        "connector_name": connector_name,
+        "trading_pair": trading_pair,
+        "leg": leg,
+        "logical_quantity": quantity,
+        **(payload_overrides or {}),
+    }
     return StrategyReservationV1(
         reservation_id=reservation_id,
-        executor_id="exec-sndk-snxx-0001",
+        executor_id=executor_id,
         reservation_key=reservation_key,
-        connector_name="binance_perpetual",
-        trading_pair="SNXX-USDT",
-        leg="ETF",
-        quantity="40",
-        leverage=20,
-        notional_cap="1000000",
+        connector_name=connector_name,
+        trading_pair=trading_pair,
+        leg=leg,
+        quantity=quantity,
+        leverage=leverage,
+        notional_cap=notional_cap,
         payload=CanonicalOpaquePayload.from_value(
             schema_version=1,
             kind="LEVERAGE_RESERVATION",
-            value={"logical_quantity": "40"},
+            value=payload_value,
         ),
-        created_at_utc=CREATED_AT,
-        updated_at_utc=CREATED_AT,
-        released_at_utc=None,
+        created_at_utc=created_at_utc,
+        updated_at_utc=updated_at_utc,
+        released_at_utc=released_at_utc,
     )
 
 
@@ -187,8 +404,9 @@ def test_journal_append_replay_and_stable_idempotency(manager: SQLConnectionMana
     prepared = _prepared_snapshot(initial)
     repository.create_executor(initial)
 
-    committed = repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
-    duplicate = repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
+    event = _prepared_event(initial, prepared)
+    committed = repository.append_and_reduce(initial.executor_id, event, prepared)
+    duplicate = repository.append_and_reduce(initial.executor_id, event, prepared)
 
     assert committed == duplicate
     assert committed.sequence == 1
@@ -197,7 +415,11 @@ def test_journal_append_replay_and_stable_idempotency(manager: SQLConnectionMana
     assert len(repository.events(initial.executor_id)) == 1
 
     with pytest.raises(JournalIntegrityError, match="event|payload|idempotency"):
-        repository.append_and_reduce(initial.executor_id, _prepared_event("41"), prepared)
+        repository.append_and_reduce(
+            initial.executor_id,
+            _prepared_event(initial, prepared, payload_value="41"),
+            prepared,
+        )
 
 
 def test_journal_commit_failure_rolls_back_event_and_snapshot(manager: SQLConnectionManager, vectors: dict):
@@ -211,7 +433,7 @@ def test_journal_commit_failure_rolls_back_event_and_snapshot(manager: SQLConnec
 
     failing_repository = LeveragedEtfJournalRepository(manager, before_commit=fail_commit)
     with pytest.raises(RuntimeError, match="forced commit failure"):
-        failing_repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
+        failing_repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
 
     assert repository.events(initial.executor_id) == ()
     assert repository.load_snapshot(initial.executor_id) == initial
@@ -225,7 +447,7 @@ def test_concurrent_duplicate_event_has_one_committed_sequence(manager: SQLConne
     def append_duplicate(_index: int):
         return LeveragedEtfJournalRepository(manager).append_and_reduce(
             initial.executor_id,
-            _prepared_event(),
+            _prepared_event(initial, prepared),
             prepared,
         )
 
@@ -245,27 +467,27 @@ def test_intent_transition_incomplete_query_and_logical_quantity_collision(
     initial = _initial_snapshot(vectors)
     prepared = _prepared_snapshot(initial)
     repository.create_executor(initial)
-    repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
-
-    conflicting_payload = _prepared_event().model_dump(mode="json")
-    conflicting_payload.update(
-        {
-            "event_id": "event-maker-prepared-2",
-            "intent_id": "intent-maker-2",
-            "idempotency_key": "exec-sndk-snxx-0001:OPEN:ETF:40:2",
-        }
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    conflicting_snapshot = _snapshot_at(prepared, 2)
+    conflicting = _prepared_event(
+        initial,
+        conflicting_snapshot,
+        attempt=2,
+        event_id="event-maker-prepared-2",
+        intent_id="intent-maker-2",
+        client_order_id="exec-sndk-snxx-0001-maker-2",
     )
     with pytest.raises(JournalConflictError, match="logical|non-terminal|intent"):
         repository.append_and_reduce(
             initial.executor_id,
-            JournalEventV1.model_validate(conflicting_payload),
-            _snapshot_at(prepared, 2),
+            conflicting,
+            conflicting_snapshot,
         )
 
     acknowledged = _snapshot_at(prepared, 2, "MAKER_WORKING")
     repository.append_and_reduce(
         initial.executor_id,
-        _followup_event(JournalEventType.ACKNOWLEDGED, "event-maker-ack-1"),
+        _followup_event(initial, acknowledged, JournalEventType.ACKNOWLEDGED, "event-maker-ack-1"),
         acknowledged,
     )
     incomplete = repository.incomplete_intents(initial.executor_id)
@@ -277,6 +499,8 @@ def test_intent_transition_incomplete_query_and_logical_quantity_collision(
     repository.append_and_reduce(
         initial.executor_id,
         _followup_event(
+            initial,
+            reconciled,
             JournalEventType.RECONCILIATION,
             "event-maker-reconciled-1",
             terminal=True,
@@ -294,8 +518,13 @@ def test_ack_without_prepared_is_rejected_without_snapshot_mutation(manager: SQL
     with pytest.raises(JournalConflictError, match="PREPARED|intent"):
         repository.append_and_reduce(
             initial.executor_id,
-            _followup_event(JournalEventType.ACKNOWLEDGED, "event-maker-ack-orphan"),
-            _snapshot_at(initial, 1),
+            _followup_event(
+                initial,
+                _snapshot_at(initial, 1, "MAKER_WORKING"),
+                JournalEventType.ACKNOWLEDGED,
+                "event-maker-ack-orphan",
+            ),
+            _snapshot_at(initial, 1, "MAKER_WORKING"),
         )
     assert repository.events(initial.executor_id) == ()
     assert repository.load_snapshot(initial.executor_id) == initial
@@ -308,22 +537,18 @@ def test_side_effect_status_without_intent_is_rejected_without_snapshot_mutation
     repository = LeveragedEtfJournalRepository(manager)
     initial = _initial_snapshot(vectors)
     repository.create_executor(initial)
-    orphan_ack = JournalEventV1(
-        event_id="event-maker-ack-without-intent",
-        event_type=JournalEventType.ACKNOWLEDGED,
-        connector_name="binance_perpetual",
-        trading_pair="SNXX-USDT",
-        client_order_id="exec-sndk-snxx-0001-maker-1",
-        payload=CanonicalOpaquePayload.from_value(
-            schema_version=1,
-            kind="ORDER_STATUS",
-            value={"terminal": False},
-        ),
-        created_at_utc=UPDATED_AT,
-    )
+    next_snapshot = _snapshot_at(initial, 1, "MAKER_WORKING")
+    complete_ack = _followup_event(
+        initial,
+        next_snapshot,
+        JournalEventType.ACKNOWLEDGED,
+        "event-maker-ack-without-intent",
+    ).model_dump(mode="json")
+    complete_ack["intent_id"] = None
 
-    with pytest.raises(JournalConflictError, match="intent|PREPARED"):
-        repository.append_and_reduce(initial.executor_id, orphan_ack, _snapshot_at(initial, 1))
+    with pytest.raises((ValidationError, JournalConflictError), match="intent|PREPARED|identity"):
+        orphan_ack = JournalEventV1.model_validate(complete_ack)
+        repository.append_and_reduce(initial.executor_id, orphan_ack, next_snapshot)
     assert repository.events(initial.executor_id) == ()
     assert repository.load_snapshot(initial.executor_id) == initial
 
@@ -336,25 +561,25 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
     initial = _initial_snapshot(vectors)
     prepared = _prepared_snapshot(initial)
     repository.create_executor(initial)
-    repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
-    fill = JournalEventV1(
-        event_id="event-maker-fill-1",
-        event_type=JournalEventType.FILL,
-        intent_id="intent-maker-1",
-        connector_name="binance_perpetual",
-        trading_pair="SNXX-USDT",
-        client_order_id="exec-sndk-snxx-0001-maker-1",
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    filled_snapshot = _snapshot_with_leg_fill(
+        prepared,
+        sequence=2,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="1",
+        filled="1",
+    )
+    fill = _followup_event(
+        initial,
+        filled_snapshot,
+        JournalEventType.FILL,
+        "event-maker-fill-1",
         exchange_order_id="exchange-order-1",
         exchange_trade_id="exchange-trade-1",
-        payload=CanonicalOpaquePayload.from_value(
-            schema_version=1,
-            kind="ORDER_FILL",
-            value={"price": "30", "quantity": "1", "terminal": False},
-        ),
-        created_at_utc=UPDATED_AT,
     )
-    filled_snapshot = _snapshot_at(prepared, 2, "STOCK_HEDGE_PENDING")
     committed = repository.append_and_reduce(initial.executor_id, fill, filled_snapshot)
+    assert fill.payload.__class__.__name__ == "FillJournalPayloadV1"
     duplicate_fill = JournalEventV1.model_validate(
         {
             **fill.model_dump(mode="json"),
@@ -362,14 +587,12 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
         }
     )
 
-    assert (
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="trade|event|identity|payload"):
         repository.append_and_reduce(
             initial.executor_id,
             duplicate_fill,
             _snapshot_at(filled_snapshot, 3),
         )
-        == committed
-    )
     assert repository.load_snapshot(initial.executor_id) == filled_snapshot
     assert tuple(event.sequence for event in repository.events(initial.executor_id)) == (1, 2)
 
@@ -377,10 +600,13 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
         {
             **fill.model_dump(mode="json"),
             "event_id": "event-maker-fill-conflict",
-            "payload": CanonicalOpaquePayload.from_value(
-                schema_version=1,
-                kind="ORDER_FILL",
-                value={"price": "30", "quantity": "2", "terminal": False},
+            "payload": _journal_payload(
+                "FILL",
+                {
+                    **_payload_value(fill.payload),
+                    "fill_quantity": "2",
+                    "cumulative_filled_quantity": "2",
+                },
             ).model_dump(mode="json"),
         }
     )
@@ -394,7 +620,12 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
     with pytest.raises(JournalConflictError, match="sequence"):
         repository.append_and_reduce(
             initial.executor_id,
-            _followup_event(JournalEventType.ACKNOWLEDGED, "event-maker-ack-out-of-order"),
+            _followup_event(
+                initial,
+                _snapshot_at(filled_snapshot, 4),
+                JournalEventType.ACKNOWLEDGED,
+                "event-maker-ack-out-of-order",
+            ),
             _snapshot_at(filled_snapshot, 4),
         )
     assert repository.load_snapshot(initial.executor_id) == filled_snapshot
@@ -425,7 +656,7 @@ def test_journal_replay_detects_hash_corruption_after_reopen(tmp_path: Path, vec
     prepared = _prepared_snapshot(initial)
     repository = LeveragedEtfJournalRepository(manager)
     repository.create_executor(initial)
-    repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
     manager.engine.dispose()
 
     reopened = _open_manager(db_path)
@@ -556,3 +787,897 @@ def test_anchor_revision_observations_append_without_mutating_final_record(
         ("5" * 64, "2026-07-17T20:05:00.000000Z"),
         ("6" * 64, "2026-07-17T20:06:00.000000Z"),
     )
+
+
+def _terminal_snapshot(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    sequence: int,
+    state: str = "COMPLETED",
+) -> LeveragedEtfPairExecutorSnapshotV1:
+    payload = snapshot.model_dump(mode="json")
+    if state == "COMPLETED":
+        payload.update(
+            {
+                "etf_submitted_quantity": payload["etf_target_quantity"],
+                "etf_filled_quantity": payload["etf_target_quantity"],
+                "etf_remaining_quantity": "0",
+                "stock_submitted_quantity": payload["stock_target_quantity"],
+                "stock_filled_quantity": payload["stock_target_quantity"],
+                "stock_remaining_quantity": "0",
+            }
+        )
+    payload.update(
+        {
+            "state": state,
+            "close_reason": "round-2 terminal probe",
+            "updated_at_utc": LATER_AT,
+            "last_journal_sequence": sequence,
+        }
+    )
+    return LeveragedEtfPairExecutorSnapshotV1.model_validate(payload)
+
+
+def _snapshot_for_executor(
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+    executor_id: str,
+) -> LeveragedEtfPairExecutorSnapshotV1:
+    payload = snapshot.model_dump(mode="json")
+    payload["executor_id"] = executor_id
+    return LeveragedEtfPairExecutorSnapshotV1.model_validate(payload)
+
+
+def _canonical_json_hash(value: dict) -> tuple[str, str]:
+    payload_json = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    return payload_json, hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _overwrite_snapshot(
+    db_path: Path,
+    snapshot: LeveragedEtfPairExecutorSnapshotV1,
+) -> None:
+    serialized = snapshot.model_dump(mode="json")
+    payload_json, payload_hash = _canonical_json_hash(serialized)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE LeveragedEtfExecutorSnapshot
+            SET state = ?, snapshot_json = ?, snapshot_hash = ?,
+                last_journal_sequence = ?, updated_at_utc = ?
+            WHERE executor_id = ?
+            """,
+            (
+                serialized["state"],
+                payload_json,
+                payload_hash,
+                serialized["last_journal_sequence"],
+                serialized["updated_at_utc"],
+                serialized["executor_id"],
+            ),
+        )
+
+
+def test_journal_payloads_are_typed_and_discriminated(vectors: dict):
+    initial = _initial_snapshot(vectors)
+    payload_cases = []
+    payload_cases.append((_prepared_event(initial, _prepared_snapshot(initial)), "PreparedJournalPayloadV1"))
+    payload_cases.extend(
+        (
+            _followup_event(
+                initial,
+                _snapshot_at(initial, 1, next_state),
+                event_type,
+                f"event-{event_type.value.lower()}",
+                action=action,
+                leg=leg,
+                logical_quantity=logical_quantity,
+                exchange_order_id="exchange-order-typed" if event_type == JournalEventType.ORDER_CREATED else None,
+                exchange_trade_id="exchange-trade-typed" if event_type == JournalEventType.FILL else None,
+            ),
+            expected_type,
+        )
+        for event_type, expected_type, action, leg, logical_quantity, next_state in (
+            (JournalEventType.ACKNOWLEDGED, "AcknowledgedJournalPayloadV1", "ETF_MAKER", "ETF", "40", "MAKER_WORKING"),
+            (JournalEventType.SUBMIT_UNKNOWN, "SubmitUnknownJournalPayloadV1", "ETF_MAKER", "ETF", "40", "RECONCILING"),
+            (JournalEventType.FILL, "FillJournalPayloadV1", "ETF_MAKER", "ETF", "40", "STOCK_HEDGE_PENDING"),
+            (
+                JournalEventType.CANCEL_REQUESTED,
+                "CancelJournalPayloadV1",
+                "CANCEL",
+                "ETF",
+                "40",
+                "MAKER_CANCEL_PENDING",
+            ),
+            (
+                JournalEventType.HEDGE_REQUESTED,
+                "HedgeJournalPayloadV1",
+                "STOCK_HEDGE",
+                "STOCK",
+                "49.796",
+                "STOCK_HEDGE_PENDING",
+            ),
+            (
+                JournalEventType.ROLLBACK_REQUESTED,
+                "RollbackJournalPayloadV1",
+                "ETF_ROLLBACK",
+                "ETF",
+                "40",
+                "ETF_ROLLBACK_PENDING",
+            ),
+            (
+                JournalEventType.RECONCILIATION,
+                "ReconciliationJournalPayloadV1",
+                "ETF_MAKER",
+                "ETF",
+                "40",
+                "RECONCILING",
+            ),
+        )
+    )
+
+    assert tuple(payload.__class__.__name__ for event, _ in payload_cases for payload in (event.payload,)) == tuple(
+        expected_type for _, expected_type in payload_cases
+    )
+    payload_schema = JournalEventV1.model_json_schema()["properties"]["payload"]
+    assert "discriminator" in payload_schema
+
+
+def test_prepared_cannot_jump_created_executor_to_completed(manager: SQLConnectionManager, vectors: dict):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    illegal = _terminal_snapshot(initial, 1)
+    repository.create_executor(initial)
+
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="state|transition|reducer"):
+        repository.append_and_reduce(initial.executor_id, _prepared_event(initial, illegal), illegal)
+    assert repository.events(initial.executor_id) == ()
+    assert repository.load_snapshot(initial.executor_id) == initial
+
+
+def test_maker_prepared_cannot_be_completed_by_hedge_event(manager: SQLConnectionManager, vectors: dict):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    illegal = _snapshot_at(prepared, 2, "STOCK_HEDGE_PENDING")
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    hedge = _followup_event(
+        initial,
+        illegal,
+        JournalEventType.HEDGE_CONFIRMED,
+        "event-foreign-hedge-confirmed",
+        action="STOCK_HEDGE",
+        leg="STOCK",
+        logical_quantity="49.796",
+        intent_id="intent-maker-1",
+    )
+
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="action|identity|intent|operation"):
+        repository.append_and_reduce(initial.executor_id, hedge, illegal)
+    assert tuple(event.sequence for event in repository.events(initial.executor_id)) == (1,)
+    assert repository.load_snapshot(initial.executor_id) == prepared
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_logical_quantity",
+        "false_exposure_flag",
+        "missing_deadline",
+        "operation_mismatch",
+        "idempotency_mismatch",
+        "connector_mismatch",
+    ),
+)
+def test_malformed_prepared_identity_is_rejected_atomically(
+    manager: SQLConnectionManager,
+    vectors: dict,
+    mutation: str,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    repository.create_executor(initial)
+    identity = _side_effect_identity(initial)
+    if mutation == "missing_logical_quantity":
+        identity.pop("logical_quantity")
+    elif mutation == "false_exposure_flag":
+        identity["exposure_increasing"] = False
+    elif mutation == "missing_deadline":
+        identity.pop("deadline_utc")
+    elif mutation == "operation_mismatch":
+        identity["operation"] = "CLOSE"
+    elif mutation == "idempotency_mismatch":
+        identity["idempotency_key"] = "arbitrary-idempotency-key"
+    elif mutation == "connector_mismatch":
+        identity["connector_name"] = "other_connector"
+    event_payload = _journal_payload(
+        "PREPARED",
+        {
+            "identity": identity,
+            "next_state": _state_payload(prepared),
+        },
+    )
+
+    with pytest.raises(
+        (ValidationError, JournalConflictError, JournalIntegrityError),
+        match="identity|exposure|logical|deadline|operation|idempotency|connector|payload",
+    ):
+        event = JournalEventV1(
+            event_id=f"event-malformed-{mutation}",
+            event_type=JournalEventType.PREPARED,
+            intent_id="intent-maker-1",
+            idempotency_key="exec-sndk-snxx-0001:OPEN:ETF:40:1",
+            connector_name="binance_perpetual",
+            trading_pair="SNXX-USDT",
+            client_order_id="exec-sndk-snxx-0001-maker-1",
+            payload=event_payload,
+            created_at_utc=UPDATED_AT,
+        )
+        repository.append_and_reduce(initial.executor_id, event, prepared)
+    assert repository.events(initial.executor_id) == ()
+    assert repository.load_snapshot(initial.executor_id) == initial
+
+
+@pytest.mark.parametrize(
+    ("event_type", "action", "leg", "logical_quantity", "illegal_state"),
+    (
+        (JournalEventType.ACKNOWLEDGED, "ETF_MAKER", "ETF", "40", "COMPLETED"),
+        (JournalEventType.SUBMIT_UNKNOWN, "ETF_MAKER", "ETF", "40", "COMPLETED"),
+        (JournalEventType.FILL, "ETF_MAKER", "ETF", "40", "COMPLETED"),
+        (JournalEventType.CANCEL_CONFIRMED, "CANCEL", "ETF", "40", "ABORTED_NO_FILL"),
+        (JournalEventType.HEDGE_CONFIRMED, "STOCK_HEDGE", "STOCK", "49.796", "STOCK_HEDGE_PENDING"),
+        (JournalEventType.ROLLBACK_CONFIRMED, "ETF_ROLLBACK", "ETF", "40", "ETF_ROLLBACK_PENDING"),
+        (JournalEventType.RECONCILIATION, "ETF_MAKER", "ETF", "40", "CREATED"),
+    ),
+)
+def test_illegal_cross_operation_and_state_matrix_has_no_mutation(
+    manager: SQLConnectionManager,
+    vectors: dict,
+    event_type: JournalEventType,
+    action: str,
+    leg: str,
+    logical_quantity: str,
+    illegal_state: str,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    illegal = _snapshot_at(prepared, 2, illegal_state)
+    event = _followup_event(
+        initial,
+        illegal,
+        event_type,
+        f"event-illegal-{event_type.value.lower()}",
+        action=action,
+        leg=leg,
+        logical_quantity=logical_quantity,
+        exchange_order_id="exchange-order-illegal" if event_type == JournalEventType.FILL else None,
+        exchange_trade_id="exchange-trade-illegal" if event_type == JournalEventType.FILL else None,
+    )
+
+    with pytest.raises(
+        (JournalConflictError, JournalIntegrityError), match="state|transition|action|identity|quantity|reducer"
+    ):
+        repository.append_and_reduce(initial.executor_id, event, illegal)
+    assert tuple(item.sequence for item in repository.events(initial.executor_id)) == (1,)
+    assert repository.load_snapshot(initial.executor_id) == prepared
+
+
+def test_exchange_trade_duplicate_requires_complete_same_event_identity(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    filled = _snapshot_with_leg_fill(
+        prepared,
+        sequence=2,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="1",
+        filled="1",
+    )
+    event = _followup_event(
+        initial,
+        filled,
+        JournalEventType.FILL,
+        "event-trade-owned",
+        exchange_order_id="exchange-order-owned",
+        exchange_trade_id="exchange-trade-owned",
+    )
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    committed = repository.append_and_reduce(initial.executor_id, event, filled)
+
+    assert repository.append_and_reduce(initial.executor_id, event, filled) == committed
+    conflicting = JournalEventV1.model_validate({**event.model_dump(mode="json"), "event_id": "event-trade-renamed"})
+    with pytest.raises((JournalConflictError, JournalIntegrityError), match="trade|event|identity"):
+        repository.append_and_reduce(initial.executor_id, conflicting, _snapshot_at(filled, 3))
+    assert repository.load_snapshot(initial.executor_id) == filled
+
+
+def test_exchange_trade_duplicate_cannot_return_foreign_executor_event(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial_a = _initial_snapshot(vectors)
+    initial_b = _snapshot_for_executor(initial_a, "exec-sndk-snxx-0002")
+    prepared_a = _prepared_snapshot(initial_a)
+    filled_a = _snapshot_with_leg_fill(
+        prepared_a,
+        sequence=2,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="1",
+        filled="1",
+    )
+    fill_a = _followup_event(
+        initial_a,
+        filled_a,
+        JournalEventType.FILL,
+        "event-trade-owner-a",
+        exchange_order_id="exchange-order-shared",
+        exchange_trade_id="exchange-trade-shared",
+    )
+    repository.create_executor(initial_a)
+    repository.create_executor(initial_b)
+    repository.append_and_reduce(initial_a.executor_id, _prepared_event(initial_a, prepared_a), prepared_a)
+    repository.append_and_reduce(initial_a.executor_id, fill_a, filled_a)
+    foreign_event_data = fill_a.model_dump(mode="json")
+    foreign_event_data.update(
+        {
+            "event_id": "event-trade-foreign-b",
+            "intent_id": "intent-foreign-b",
+            "idempotency_key": "exec-sndk-snxx-0002:OPEN:ETF:40:1",
+            "client_order_id": "exec-sndk-snxx-0002-maker-1",
+        }
+    )
+    proposed_b = _snapshot_with_leg_fill(
+        initial_b,
+        sequence=1,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="1",
+        filled="1",
+    )
+
+    with pytest.raises(
+        (ValidationError, JournalConflictError, JournalIntegrityError), match="executor|owner|identity|trade|PREPARED"
+    ):
+        foreign_event = JournalEventV1.model_validate(foreign_event_data)
+        repository.append_and_reduce(initial_b.executor_id, foreign_event, proposed_b)
+    assert repository.events(initial_b.executor_id) == ()
+    assert repository.load_snapshot(initial_b.executor_id) == initial_b
+
+
+def test_exchange_trade_id_is_rejected_for_non_fill_event(manager: SQLConnectionManager, vectors: dict):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    with pytest.raises(
+        (ValidationError, JournalConflictError, JournalIntegrityError), match="trade|FILL|identity|action"
+    ):
+        illegal = _followup_event(
+            initial,
+            _snapshot_at(prepared, 2, "STOCK_HEDGE_PENDING"),
+            JournalEventType.HEDGE_CONFIRMED,
+            "event-non-fill-trade-id",
+            action="STOCK_HEDGE",
+            leg="STOCK",
+            logical_quantity="49.796",
+            exchange_trade_id="exchange-trade-not-a-fill",
+        )
+        repository.append_and_reduce(initial.executor_id, illegal, _snapshot_at(prepared, 2, "STOCK_HEDGE_PENDING"))
+    assert tuple(item.sequence for item in repository.events(initial.executor_id)) == (1,)
+
+
+def test_cross_executor_exchange_trade_race_has_one_owner(manager: SQLConnectionManager, vectors: dict):
+    initial_a = _initial_snapshot(vectors)
+    initial_b = _snapshot_for_executor(initial_a, "exec-sndk-snxx-0002")
+    repository = LeveragedEtfJournalRepository(manager)
+    repository.create_executor(initial_a)
+    repository.create_executor(initial_b)
+    prepared_a = _prepared_snapshot(initial_a)
+    prepared_b = _prepared_snapshot(initial_b)
+    repository.append_and_reduce(initial_a.executor_id, _prepared_event(initial_a, prepared_a), prepared_a)
+    repository.append_and_reduce(
+        initial_b.executor_id,
+        _prepared_event(
+            initial_b,
+            prepared_b,
+            event_id="event-maker-prepared-b",
+            intent_id="intent-maker-b",
+            client_order_id="exec-sndk-snxx-0002-maker-1",
+        ),
+        prepared_b,
+    )
+    filled_a = _snapshot_with_leg_fill(
+        prepared_a,
+        sequence=2,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="1",
+        filled="1",
+    )
+    filled_b = _snapshot_with_leg_fill(
+        prepared_b,
+        sequence=2,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="1",
+        filled="1",
+    )
+    fill_a = _followup_event(
+        initial_a,
+        filled_a,
+        JournalEventType.FILL,
+        "event-race-fill-a",
+        exchange_order_id="exchange-order-race-a",
+        exchange_trade_id="exchange-trade-race",
+    )
+    fill_b = _followup_event(
+        initial_b,
+        filled_b,
+        JournalEventType.FILL,
+        "event-race-fill-b",
+        intent_id="intent-maker-b",
+        client_order_id="exec-sndk-snxx-0002-maker-1",
+        exchange_order_id="exchange-order-race-b",
+        exchange_trade_id="exchange-trade-race",
+    )
+
+    def append(executor_id: str, event: JournalEventV1, snapshot: LeveragedEtfPairExecutorSnapshotV1):
+        try:
+            return LeveragedEtfJournalRepository(manager).append_and_reduce(executor_id, event, snapshot)
+        except (JournalConflictError, JournalIntegrityError) as exception:
+            return exception
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(
+                lambda arguments: append(*arguments),
+                ((initial_a.executor_id, fill_a, filled_a), (initial_b.executor_id, fill_b, filled_b)),
+            )
+        )
+    committed = tuple(result for result in results if not isinstance(result, Exception))
+    rejected = tuple(result for result in results if isinstance(result, Exception))
+
+    assert len(committed) == 1
+    assert len(rejected) == 1
+    snapshots = (repository.load_snapshot(initial_a.executor_id), repository.load_snapshot(initial_b.executor_id))
+    assert sorted(snapshot.last_journal_sequence for snapshot in snapshots) == [1, 2]
+
+
+def _create_terminal_maker_intent(
+    repository: LeveragedEtfJournalRepository,
+    initial: LeveragedEtfPairExecutorSnapshotV1,
+) -> LeveragedEtfPairExecutorSnapshotV1:
+    prepared = _prepared_snapshot(initial)
+    acknowledged = _snapshot_at(prepared, 2, "MAKER_WORKING")
+    reconciled = _snapshot_at(acknowledged, 3, "MAKER_WORKING")
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    repository.append_and_reduce(
+        initial.executor_id,
+        _followup_event(initial, acknowledged, JournalEventType.ACKNOWLEDGED, "event-recovery-ack"),
+        acknowledged,
+    )
+    repository.append_and_reduce(
+        initial.executor_id,
+        _followup_event(
+            initial,
+            reconciled,
+            JournalEventType.RECONCILIATION,
+            "event-recovery-terminal",
+            terminal=True,
+        ),
+        reconciled,
+    )
+    return reconciled
+
+
+@pytest.mark.parametrize("discovery_method", ("incomplete_intents", "incomplete_executors"))
+def test_recovery_discovery_replays_snapshot_before_filtering(
+    tmp_path: Path,
+    vectors: dict,
+    discovery_method: str,
+):
+    db_path = tmp_path / f"recovery-divergence-{discovery_method}.sqlite"
+    manager = _open_manager(db_path)
+    initial = _initial_snapshot(vectors)
+    repository = LeveragedEtfJournalRepository(manager)
+    reconciled = _create_terminal_maker_intent(repository, initial)
+    tampered = LeveragedEtfPairExecutorSnapshotV1.model_validate(
+        {**reconciled.model_dump(mode="json"), "state": "COMPLETED", "close_reason": "tampered terminal"}
+    )
+    manager.engine.dispose()
+    _overwrite_snapshot(db_path, tampered)
+    reopened = _open_manager(db_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="replay|persisted|journal|chain"):
+            method = getattr(LeveragedEtfJournalRepository(reopened), discovery_method)
+            method(initial.executor_id) if discovery_method == "incomplete_intents" else method()
+    finally:
+        reopened.engine.dispose()
+
+
+@pytest.mark.parametrize("corruption", ("missing_sequence", "extra_journal_sequence", "orphan_event"))
+def test_recovery_discovery_rejects_gap_extra_and_orphan_rows(
+    tmp_path: Path,
+    vectors: dict,
+    corruption: str,
+):
+    db_path = tmp_path / f"recovery-{corruption}.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    acknowledged = _snapshot_at(prepared, 2, "MAKER_WORKING")
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
+    repository.append_and_reduce(
+        initial.executor_id,
+        _followup_event(initial, acknowledged, JournalEventType.ACKNOWLEDGED, "event-recovery-gap-ack"),
+        acknowledged,
+    )
+    manager.engine.dispose()
+    if corruption == "extra_journal_sequence":
+        _overwrite_snapshot(db_path, prepared)
+    else:
+        with sqlite3.connect(db_path) as connection:
+            if corruption == "missing_sequence":
+                connection.execute("DROP TRIGGER lepf_journal_no_delete")
+                connection.execute("DELETE FROM LeveragedEtfJournalEvent WHERE sequence = 1")
+            else:
+                connection.execute("DROP TRIGGER lepf_snapshot_referenced_no_delete")
+                connection.execute(
+                    "DELETE FROM LeveragedEtfExecutorSnapshot WHERE executor_id = ?",
+                    (initial.executor_id,),
+                )
+    reopened = _open_manager(db_path)
+    try:
+        recovery_repository = LeveragedEtfJournalRepository(reopened)
+        with pytest.raises(JournalIntegrityError, match="sequence|orphan|snapshot|journal|replay"):
+            recovery_repository.incomplete_executors()
+        with pytest.raises(JournalIntegrityError, match="sequence|orphan|snapshot|journal|replay"):
+            recovery_repository.incomplete_intents(initial.executor_id)
+    finally:
+        reopened.engine.dispose()
+
+
+def test_recovery_discovery_and_append_share_one_database_snapshot(manager: SQLConnectionManager, vectors: dict):
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    LeveragedEtfJournalRepository(manager).create_executor(initial)
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    writer_reached_commit = threading.Event()
+
+    def recovery_hook(_connection) -> None:
+        read_entered.set()
+        assert release_read.wait(timeout=10)
+
+    def before_writer_commit(_connection) -> None:
+        writer_reached_commit.set()
+
+    recovery_repository = LeveragedEtfJournalRepository(manager, recovery_read_hook=recovery_hook)
+    writer_repository = LeveragedEtfJournalRepository(manager, before_commit=before_writer_commit)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        discovery = executor.submit(recovery_repository.incomplete_executors)
+        assert read_entered.wait(timeout=10)
+        append = executor.submit(
+            writer_repository.append_and_reduce,
+            initial.executor_id,
+            _prepared_event(initial, prepared),
+            prepared,
+        )
+        assert writer_reached_commit.wait(timeout=10)
+        assert not append.done()
+        release_read.set()
+        assert discovery.result(timeout=10) == (initial,)
+        assert append.result(timeout=10).sequence == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "connector",
+        "pair",
+        "key",
+        "quantity_payload",
+        "leverage",
+        "notional_cap",
+        "pre_released",
+        "pre_released_backdated",
+        "non_creation_update",
+        "updated_backdated",
+    ),
+)
+def test_reservation_role_identity_and_creation_lifecycle_are_atomic(
+    manager: SQLConnectionManager,
+    vectors: dict,
+    mutation: str,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    reservation_kwargs = {
+        "connector": {"connector_name": "other_connector"},
+        "pair": {"trading_pair": "BTC-USDT"},
+        "key": {"reservation_key": "arbitrary-reservation-key"},
+        "quantity_payload": {"quantity": "39", "payload_overrides": {"logical_quantity": "40"}},
+        "leverage": {"leverage": 10},
+        "notional_cap": {"notional_cap": "999999"},
+        "pre_released": {"released_at_utc": UPDATED_AT},
+        "pre_released_backdated": {"released_at_utc": "2026-07-17T14:01:01.000000Z"},
+        "non_creation_update": {"updated_at_utc": LATER_AT},
+        "updated_backdated": {"updated_at_utc": "2026-07-17T14:01:01.000000Z"},
+    }[mutation]
+
+    with pytest.raises(
+        (ValidationError, JournalConflictError, JournalIntegrityError),
+        match="reservation|role|connector|pair|key|quantity|release|created|updated|identity",
+    ):
+        reservation = _reservation(**reservation_kwargs)
+        repository.reserve(reservation)
+    assert repository.active_reservations() == ()
+
+
+def test_reservation_reopen_and_concurrent_release_are_monotonic(tmp_path: Path, vectors: dict):
+    db_path = tmp_path / "reservation-reopen.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    reservation = _reservation()
+    repository.reserve(reservation)
+    manager.engine.dispose()
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.active_reservations(initial.executor_id) == (reservation,)
+        with pytest.raises(JournalConflictError, match="release|time|monotonic|created"):
+            reopened_repository.release_reservation(
+                reservation.reservation_id,
+                "2026-07-17T14:01:01.000000Z",
+            )
+        assert reopened_repository.active_reservations(initial.executor_id) == (reservation,)
+
+        def release(timestamp: str):
+            try:
+                return LeveragedEtfJournalRepository(reopened).release_reservation(
+                    reservation.reservation_id,
+                    timestamp,
+                )
+            except JournalConflictError as exception:
+                return exception
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(release, (UPDATED_AT, LATER_AT)))
+        released = tuple(result for result in results if isinstance(result, StrategyReservationV1))
+        rejected = tuple(result for result in results if isinstance(result, JournalConflictError))
+        assert len(released) == 1
+        assert len(rejected) == 1
+        assert reopened_repository.active_reservations(initial.executor_id) == ()
+        with pytest.raises(JournalConflictError, match="released|time|monotonic"):
+            reopened_repository.release_reservation(reservation.reservation_id, CREATED_AT)
+    finally:
+        reopened.engine.dispose()
+
+
+@pytest.mark.parametrize("non_finite", (math.nan, math.inf, -math.inf), ids=("nan", "infinity", "negative-infinity"))
+def test_canonical_opaque_payload_rejects_non_finite_json(non_finite: float):
+    with pytest.raises((ValueError, ValidationError), match="finite|constant|JSON|canonical"):
+        CanonicalOpaquePayload.from_value(
+            schema_version=1,
+            kind="ANCHOR_CHECKPOINT",
+            value={"schema_version": 1, "value": non_finite},
+        )
+    raw_json = (
+        '{"schema_version":1,"value":'
+        + ("NaN" if math.isnan(non_finite) else "Infinity" if non_finite > 0 else "-Infinity")
+        + "}"
+    )
+    with pytest.raises((ValueError, ValidationError), match="finite|constant|JSON|canonical"):
+        CanonicalOpaquePayload.from_canonical_json(
+            schema_version=1,
+            kind="ANCHOR_CHECKPOINT",
+            payload_json=raw_json,
+            payload_hash=hashlib.sha256(raw_json.encode("utf-8")).hexdigest(),
+        )
+
+
+@pytest.mark.parametrize("kind", ("ANCHOR_CHECKPOINT", "ANCHOR_RECORD", "LEVERAGE_RESERVATION"))
+def test_opaque_wrapper_and_embedded_schema_versions_must_match(kind: str):
+    with pytest.raises((ValueError, ValidationError), match="schema_version|version"):
+        CanonicalOpaquePayload.from_value(
+            schema_version=2,
+            kind=kind,
+            value={"schema_version": 1, "kind": kind},
+        )
+
+
+@pytest.mark.parametrize("schema_version", (1, 2))
+@pytest.mark.parametrize("state_kind", ("CHECKPOINT", "FINALIZED"))
+def test_matching_opaque_anchor_versions_round_trip_after_reopen(
+    tmp_path: Path,
+    schema_version: int,
+    state_kind: str,
+):
+    db_path = tmp_path / f"opaque-{schema_version}-{state_kind.lower()}.sqlite"
+    manager = _open_manager(db_path)
+    repository = AnchorRepositoryV1(manager)
+    cycle_id = f"xnys-2026-07-{18 + schema_version}"
+    target_session_date = f"2026-07-{18 + schema_version}"
+    official_close_utc = f"2026-07-{18 + schema_version}T20:00:00.000000Z"
+    deadline_utc = f"2026-07-{18 + schema_version}T20:10:00.000000Z"
+    if state_kind == "CHECKPOINT":
+        payload = CanonicalOpaquePayload.from_value(
+            schema_version,
+            "ANCHOR_CHECKPOINT",
+            {
+                "schema_version": schema_version,
+                "cycle_id": cycle_id,
+                "target_session_date": target_session_date,
+                "official_close_utc": official_close_utc,
+                "deadline_utc": deadline_utc,
+                "revision": 1,
+                "provider_state": {"cursor": f"v{schema_version}"},
+            },
+        )
+        state = OpaqueAnchorCheckpointV1(
+            cycle_id=cycle_id,
+            target_session_date=target_session_date,
+            official_close_utc=official_close_utc,
+            deadline_utc=deadline_utc,
+            revision=1,
+            payload=payload,
+        )
+        repository.compare_and_set_opaque_checkpoint(state, expected_revision=0)
+    else:
+        evidence_hash = str(schema_version) * 64
+        payload = CanonicalOpaquePayload.from_value(
+            schema_version,
+            "ANCHOR_RECORD",
+            {
+                "schema_version": schema_version,
+                "cycle_id": cycle_id,
+                "target_session_date": target_session_date,
+                "official_close_utc": official_close_utc,
+                "deadline_utc": deadline_utc,
+                "evidence_hash": evidence_hash,
+                "finalized_at_utc": official_close_utc,
+                "provider_state": {"cursor": f"v{schema_version}"},
+            },
+        )
+        state = OpaqueAnchorFinalizedV1(
+            cycle_id=cycle_id,
+            target_session_date=target_session_date,
+            official_close_utc=official_close_utc,
+            deadline_utc=deadline_utc,
+            revision=1,
+            evidence_hash=evidence_hash,
+            payload=payload,
+        )
+        repository.finalize_opaque_if_absent(state, expected_revision=0)
+    manager.engine.dispose()
+    reopened = _open_manager(db_path)
+    try:
+        assert AnchorRepositoryV1(reopened).load_opaque(cycle_id) == state
+    finally:
+        reopened.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    (
+        ("target_session_date", "2026-07-18"),
+        ("official_close_utc", "2026-07-17T20:01:00.000000Z"),
+        ("deadline_utc", "2026-07-17T20:11:00.000000Z"),
+    ),
+)
+def test_anchor_checkpoint_cycle_identity_is_frozen_without_mutation(
+    manager: SQLConnectionManager,
+    vectors: dict,
+    field_name: str,
+    replacement: str,
+):
+    repository = AnchorRepositoryV1(manager)
+    empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
+    confirmed_data = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"]).model_dump(
+        mode="json"
+    )
+    confirmed_data[field_name] = replacement
+    changed = AnchorPollingCheckpointV1.model_validate(confirmed_data)
+    repository.compare_and_set_checkpoint(empty, expected_revision=0)
+
+    with pytest.raises(AnchorIntegrityError, match="cycle|session|official|deadline|identity"):
+        repository.compare_and_set_checkpoint(changed, expected_revision=1)
+    assert repository.load(empty.cycle_id) == empty
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    (
+        ("target_session_date", "2026-07-18"),
+        ("deadline_utc", "2026-07-17T20:11:00.000000Z"),
+    ),
+)
+def test_anchor_typed_finalization_preserves_checkpoint_identity_after_reopen(
+    tmp_path: Path,
+    vectors: dict,
+    field_name: str,
+    replacement: str,
+):
+    db_path = tmp_path / f"anchor-final-{field_name}.sqlite"
+    manager = _open_manager(db_path)
+    repository = AnchorRepositoryV1(manager)
+    empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
+    confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
+    repository.compare_and_set_checkpoint(empty, expected_revision=0)
+    repository.compare_and_set_checkpoint(confirmed, expected_revision=1)
+    manager.engine.dispose()
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = AnchorRepositoryV1(reopened)
+        record_data = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record"]).model_dump(mode="json")
+        record_data[field_name] = replacement
+        changed_record = AnchorRecordV1.model_validate(record_data)
+        with pytest.raises(AnchorIntegrityError, match="cycle|session|deadline|identity"):
+            reopened_repository.finalize_if_absent(changed_record, expected_revision=2)
+        assert reopened_repository.load(confirmed.cycle_id) == confirmed
+    finally:
+        reopened.engine.dispose()
+
+
+def test_anchor_opaque_finalization_preserves_official_close(manager: SQLConnectionManager, vectors: dict):
+    repository = AnchorRepositoryV1(manager)
+    empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
+    confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
+    record = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record"])
+    repository.compare_and_set_checkpoint(empty, expected_revision=0)
+    repository.compare_and_set_checkpoint(confirmed, expected_revision=1)
+    opaque = OpaqueAnchorFinalizedV1(
+        cycle_id=record.cycle_id,
+        target_session_date=record.target_session_date,
+        official_close_utc="2026-07-17T20:01:00.000000Z",
+        deadline_utc=record.deadline_utc,
+        revision=2,
+        evidence_hash=record.evidence_hash,
+        payload=CanonicalOpaquePayload.from_value(1, "ANCHOR_RECORD", record.model_dump(mode="json")),
+    )
+
+    with pytest.raises(AnchorIntegrityError, match="official|close|cycle|identity"):
+        repository.finalize_opaque_if_absent(opaque, expected_revision=2)
+    assert repository.load(confirmed.cycle_id) == confirmed
+
+
+def test_anchor_concurrent_valid_and_identity_conflicting_cas_keeps_valid_state(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = AnchorRepositoryV1(manager)
+    empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
+    confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
+    invalid = AnchorPollingCheckpointV1.model_validate(
+        {**confirmed.model_dump(mode="json"), "deadline_utc": "2026-07-17T20:11:00.000000Z"}
+    )
+    repository.compare_and_set_checkpoint(empty, expected_revision=0)
+
+    def update(checkpoint: AnchorPollingCheckpointV1):
+        try:
+            return AnchorRepositoryV1(manager).compare_and_set_checkpoint(checkpoint, expected_revision=1)
+        except (AnchorIntegrityError, AnchorRevisionConflict) as exception:
+            return exception
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(update, (confirmed, invalid)))
+    assert sum(isinstance(result, AnchorPollingCheckpointV1) for result in results) == 1
+    assert sum(isinstance(result, (AnchorIntegrityError, AnchorRevisionConflict)) for result in results) == 1
+    assert repository.load(empty.cycle_id) == confirmed
