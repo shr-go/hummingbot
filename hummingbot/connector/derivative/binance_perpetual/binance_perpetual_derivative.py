@@ -56,7 +56,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     SHORT_POLL_INTERVAL = 5.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     LONG_POLL_INTERVAL = 120.0
-    MAX_ACCOUNT_DATA_AGE_SECONDS = 5.0
+    MAX_ACCOUNT_DATA_AGE_SECONDS = 5
 
     def __init__(
             self,
@@ -306,13 +306,27 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             raise BinancePerpetualPreflightError(
                 "max_age_seconds must be a finite number between 0 and 5 seconds"
             )
+        if isinstance(max_age_seconds, Decimal):
+            is_finite_max_age = max_age_seconds.is_finite()
+        elif isinstance(max_age_seconds, float):
+            is_finite_max_age = math.isfinite(max_age_seconds)
+        else:
+            is_finite_max_age = True
+        if (
+                not is_finite_max_age
+                or max_age_seconds < 0
+                or max_age_seconds > self.MAX_ACCOUNT_DATA_AGE_SECONDS
+        ):
+            raise BinancePerpetualPreflightError(
+                "max_age_seconds must be a finite number between 0 and 5 seconds"
+            )
         try:
             max_age = float(max_age_seconds)
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, TypeError, ValueError) as exc:
             raise BinancePerpetualPreflightError(
                 "max_age_seconds must be a finite number between 0 and 5 seconds"
             ) from exc
-        if not math.isfinite(max_age) or max_age < 0 or max_age > self.MAX_ACCOUNT_DATA_AGE_SECONDS:
+        if not math.isfinite(max_age):
             raise BinancePerpetualPreflightError(
                 "max_age_seconds must be a finite number between 0 and 5 seconds"
             )
