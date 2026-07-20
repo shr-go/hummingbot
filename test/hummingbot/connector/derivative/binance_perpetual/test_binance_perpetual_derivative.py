@@ -25,6 +25,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, Position
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.trade_fee import TokenAmount
+from hummingbot.core.event.event_forwarder import EventForwarder
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
 
@@ -3305,6 +3306,97 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(committed_snapshot, self._submission_unknown_mutation_snapshot(tracked_order))
         self.assertEqual(1, len(fill_logger.event_log))
+
+    async def test_submission_unknown_fill_listener_cancellation_cannot_split_commit(self):
+        self._simulate_trading_rules_initialized()
+        observations = []
+
+        for index, cancel_first in enumerate((True, False), start=121):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            fill_logger = EventLogger()
+            cancellation_calls = []
+
+            def cancel_synchronously(event):
+                cancellation_calls.append(event)
+                raise asyncio.CancelledError("listener-local cancellation")
+
+            canceling_listener = EventForwarder(cancel_synchronously)
+            listeners = (
+                (canceling_listener, fill_logger)
+                if cancel_first
+                else (fill_logger, canceling_listener)
+            )
+            for listener in listeners:
+                self.exchange.add_listener(MarketEvent.OrderFilled, listener)
+
+            waiter_wake_count = 0
+
+            async def wait_for_fill():
+                nonlocal waiter_wake_count
+                await tracked_order.wait_until_completely_filled()
+                waiter_wake_count += 1
+
+            completion_waiter = asyncio.create_task(wait_for_fill())
+            await asyncio.sleep(0)
+            event = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="FILLED",
+                last_fill_quantity="1.250",
+                cumulative_quantity="1.250",
+                trade_id=1,
+            )
+            initial_error_name = None
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except BaseException as error:
+                initial_error_name = type(error).__name__
+            await asyncio.sleep(0)
+            initial_observation = (
+                initial_error_name,
+                tracked_order.current_state,
+                self.exchange.is_order_submission_unknown(client_order_id),
+                len(fill_logger.event_log),
+                len(cancellation_calls),
+                waiter_wake_count,
+                len(tracked_order.order_fills),
+            )
+
+            duplicate_error_name = None
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except BaseException as error:
+                duplicate_error_name = type(error).__name__
+            await asyncio.sleep(0)
+            observations.append((
+                cancel_first,
+                initial_observation,
+                duplicate_error_name,
+                tracked_order.current_state,
+                self.exchange.is_order_submission_unknown(client_order_id),
+                len(fill_logger.event_log),
+                len(cancellation_calls),
+                waiter_wake_count,
+                len(tracked_order.order_fills),
+            ))
+
+            for listener in listeners:
+                self.exchange.remove_listener(MarketEvent.OrderFilled, listener)
+            if completion_waiter.done():
+                await completion_waiter
+            else:
+                completion_waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await completion_waiter
+
+        expected_initial = (None, OrderState.FILLED, False, 1, 1, 1, 1)
+        self.assertEqual(
+            [
+                (cancel_first, expected_initial, None, OrderState.FILLED, False, 1, 1, 1, 1)
+                for cancel_first in (True, False)
+            ],
+            observations,
+        )
 
     async def test_submission_unknown_stream_atomic_clears_only_after_tracker_success_and_propagates_cancel(self):
         self._simulate_trading_rules_initialized()
