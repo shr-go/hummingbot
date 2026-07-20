@@ -312,7 +312,11 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             exchange_order_id: Optional[str] = None,
             trade_type: TradeType = TradeType.SELL,
             order_type: OrderType = OrderType.LIMIT,
+            authoritative_price_increment: Optional[Decimal] = Decimal("0.001"),
     ) -> InFlightOrder:
+        trading_rule = self.exchange._trading_rules.get(self.trading_pair)
+        if trading_rule is not None and authoritative_price_increment is not None:
+            trading_rule.min_price_increment = authoritative_price_increment
         self.exchange.start_tracking_order(
             order_id=client_order_id,
             exchange_order_id=exchange_order_id,
@@ -3381,7 +3385,10 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                     )
                 }
             client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
-            tracked_order = self._track_submission_unknown_order(client_order_id)
+            tracked_order = self._track_submission_unknown_order(
+                client_order_id,
+                authoritative_price_increment=None,
+            )
             before = self._submission_unknown_mutation_snapshot(tracked_order)
             rejected = False
             try:
@@ -3408,6 +3415,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             tracked_order = self._track_submission_unknown_order(
                 client_order_id=client_order_id,
                 order_type=OrderType.MARKET,
+                authoritative_price_increment=Decimal("0.01"),
             )
             event = self._submission_unknown_fill_event(
                 client_order_id=client_order_id,
@@ -3909,19 +3917,14 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
 
     def _simulate_trading_rules_initialized(self):
         margin_asset = self.quote_asset
-        mocked_response = self._get_exchange_info_mock_response(
-            margin_asset,
-            min_order_size=0.001,
-            min_price_increment=0.001,
-            min_base_amount_increment=0.001,
-        )
+        mocked_response = self._get_exchange_info_mock_response(margin_asset)
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(mocked_response)
         self.exchange._trading_rules = {
             self.trading_pair: TradingRule(
                 trading_pair=self.trading_pair,
-                min_order_size=Decimal("0.001"),
-                min_price_increment=Decimal("0.001"),
-                min_base_amount_increment=Decimal("0.001"),
+                min_order_size=Decimal(str(1)),
+                min_price_increment=Decimal(str(2)),
+                min_base_amount_increment=Decimal(str(3)),
                 min_notional_size=Decimal(str(4)),
             )
         }
