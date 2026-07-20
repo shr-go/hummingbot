@@ -160,6 +160,28 @@ class MarketsRecorder:
         return self._sql_manager
 
     @property
+    def leveraged_etf_journal_repository(self):
+        """Framework-owned transactional seam for leveraged-ETF executor durability."""
+        from hummingbot.model.leveraged_etf_repository import LeveragedEtfJournalRepository
+
+        repository = getattr(self, "_leveraged_etf_journal_repository", None)
+        if repository is None:
+            repository = LeveragedEtfJournalRepository(self._sql_manager)
+            self._leveraged_etf_journal_repository = repository
+        return repository
+
+    @property
+    def anchor_repository_v1(self):
+        """Sole AnchorRepositoryV1 instance bound to the recorder database."""
+        from hummingbot.model.leveraged_etf_repository import AnchorRepositoryV1
+
+        repository = getattr(self, "_anchor_repository_v1", None)
+        if repository is None:
+            repository = AnchorRepositoryV1(self._sql_manager)
+            self._anchor_repository_v1 = repository
+        return repository
+
+    @property
     def config_file_path(self) -> str:
         return self._config_file_path
 
