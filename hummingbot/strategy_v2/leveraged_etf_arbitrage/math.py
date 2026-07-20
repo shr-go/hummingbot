@@ -13,6 +13,7 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
     LegNotionals,
     LegQuantities,
     Opportunity,
+    OPPORTUNITY_SCHEMA_VERSION,
     RoundTripCosts,
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
@@ -149,33 +150,25 @@ def _exact_opportunity_bp(
     stock_entry_price: Decimal,
     etf_entry_price: Decimal,
     etf_quantity: Decimal,
+    stock_quantity: Decimal,
     stock_contract_multiplier: Decimal,
     etf_contract_multiplier: Decimal,
     maker_fee_bp: Decimal,
     taker_fee_bp: Decimal,
     maker_slippage_bp_per_fill: Decimal,
 ) -> tuple[Fraction, Fraction, Fraction]:
-    stock_anchor_fraction = Fraction(stock_anchor)
-    etf_anchor_fraction = Fraction(etf_anchor)
-    multiplier_fraction = Fraction(etf_daily_multiplier)
     stock_price_fraction = Fraction(stock_entry_price)
     etf_price_fraction = Fraction(etf_entry_price)
     etf_quantity_fraction = Fraction(etf_quantity)
     stock_contract_fraction = Fraction(stock_contract_multiplier)
     etf_contract_fraction = Fraction(etf_contract_multiplier)
-    exact_hedge_ratio = multiplier_fraction * etf_anchor_fraction / stock_anchor_fraction
     exact_theoretical = _exact_theoretical_price(
         stock_entry_price,
         stock_anchor,
         etf_anchor,
         etf_daily_multiplier,
     )
-    exact_stock_quantity = (
-        etf_quantity_fraction
-        * etf_contract_fraction
-        / stock_contract_fraction
-        * exact_hedge_ratio
-    )
+    exact_stock_quantity = Fraction(stock_quantity)
     exact_etf_notional = etf_quantity_fraction * etf_contract_fraction * etf_price_fraction
     exact_stock_notional = exact_stock_quantity * stock_contract_fraction * stock_price_fraction
     exact_gross_notional = exact_etf_notional + exact_stock_notional
@@ -359,6 +352,7 @@ def calculate_opportunity(
     stock_entry_price: Decimal,
     etf_entry_price: Decimal,
     etf_quantity: Decimal,
+    stock_quantity: Decimal,
     stock_contract_multiplier: Decimal,
     etf_contract_multiplier: Decimal,
     maker_fee_bp: Decimal,
@@ -371,6 +365,7 @@ def calculate_opportunity(
     stock_entry_price = _decimal(stock_entry_price, "stock entry price", positive=True)
     etf_entry_price = _decimal(etf_entry_price, "ETF entry price", positive=True)
     etf_quantity = _decimal(etf_quantity, "ETF quantity", positive=True)
+    stock_quantity = _decimal(stock_quantity, "stock quantity", positive=True)
     stock_contract_multiplier = _decimal(
         stock_contract_multiplier,
         "stock contract multiplier",
@@ -410,12 +405,22 @@ def calculate_opportunity(
     if direction is None:
         raise ValueError("entry prices contain no directional spread")
     hedge_ratio = calculate_hedge_ratio(stock_anchor, etf_anchor, etf_daily_multiplier)
-    quantities = calculate_leg_quantities(
-        etf_quantity,
-        direction,
-        hedge_ratio,
-        etf_contract_multiplier,
-        stock_contract_multiplier,
+    quantities = LegQuantities(
+        etf_quantity=(
+            -etf_quantity
+            if direction is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+            else etf_quantity
+        ),
+        stock_quantity=(
+            stock_quantity
+            if direction is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+            else -stock_quantity
+        ),
+    )
+    executable_hedge_ratio = (
+        stock_quantity
+        * stock_contract_multiplier
+        / (etf_quantity * etf_contract_multiplier)
     )
     notionals = calculate_leg_notionals(
         quantities,
@@ -431,6 +436,7 @@ def calculate_opportunity(
         stock_entry_price=stock_entry_price,
         etf_entry_price=etf_entry_price,
         etf_quantity=etf_quantity,
+        stock_quantity=stock_quantity,
         stock_contract_multiplier=stock_contract_multiplier,
         etf_contract_multiplier=etf_contract_multiplier,
         maker_fee_bp=maker_fee_bp,
@@ -457,6 +463,7 @@ def calculate_opportunity(
         stock_entry_price=stock_entry_price,
         etf_entry_price=etf_entry_price,
         etf_quantity=etf_quantity,
+        stock_quantity=stock_quantity,
         stock_contract_multiplier=stock_contract_multiplier,
         etf_contract_multiplier=etf_contract_multiplier,
         maker_fee_bp=maker_fee_bp,
@@ -468,6 +475,7 @@ def calculate_opportunity(
     return Opportunity(
         direction=direction,
         hedge_ratio=hedge_ratio,
+        executable_hedge_ratio=executable_hedge_ratio,
         theoretical_etf_price=theoretical_price,
         quantities=quantities,
         notionals=notionals,
@@ -475,6 +483,7 @@ def calculate_opportunity(
         raw_bp=raw_bp_display,
         costs=costs,
         net_bp=net_bp,
+        schema_version=OPPORTUNITY_SCHEMA_VERSION,
     )
 
 

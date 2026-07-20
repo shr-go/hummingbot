@@ -38,7 +38,7 @@ _DECISION_CONTEXT = Context(
     Emin=-99,
     Emax=99,
 )
-DECISION_VALUE_SCHEMA_VERSION = 2
+DECISION_VALUE_SCHEMA_VERSION = 3
 DECISION_VALUE_SERIALIZED_FIELDS = (
     "schema_version",
     "certainty",
@@ -301,6 +301,7 @@ _NET_BP_OPERAND_SPEC = (
     ("stock_entry_price", "positive"),
     ("etf_entry_price", "positive"),
     ("etf_quantity", "positive"),
+    ("stock_quantity", "positive"),
     ("stock_contract_multiplier", "positive"),
     ("etf_contract_multiplier", "positive"),
     ("maker_fee_bp", "nonnegative"),
@@ -407,13 +408,10 @@ def _exact_net_bp_from_values(values: Mapping[str, Decimal]) -> tuple[Fraction, 
     etf_quantity = Fraction(values["etf_quantity"])
     stock_contract = Fraction(values["stock_contract_multiplier"])
     etf_contract = Fraction(values["etf_contract_multiplier"])
-    exact_hedge_ratio = multiplier * etf_anchor / stock_anchor
     exact_theoretical = etf_anchor * (
         1 + multiplier * (stock_price / stock_anchor - 1)
     )
-    exact_stock_quantity = (
-        etf_quantity * etf_contract / stock_contract * exact_hedge_ratio
-    )
+    exact_stock_quantity = Fraction(values["stock_quantity"])
     exact_etf_notional = etf_quantity * etf_contract * etf_price
     exact_stock_notional = exact_stock_quantity * stock_contract * stock_price
     exact_gross_notional = exact_etf_notional + exact_stock_notional
@@ -438,25 +436,14 @@ def _net_bp_display_from_values(
     values: Mapping[str, Decimal],
     exact_gross_profit: Fraction,
 ) -> Decimal:
-    exact_hedge_ratio = (
-        Fraction(values["etf_daily_multiplier"])
-        * Fraction(values["etf_anchor"])
-        / Fraction(values["stock_anchor"])
-    )
     with decision_decimal_context():
-        hedge_ratio = Decimal(exact_hedge_ratio.numerator) / Decimal(exact_hedge_ratio.denominator)
-        stock_quantity = (
-            values["etf_quantity"]
-            * (values["etf_contract_multiplier"] / values["stock_contract_multiplier"])
-            * hedge_ratio
-        )
         etf_notional = (
             values["etf_quantity"]
             * values["etf_contract_multiplier"]
             * values["etf_entry_price"]
         )
         stock_notional = (
-            stock_quantity
+            values["stock_quantity"]
             * values["stock_contract_multiplier"]
             * values["stock_entry_price"]
         )
@@ -556,7 +543,7 @@ class DecisionValue:
 
     def _validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != DECISION_VALUE_SCHEMA_VERSION:
-            raise DecisionValueIntegrityError("decision value schema version must be 2")
+            raise DecisionValueIntegrityError("decision value schema version must be 3")
         if not isinstance(self.certainty, DecisionCertainty):
             raise DecisionValueIntegrityError("decision certainty is invalid")
         try:
@@ -682,6 +669,7 @@ class DecisionValue:
         stock_entry_price: Decimal,
         etf_entry_price: Decimal,
         etf_quantity: Decimal,
+        stock_quantity: Decimal,
         stock_contract_multiplier: Decimal,
         etf_contract_multiplier: Decimal,
         maker_fee_bp: Decimal,
@@ -697,6 +685,7 @@ class DecisionValue:
                 "stock_entry_price": stock_entry_price,
                 "etf_entry_price": etf_entry_price,
                 "etf_quantity": etf_quantity,
+                "stock_quantity": stock_quantity,
                 "stock_contract_multiplier": stock_contract_multiplier,
                 "etf_contract_multiplier": etf_contract_multiplier,
                 "maker_fee_bp": maker_fee_bp,
@@ -746,10 +735,10 @@ class DecisionValue:
 
     @classmethod
     def from_fields(cls, fields: Mapping[str, Any]) -> "DecisionValue":
-        """Restore the strict version-2 JSON-safe semantic schema."""
+        """Restore the strict version-3 JSON-safe semantic schema."""
 
         if not isinstance(fields, Mapping) or set(fields) != _DECISION_VALUE_FIELDS:
-            raise DecisionValueIntegrityError("decision value fields do not match schema version 2")
+            raise DecisionValueIntegrityError("decision value fields do not match schema version 3")
         try:
             certainty = DecisionCertainty(fields["certainty"])
         except (TypeError, ValueError) as exception:

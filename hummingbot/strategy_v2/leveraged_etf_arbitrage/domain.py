@@ -4,6 +4,8 @@ from enum import Enum
 from fractions import Fraction
 from typing import Optional
 
+from pydantic import StrictInt
+
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
     DecisionCertainty,
     DecisionSemanticKind,
@@ -14,6 +16,7 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
 
 
 _BASIS_POINTS = Decimal("10000")
+OPPORTUNITY_SCHEMA_VERSION = 3
 
 
 def _validate_decimal(value: object, name: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:
@@ -111,6 +114,7 @@ class RoundTripCosts:
 class Opportunity:
     direction: ArbitrageDirection
     hedge_ratio: Decimal
+    executable_hedge_ratio: Decimal
     theoretical_etf_price: DecisionValue
     quantities: LegQuantities
     notionals: LegNotionals
@@ -118,6 +122,7 @@ class Opportunity:
     raw_bp: Decimal
     costs: RoundTripCosts
     net_bp: DecisionValue
+    schema_version: StrictInt = OPPORTUNITY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         self.validate_integrity()
@@ -127,7 +132,10 @@ class Opportunity:
 
         if not isinstance(self.direction, ArbitrageDirection):
             raise TypeError("direction must be an ArbitrageDirection")
+        if type(self.schema_version) is not int or self.schema_version != OPPORTUNITY_SCHEMA_VERSION:
+            raise ValueError("opportunity schema version must be 3")
         _validate_decimal(self.hedge_ratio, "hedge ratio", positive=True)
+        _validate_decimal(self.executable_hedge_ratio, "executable hedge ratio", positive=True)
         for decision_value, field_name, semantic_kind in (
             (
                 self.theoretical_etf_price,
@@ -177,6 +185,7 @@ class Opportunity:
         stock_price = Fraction(net_values["stock_entry_price"])
         etf_price = Fraction(net_values["etf_entry_price"])
         etf_quantity = Fraction(net_values["etf_quantity"])
+        stock_quantity = Fraction(net_values["stock_quantity"])
         stock_contract = Fraction(net_values["stock_contract_multiplier"])
         etf_contract = Fraction(net_values["etf_contract_multiplier"])
         exact_hedge_ratio = multiplier * etf_anchor / stock_anchor
@@ -201,23 +210,23 @@ class Opportunity:
                 Decimal(exact_theoretical.numerator)
                 / Decimal(exact_theoretical.denominator)
             )
-            expected_stock_quantity = (
-                net_values["etf_quantity"]
-                * (
-                    net_values["etf_contract_multiplier"]
-                    / net_values["stock_contract_multiplier"]
+            expected_executable_hedge_ratio = (
+                net_values["stock_quantity"]
+                * net_values["stock_contract_multiplier"]
+                / (
+                    net_values["etf_quantity"]
+                    * net_values["etf_contract_multiplier"]
                 )
-                * expected_hedge_ratio
             )
             if expected_direction is ArbitrageDirection.SHORT_ETF_LONG_STOCK:
                 expected_quantities = LegQuantities(
                     etf_quantity=-net_values["etf_quantity"],
-                    stock_quantity=expected_stock_quantity,
+                    stock_quantity=net_values["stock_quantity"],
                 )
             else:
                 expected_quantities = LegQuantities(
                     etf_quantity=net_values["etf_quantity"],
-                    stock_quantity=-expected_stock_quantity,
+                    stock_quantity=-net_values["stock_quantity"],
                 )
             expected_etf_notional = (
                 abs(expected_quantities.etf_quantity)
@@ -280,9 +289,7 @@ class Opportunity:
             )
             expected_net_bp_display = expected_raw_bp - expected_costs.total_bp
 
-        exact_stock_quantity = (
-            etf_quantity * etf_contract / stock_contract * exact_hedge_ratio
-        )
+        exact_stock_quantity = stock_quantity
         exact_etf_notional = etf_quantity * etf_contract * etf_price
         exact_stock_notional = exact_stock_quantity * stock_contract * stock_price
         exact_gross_notional = exact_etf_notional + exact_stock_notional
@@ -310,6 +317,8 @@ class Opportunity:
             raise ValueError("opportunity direction does not match its raw inputs")
         if self.hedge_ratio != expected_hedge_ratio:
             raise ValueError("opportunity hedge ratio does not match its raw inputs")
+        if self.executable_hedge_ratio != expected_executable_hedge_ratio:
+            raise ValueError("opportunity executable hedge ratio does not match its actual quantities")
         if self.theoretical_etf_price.exact_fraction != exact_theoretical:
             raise ValueError("opportunity theoretical exact value does not match its raw inputs")
         if self.theoretical_etf_price.display != expected_theoretical_display:
@@ -336,6 +345,7 @@ class Opportunity:
             (
                 self.direction,
                 self.hedge_ratio,
+                self.executable_hedge_ratio,
                 self.theoretical_etf_price,
                 self.quantities,
                 self.notionals,
@@ -343,6 +353,7 @@ class Opportunity:
                 self.raw_bp,
                 self.costs,
                 self.net_bp,
+                self.schema_version,
             ),
         )
 

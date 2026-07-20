@@ -3,12 +3,15 @@ from hummingbot.data_feed.yahoo_finance.acquisition import (
     AnchorAcquisitionStatus,
     AnchorCandidate,
     AnchorPollingCheckpoint,
+    AnchorRepositoryKey,
+    AnchorRepositoryV2,
     CheckpointIntegrityError,
     FinalizedAnchorAssessment,
     FinalizedAnchorStatus,
     RevisionObservation,
     YahooAnchorAcquisition,
     anchor_evidence_hash,
+    pair_scoped_anchor_evidence_hash,
 )
 from hummingbot.data_feed.yahoo_finance.parser import (
     YahooChartParseError,
@@ -27,6 +30,8 @@ __all__ = [
     "AnchorAcquisitionStatus",
     "AnchorCandidate",
     "AnchorPollingCheckpoint",
+    "AnchorRepositoryKey",
+    "AnchorRepositoryV2",
     "CheckpointIntegrityError",
     "FinalizedAnchorAssessment",
     "FinalizedAnchorStatus",
@@ -39,4 +44,5 @@ __all__ = [
     "YahooDeadlineExceeded",
     "YahooHTTPError",
     "anchor_evidence_hash",
+    "pair_scoped_anchor_evidence_hash",
 ]

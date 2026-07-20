@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from hummingbot.data_feed.yahoo_finance.parser import YahooCloseObservation
 from hummingbot.data_feed.yahoo_finance.provider import (
@@ -36,6 +36,7 @@ UTC = timezone.utc
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _CYCLE_PATTERN = re.compile(r"^xnys-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
+_PAIR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _ANCHOR_SOURCE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DATE_PATTERN = re.compile(r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])$")
 _UTC_PATTERN = re.compile(
@@ -76,7 +77,7 @@ _CONFIRMATION_EVIDENCE_FIELDS = {
     "stock_source_url",
     "etf_source_url",
 }
-_RECOVERY_FIELDS = _CHECKPOINT_FIELDS | {
+_RECOVERY_V2_FIELDS = _CHECKPOINT_FIELDS | {
     "integrity_version",
     "stock_symbol",
     "etf_symbol",
@@ -87,6 +88,7 @@ _RECOVERY_FIELDS = _CHECKPOINT_FIELDS | {
     "acquisition_config_hash",
     "integrity_hash",
 }
+_RECOVERY_FIELDS = _RECOVERY_V2_FIELDS | {"pair_id"}
 _CANDIDATE_EVIDENCE_FIELDS = {
     "evidence_version",
     "cycle_id",
@@ -119,7 +121,19 @@ _CANDIDATE_EVIDENCE_FIELDS = {
     "confirmation_evidence",
     "evidence_hash",
 }
-_ANCHOR_EVIDENCE_VERSION = 2
+_REVISION_OBSERVATION_FIELDS = {
+    "schema_version",
+    "pair_id",
+    "cycle_id",
+    "stock_close",
+    "etf_close",
+    "stock_raw_response_hash",
+    "etf_raw_response_hash",
+    "evidence_hash",
+    "observed_at_utc",
+}
+_ANCHOR_EVIDENCE_VERSION = 3
+_ANCHOR_REPOSITORY_KEY_SCHEMA_VERSION = 2
 
 
 class CheckpointIntegrityError(ValueError):
@@ -234,6 +248,27 @@ def _validate_symbol(value: object, field_name: str) -> str:
     return value
 
 
+def _validate_pair_id(value: object, field_name: str = "pair ID") -> str:
+    if not isinstance(value, str) or _PAIR_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a bounded canonical pair identifier")
+    return value
+
+
+def _pair_id_for_symbols(stock_symbol: str, etf_symbol: str) -> str:
+    _validate_symbol(stock_symbol, "stock symbol")
+    _validate_symbol(etf_symbol, "ETF symbol")
+    if stock_symbol == etf_symbol:
+        raise ValueError("stock and ETF symbols must differ")
+    return f"{stock_symbol.lower()}_{etf_symbol.lower()}"
+
+
+def _validate_pair_binding(pair_id: object, stock_symbol: str, etf_symbol: str) -> str:
+    validated = _validate_pair_id(pair_id)
+    if validated != _pair_id_for_symbols(stock_symbol, etf_symbol):
+        raise ValueError("pair ID does not match its stock and ETF symbols")
+    return validated
+
+
 def _validate_source_url(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 512 or not value.startswith("https://"):
         raise ValueError(f"{field_name} must be a bounded HTTPS URL")
@@ -287,6 +322,30 @@ def anchor_evidence_hash(
         sort_keys=True,
     )
     return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def pair_scoped_anchor_evidence_hash(
+    pair_id: str,
+    cycle_id: str,
+    stock_raw_response_hash: str,
+    etf_raw_response_hash: str,
+) -> str:
+    """Hash revision evidence under the version-2 pair/cycle repository key."""
+
+    _validate_pair_id(pair_id)
+    if not isinstance(cycle_id, str) or _CYCLE_PATTERN.fullmatch(cycle_id) is None:
+        raise ValueError("cycle_id must be an XNYS cycle identifier")
+    _validate_hash(stock_raw_response_hash, "stock raw response hash")
+    _validate_hash(etf_raw_response_hash, "ETF raw response hash")
+    return _canonical_sha256(
+        {
+            "schema_version": _ANCHOR_REPOSITORY_KEY_SCHEMA_VERSION,
+            "pair_id": pair_id,
+            "cycle_id": cycle_id,
+            "stock_raw_response_hash": stock_raw_response_hash,
+            "etf_raw_response_hash": etf_raw_response_hash,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +489,7 @@ class AnchorPollingCheckpoint:
     etf_received_at_utc: datetime | None
     revision: int
     integrity_version: int = 1
+    pair_id: str | None = None
     anchor_source: str | None = None
     etf_daily_multiplier: Decimal | None = None
     hedge_ratio: Decimal | None = None
@@ -512,13 +572,14 @@ class AnchorPollingCheckpoint:
             if self.next_poll_utc < max(self.stock_received_at_utc, self.etf_received_at_utc):
                 raise CheckpointIntegrityError("next poll cannot precede the latest candidate receive time")
 
-        if isinstance(self.integrity_version, bool) or self.integrity_version not in (1, 2):
-            raise CheckpointIntegrityError("checkpoint integrity version must be 1 or 2")
+        if isinstance(self.integrity_version, bool) or self.integrity_version not in (1, 2, 3):
+            raise CheckpointIntegrityError("checkpoint integrity version must be 1, 2, or 3")
         if not isinstance(self.confirmation_evidence, tuple):
             raise CheckpointIntegrityError("checkpoint confirmation evidence must be an immutable tuple")
         if self.integrity_version == 1:
             if (
                 self.anchor_source is not None
+                or self.pair_id is not None
                 or self.etf_daily_multiplier is not None
                 or self.hedge_ratio is not None
                 or self.acquisition_config_hash is not None
@@ -527,8 +588,17 @@ class AnchorPollingCheckpoint:
                 or self.confirmation_evidence
                 or self.integrity_hash is not None
             ):
-                raise CheckpointIntegrityError("version-1 checkpoint cannot contain version-2 recovery evidence")
+                raise CheckpointIntegrityError("version-1 checkpoint cannot contain recovery evidence")
             return
+
+        if self.integrity_version == 2:
+            if self.pair_id is not None:
+                raise CheckpointIntegrityError("version-2 checkpoint cannot claim a pair namespace")
+        else:
+            try:
+                _validate_pair_binding(self.pair_id, self.stock_symbol, self.etf_symbol)
+            except (TypeError, ValueError) as exception:
+                raise CheckpointIntegrityError(str(exception)) from exception
 
         if (
             not isinstance(self.anchor_source, str)
@@ -543,7 +613,11 @@ class AnchorPollingCheckpoint:
         _validate_hash(self.acquisition_config_hash, "checkpoint acquisition config hash")
 
         if self.confirmation_count == 0:
-            if self.stock_symbol is not None or self.etf_symbol is not None or self.confirmation_evidence:
+            if self.integrity_version == 2 and (
+                self.stock_symbol is not None or self.etf_symbol is not None
+            ):
+                raise CheckpointIntegrityError("empty version-2 checkpoint cannot contain pair symbols")
+            if self.confirmation_evidence:
                 raise CheckpointIntegrityError("empty checkpoint cannot contain confirmation evidence")
             if self.hedge_ratio is not None:
                 raise CheckpointIntegrityError("empty checkpoint cannot contain a derived hedge ratio")
@@ -606,6 +680,8 @@ class AnchorPollingCheckpoint:
                 "confirmation_evidence": [record.to_fields() for record in self.confirmation_evidence],
             }
         )
+        if self.integrity_version >= 3:
+            payload["pair_id"] = self.pair_id
         return payload
 
     def _contract_fields(self) -> dict[str, Any]:
@@ -681,21 +757,25 @@ class AnchorPollingCheckpoint:
             raise CheckpointIntegrityError(f"invalid checkpoint contract fields: {exception}") from exception
 
     def to_contract_fields(self) -> dict[str, Any]:
-        if self.integrity_version == _ANCHOR_EVIDENCE_VERSION and self.confirmation_count > 0:
+        if self.integrity_version != 1 and self.confirmation_count > 0:
             raise CheckpointIntegrityError(
-                "confirmed version-2 checkpoint requires the lossless recovery adapter"
+                "pair-scoped recovery checkpoint cannot use the lossy version-1 contract"
             )
         return self._contract_fields()
 
     @classmethod
     def from_recovery_fields(cls, fields: Mapping[str, Any]) -> "AnchorPollingCheckpoint":
-        if not isinstance(fields, Mapping) or set(fields) != _RECOVERY_FIELDS:
-            raise CheckpointIntegrityError("checkpoint recovery fields do not match version 2")
+        if not isinstance(fields, Mapping):
+            raise CheckpointIntegrityError("checkpoint recovery fields must be an object")
+        integrity_version = fields.get("integrity_version")
+        expected_fields = _RECOVERY_FIELDS if integrity_version == 3 else _RECOVERY_V2_FIELDS
+        if integrity_version not in (2, 3) or set(fields) != expected_fields:
+            raise CheckpointIntegrityError("checkpoint recovery fields do not match version 2 or 3")
         raw_records = fields["confirmation_evidence"]
         if not isinstance(raw_records, list):
             raise CheckpointIntegrityError("checkpoint confirmation evidence must be an array")
-        if fields["integrity_version"] == _ANCHOR_EVIDENCE_VERSION and fields["integrity_hash"] is None:
-            raise CheckpointIntegrityError("version-2 recovery fields require an integrity hash")
+        if fields["integrity_hash"] is None:
+            raise CheckpointIntegrityError("recovery fields require an integrity hash")
         contract_fields = {field_name: fields[field_name] for field_name in _CHECKPOINT_FIELDS}
         base = cls.from_contract_fields(contract_fields)
 
@@ -707,6 +787,7 @@ class AnchorPollingCheckpoint:
             return replace(
                 base,
                 integrity_version=fields["integrity_version"],
+                pair_id=fields.get("pair_id"),
                 anchor_source=fields["anchor_source"],
                 etf_daily_multiplier=optional_financial_decimal("etf_daily_multiplier"),
                 hedge_ratio=optional_financial_decimal("hedge_ratio"),
@@ -724,6 +805,8 @@ class AnchorPollingCheckpoint:
             raise CheckpointIntegrityError(f"invalid checkpoint recovery fields: {exception}") from exception
 
     def to_recovery_fields(self) -> dict[str, Any]:
+        if self.integrity_version not in (2, 3):
+            raise CheckpointIntegrityError("legacy checkpoint does not have a recovery evidence schema")
         fields = self._contract_fields()
         fields.update(
             {
@@ -744,6 +827,8 @@ class AnchorPollingCheckpoint:
                 "integrity_hash": self.integrity_hash,
             }
         )
+        if self.integrity_version >= 3:
+            fields["pair_id"] = self.pair_id
         return fields
 
 
@@ -854,8 +939,8 @@ class AnchorCandidate:
             raise ValueError("candidate deadline must follow official close")
         if self.deadline_utc - self.official_close_utc > timedelta(seconds=600):
             raise ValueError("candidate deadline exceeds the bounded anchor window")
-        if self.observed_confirmation_count != self.anchor_confirmation_count:
-            raise ValueError("final candidate must contain every required confirmation")
+        if self.observed_confirmation_count < self.anchor_confirmation_count:
+            raise ValueError("final candidate has fewer observations than the required confirmations")
         if len(self.confirmation_evidence) != self.observed_confirmation_count:
             raise ValueError("candidate evidence count does not match observed confirmation count")
         if not self.confirmation_evidence:
@@ -969,7 +1054,7 @@ class AnchorCandidate:
     @classmethod
     def from_evidence_fields(cls, fields: Mapping[str, Any]) -> "AnchorCandidate":
         if not isinstance(fields, Mapping) or set(fields) != _CANDIDATE_EVIDENCE_FIELDS:
-            raise CheckpointIntegrityError("candidate evidence fields do not match version 2")
+            raise CheckpointIntegrityError("candidate evidence fields do not match version 3")
         raw_records = fields["confirmation_evidence"]
         if not isinstance(raw_records, list):
             raise CheckpointIntegrityError("candidate confirmation evidence must be an array")
@@ -1031,6 +1116,8 @@ class AnchorCandidate:
 
 @dataclass(frozen=True, slots=True)
 class RevisionObservation:
+    schema_version: int
+    pair_id: str
     cycle_id: str
     stock_close: Decimal
     etf_close: Decimal
@@ -1040,6 +1127,9 @@ class RevisionObservation:
     observed_at_utc: datetime
 
     def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != _ANCHOR_REPOSITORY_KEY_SCHEMA_VERSION:
+            raise ValueError("revision observation schema version must be 2")
+        _validate_pair_id(self.pair_id, "revision pair ID")
         if not isinstance(self.cycle_id, str) or _CYCLE_PATTERN.fullmatch(self.cycle_id) is None:
             raise ValueError("revision cycle ID must be an XNYS cycle identifier")
         _validate_positive_decimal(self.stock_close, "revision stock close")
@@ -1048,13 +1138,145 @@ class RevisionObservation:
         _validate_hash(self.etf_raw_response_hash, "revision ETF raw response hash")
         _validate_hash(self.evidence_hash, "revision evidence hash")
         _validate_utc(self.observed_at_utc, "revision observed time")
-        expected_evidence_hash = anchor_evidence_hash(
+        expected_evidence_hash = pair_scoped_anchor_evidence_hash(
+            pair_id=self.pair_id,
             cycle_id=self.cycle_id,
             stock_raw_response_hash=self.stock_raw_response_hash,
             etf_raw_response_hash=self.etf_raw_response_hash,
         )
         if self.evidence_hash != expected_evidence_hash:
             raise ValueError("revision evidence hash does not match its immutable response hashes")
+
+    def to_fields(self) -> dict[str, Any]:
+        self.__post_init__()
+        return {
+            "schema_version": self.schema_version,
+            "pair_id": self.pair_id,
+            "cycle_id": self.cycle_id,
+            "stock_close": _format_decimal(self.stock_close),
+            "etf_close": _format_decimal(self.etf_close),
+            "stock_raw_response_hash": self.stock_raw_response_hash,
+            "etf_raw_response_hash": self.etf_raw_response_hash,
+            "evidence_hash": self.evidence_hash,
+            "observed_at_utc": _format_utc(self.observed_at_utc),
+        }
+
+    @classmethod
+    def from_fields(cls, fields: Mapping[str, Any]) -> "RevisionObservation":
+        if not isinstance(fields, Mapping) or set(fields) != _REVISION_OBSERVATION_FIELDS:
+            raise CheckpointIntegrityError("revision observation fields do not match version 2")
+        try:
+            return cls(
+                schema_version=fields["schema_version"],
+                pair_id=fields["pair_id"],
+                cycle_id=fields["cycle_id"],
+                stock_close=_parse_canonical_decimal(fields["stock_close"], "revision stock close"),
+                etf_close=_parse_canonical_decimal(fields["etf_close"], "revision ETF close"),
+                stock_raw_response_hash=fields["stock_raw_response_hash"],
+                etf_raw_response_hash=fields["etf_raw_response_hash"],
+                evidence_hash=fields["evidence_hash"],
+                observed_at_utc=_parse_utc(fields["observed_at_utc"], "revision observed time"),
+            )
+        except CheckpointIntegrityError:
+            raise
+        except (TypeError, ValueError) as exception:
+            raise CheckpointIntegrityError(f"invalid revision observation fields: {exception}") from exception
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorRepositoryKey:
+    """Explicit pair/cycle namespace for every version-2 repository operation."""
+
+    schema_version: int
+    pair_id: str
+    cycle_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != _ANCHOR_REPOSITORY_KEY_SCHEMA_VERSION:
+            raise CheckpointIntegrityError("anchor repository key schema version must be 2")
+        try:
+            _validate_pair_id(self.pair_id, "repository pair ID")
+        except (TypeError, ValueError) as exception:
+            raise CheckpointIntegrityError(str(exception)) from exception
+        if not isinstance(self.cycle_id, str) or _CYCLE_PATTERN.fullmatch(self.cycle_id) is None:
+            raise CheckpointIntegrityError("repository cycle ID must be an XNYS cycle identifier")
+
+    @classmethod
+    def create(cls, pair_id: str, cycle_id: str) -> "AnchorRepositoryKey":
+        return cls(
+            schema_version=_ANCHOR_REPOSITORY_KEY_SCHEMA_VERSION,
+            pair_id=pair_id,
+            cycle_id=cycle_id,
+        )
+
+    def to_fields(self) -> dict[str, Any]:
+        self.__post_init__()
+        return {
+            "schema_version": self.schema_version,
+            "pair_id": self.pair_id,
+            "cycle_id": self.cycle_id,
+        }
+
+    @classmethod
+    def from_fields(cls, fields: Mapping[str, Any]) -> "AnchorRepositoryKey":
+        if not isinstance(fields, Mapping) or set(fields) != {"schema_version", "pair_id", "cycle_id"}:
+            raise CheckpointIntegrityError("anchor repository key fields do not match version 2")
+        return cls(
+            schema_version=fields["schema_version"],
+            pair_id=fields["pair_id"],
+            cycle_id=fields["cycle_id"],
+        )
+
+    def validate_checkpoint(self, checkpoint: AnchorPollingCheckpoint) -> None:
+        if not isinstance(checkpoint, AnchorPollingCheckpoint):
+            raise TypeError("repository checkpoint must be an AnchorPollingCheckpoint")
+        checkpoint.__post_init__()
+        if checkpoint.integrity_version != _ANCHOR_EVIDENCE_VERSION:
+            raise CheckpointIntegrityError("repository checkpoint must use pair-scoped version 3")
+        if checkpoint.pair_id != self.pair_id or checkpoint.cycle_id != self.cycle_id:
+            raise CheckpointIntegrityError("repository key does not match checkpoint pair/cycle identity")
+
+    def validate_candidate(self, candidate: AnchorCandidate) -> None:
+        if not isinstance(candidate, AnchorCandidate):
+            raise TypeError("repository candidate must be an AnchorCandidate")
+        if not candidate.verify_evidence_hash():
+            raise CheckpointIntegrityError("repository candidate evidence is corrupt")
+        if candidate.pair_id != self.pair_id or candidate.cycle_id != self.cycle_id:
+            raise CheckpointIntegrityError("repository key does not match candidate pair/cycle identity")
+
+    def validate_revision_observation(self, observation: RevisionObservation) -> None:
+        if not isinstance(observation, RevisionObservation):
+            raise TypeError("repository revision must be a RevisionObservation")
+        observation.__post_init__()
+        if observation.pair_id != self.pair_id or observation.cycle_id != self.cycle_id:
+            raise CheckpointIntegrityError("repository key does not match revision pair/cycle identity")
+
+
+@runtime_checkable
+class AnchorRepositoryV2(Protocol):
+    """Persistence port; F004 supplies storage and must preserve the explicit key."""
+
+    def load(self, key: AnchorRepositoryKey) -> AnchorPollingCheckpoint | AnchorCandidate | None: ...
+
+    def compare_and_set_checkpoint(
+        self,
+        key: AnchorRepositoryKey,
+        checkpoint: AnchorPollingCheckpoint,
+        expected_revision: int,
+    ) -> AnchorPollingCheckpoint: ...
+
+    def finalize_if_absent(
+        self,
+        key: AnchorRepositoryKey,
+        candidate: AnchorCandidate,
+        expected_revision: int,
+    ) -> AnchorCandidate: ...
+
+    def append_revision_observation(
+        self,
+        key: AnchorRepositoryKey,
+        revision_observation: RevisionObservation,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1111,7 +1333,7 @@ class YahooAnchorAcquisition:
             sleep=sleep,
             jitter=jitter,
         )
-        self._active_budget_key: tuple[str, datetime] | None = None
+        self._active_budget_key: tuple[str, str, datetime] | None = None
         self._active_budget: YahooCycleBudget | None = None
         self._poll_saturation_attempt = self._calculate_poll_saturation_attempt()
 
@@ -1120,8 +1342,16 @@ class YahooAnchorAcquisition:
         cycle_id: str,
         target_session_date: date,
         official_close_utc: datetime,
+        *,
+        pair_id: str,
+        stock_symbol: str,
+        etf_symbol: str,
     ) -> AnchorPollingCheckpoint:
         self._validate_exact_official_close(target_session_date, official_close_utc)
+        try:
+            _validate_pair_binding(pair_id, stock_symbol, etf_symbol)
+        except (TypeError, ValueError) as exception:
+            raise CheckpointIntegrityError(str(exception)) from exception
         checkpoint = AnchorPollingCheckpoint(
             schema_version=1,
             cycle_id=cycle_id,
@@ -1139,12 +1369,19 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=None,
             revision=1,
             integrity_version=_ANCHOR_EVIDENCE_VERSION,
+            pair_id=pair_id,
             anchor_source=self._nav_config.anchor_source,
             etf_daily_multiplier=self._etf_daily_multiplier,
             hedge_ratio=None,
             acquisition_config_hash=self._acquisition_config_hash,
+            stock_symbol=stock_symbol,
+            etf_symbol=etf_symbol,
         )
-        self._active_budget_key = (checkpoint.cycle_id, checkpoint.deadline_utc)
+        self._active_budget_key = (
+            checkpoint.pair_id,
+            checkpoint.cycle_id,
+            checkpoint.deadline_utc,
+        )
         self._active_budget = YahooCycleBudget.start(
             deadline_utc=checkpoint.deadline_utc,
             utc_clock=self._utc_clock,
@@ -1163,10 +1400,13 @@ class YahooAnchorAcquisition:
         self._validate_checkpoint_for_config(checkpoint)
         self._validate_symbol(stock_symbol, "stock symbol")
         self._validate_symbol(etf_symbol, "ETF symbol")
-        if checkpoint.confirmation_count > 0 and (
-            checkpoint.stock_symbol != stock_symbol or checkpoint.etf_symbol != etf_symbol
+        expected_pair_id = _pair_id_for_symbols(stock_symbol, etf_symbol)
+        if (
+            checkpoint.pair_id != expected_pair_id
+            or checkpoint.stock_symbol != stock_symbol
+            or checkpoint.etf_symbol != etf_symbol
         ):
-            raise CheckpointIntegrityError("checkpoint evidence symbols do not match the requested pair")
+            raise CheckpointIntegrityError("checkpoint pair identity does not match the requested pair")
         budget = budget or self._budget_for(checkpoint)
         if budget.deadline_utc != checkpoint.deadline_utc:
             raise ValueError("cycle budget does not match checkpoint deadline")
@@ -1323,12 +1563,15 @@ class YahooAnchorAcquisition:
         if stock_observation.close == candidate.stock_close and etf_observation.close == candidate.etf_close:
             return FinalizedAnchorAssessment(status=FinalizedAnchorStatus.UNCHANGED, candidate=candidate)
 
-        evidence_hash = anchor_evidence_hash(
+        evidence_hash = pair_scoped_anchor_evidence_hash(
+            pair_id=candidate.pair_id,
             cycle_id=candidate.cycle_id,
             stock_raw_response_hash=stock_observation.raw_response_hash,
             etf_raw_response_hash=etf_observation.raw_response_hash,
         )
         revision = RevisionObservation(
+            schema_version=_ANCHOR_REPOSITORY_KEY_SCHEMA_VERSION,
+            pair_id=candidate.pair_id,
             cycle_id=candidate.cycle_id,
             stock_close=stock_observation.close,
             etf_close=etf_observation.close,
@@ -1359,9 +1602,6 @@ class YahooAnchorAcquisition:
         if checkpoint.confirmation_count == 0 or not same_candidate:
             confirmation_count = 1
             confirmation_evidence = (AnchorConfirmationEvidence.from_observations(1, stock, etf),)
-        elif checkpoint.confirmation_count >= self._nav_config.anchor_confirmation_count:
-            confirmation_count = checkpoint.confirmation_count
-            confirmation_evidence = checkpoint.confirmation_evidence
         else:
             prior_received_at = max(checkpoint.stock_received_at_utc, checkpoint.etf_received_at_utc)
             confirmation_elapsed = (current_received_at - prior_received_at).total_seconds()
@@ -1416,6 +1656,7 @@ class YahooAnchorAcquisition:
             etf_received_at_utc=etf_received_at,
             revision=checkpoint.revision + 1,
             integrity_version=_ANCHOR_EVIDENCE_VERSION,
+            pair_id=checkpoint.pair_id,
             anchor_source=self._nav_config.anchor_source,
             etf_daily_multiplier=self._etf_daily_multiplier,
             hedge_ratio=calculate_hedge_ratio(
@@ -1443,7 +1684,7 @@ class YahooAnchorAcquisition:
         candidate = AnchorCandidate(
             evidence_version=_ANCHOR_EVIDENCE_VERSION,
             cycle_id=checkpoint.cycle_id,
-            pair_id=f"{latest.stock_symbol.lower()}_{latest.etf_symbol.lower()}",
+            pair_id=checkpoint.pair_id,
             target_session_date=checkpoint.target_session_date,
             official_close_utc=checkpoint.official_close_utc,
             anchor_source=self._nav_config.anchor_source,
@@ -1525,8 +1766,8 @@ class YahooAnchorAcquisition:
             etf_daily_multiplier=self._etf_daily_multiplier,
             hedge_ratio=None,
             acquisition_config_hash=self._acquisition_config_hash,
-            stock_symbol=None,
-            etf_symbol=None,
+            stock_symbol=checkpoint.stock_symbol,
+            etf_symbol=checkpoint.etf_symbol,
             confirmation_evidence=(),
             integrity_hash=None,
         )
@@ -1565,7 +1806,7 @@ class YahooAnchorAcquisition:
         return remaining_seconds >= required_seconds
 
     def _budget_for(self, checkpoint: AnchorPollingCheckpoint) -> YahooCycleBudget:
-        key = (checkpoint.cycle_id, checkpoint.deadline_utc)
+        key = (checkpoint.pair_id, checkpoint.cycle_id, checkpoint.deadline_utc)
         if self._active_budget is None or self._active_budget_key != key:
             self._active_budget = YahooCycleBudget.start(
                 deadline_utc=checkpoint.deadline_utc,
@@ -1664,6 +1905,11 @@ class YahooAnchorAcquisition:
     def _validate_checkpoint_for_config(self, checkpoint: AnchorPollingCheckpoint) -> None:
         if not isinstance(checkpoint, AnchorPollingCheckpoint):
             raise TypeError("checkpoint must be an AnchorPollingCheckpoint")
+        checkpoint.__post_init__()
+        if checkpoint.integrity_version != _ANCHOR_EVIDENCE_VERSION:
+            raise CheckpointIntegrityError(
+                "legacy checkpoint lacks the required pair-scoped version-3 recovery identity"
+            )
         self._validate_exact_official_close(
             checkpoint.target_session_date,
             checkpoint.official_close_utc,
@@ -1673,31 +1919,24 @@ class YahooAnchorAcquisition:
         )
         if checkpoint.deadline_utc != expected_deadline:
             raise CheckpointIntegrityError("checkpoint deadline does not match the configured original window")
-        if checkpoint.confirmation_count > self._nav_config.anchor_confirmation_count:
-            raise CheckpointIntegrityError("checkpoint confirmation count exceeds the configured requirement")
-        if checkpoint.integrity_version == _ANCHOR_EVIDENCE_VERSION:
-            if checkpoint.anchor_source != self._nav_config.anchor_source:
-                raise CheckpointIntegrityError("checkpoint anchor source does not match configuration")
-            if checkpoint.etf_daily_multiplier != self._etf_daily_multiplier:
-                raise CheckpointIntegrityError("checkpoint multiplier does not match original configuration")
-            if checkpoint.acquisition_config_hash != self._acquisition_config_hash:
-                raise CheckpointIntegrityError("checkpoint acquisition config hash does not match configuration")
-            expected_hedge_ratio = (
-                None
-                if checkpoint.candidate_stock_close is None
-                else calculate_hedge_ratio(
-                    checkpoint.candidate_stock_close,
-                    checkpoint.candidate_etf_close,
-                    self._etf_daily_multiplier,
-                )
+        if checkpoint.anchor_source != self._nav_config.anchor_source:
+            raise CheckpointIntegrityError("checkpoint anchor source does not match configuration")
+        if checkpoint.etf_daily_multiplier != self._etf_daily_multiplier:
+            raise CheckpointIntegrityError("checkpoint multiplier does not match original configuration")
+        if checkpoint.acquisition_config_hash != self._acquisition_config_hash:
+            raise CheckpointIntegrityError("checkpoint acquisition config hash does not match configuration")
+        expected_hedge_ratio = (
+            None
+            if checkpoint.candidate_stock_close is None
+            else calculate_hedge_ratio(
+                checkpoint.candidate_stock_close,
+                checkpoint.candidate_etf_close,
+                self._etf_daily_multiplier,
             )
-            if checkpoint.hedge_ratio != expected_hedge_ratio:
-                raise CheckpointIntegrityError(
-                    "checkpoint hedge ratio does not match original anchors and multiplier"
-                )
-        elif checkpoint.confirmation_count > 0:
+        )
+        if checkpoint.hedge_ratio != expected_hedge_ratio:
             raise CheckpointIntegrityError(
-                "confirmed legacy checkpoint lacks the full recovery evidence trail"
+                "checkpoint hedge ratio does not match original anchors and multiplier"
             )
         if checkpoint.stock_received_at_utc is not None:
             skew = abs((checkpoint.stock_received_at_utc - checkpoint.etf_received_at_utc).total_seconds())
