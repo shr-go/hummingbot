@@ -618,6 +618,8 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             False,
         )
         self.assertEqual(caller_context_before, caller_context_after)
+        if not overflow_trapped:
+            self.assertEqual(exact_quote, tracked_order.executed_amount_quote)
         self.assertEqual(
             (None, expected_after),
             (error_name, self._submission_unknown_mutation_snapshot(tracked_order)),
