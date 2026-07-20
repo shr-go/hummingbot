@@ -23,6 +23,7 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.executors import Executors
+from hummingbot.model.leveraged_etf_repository import AnchorRepositoryV1, LeveragedEtfJournalRepository
 from hummingbot.model.market_data import MarketData
 from hummingbot.model.order import Order
 from hummingbot.model.position import Position
@@ -109,6 +110,10 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.config_file_path, recorder.config_file_path)
         self.assertEqual(self.strategy_name, recorder.strategy_name)
         self.assertIsInstance(recorder.logger(), HummingbotLogger)
+        self.assertIsInstance(recorder.leveraged_etf_journal_repository, LeveragedEtfJournalRepository)
+        self.assertIsInstance(recorder.anchor_repository_v1, AnchorRepositoryV1)
+        self.assertIs(recorder.leveraged_etf_journal_repository.sql_manager, self.manager)
+        self.assertIs(recorder.anchor_repository_v1.sql_manager, self.manager)
 
     def test_get_trade_for_config(self):
         recorder = MarketsRecorder(
