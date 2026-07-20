@@ -482,7 +482,20 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             tracked_order.exchange_order_id,
             tracked_order.executed_amount_base,
             tracked_order.executed_amount_quote,
-            tuple(tracked_order.order_fills.items()),
+            tuple(
+                (
+                    trade_id,
+                    trade_update.trade_id,
+                    trade_update.client_order_id,
+                    trade_update.exchange_order_id,
+                    trade_update.trading_pair,
+                    trade_update.fill_timestamp,
+                    trade_update.fill_price,
+                    trade_update.fill_base_amount,
+                    trade_update.fill_quote_amount,
+                )
+                for trade_id, trade_update in tracked_order.order_fills.items()
+            ),
             self.exchange.is_order_submission_unknown(tracked_order.client_order_id),
             tracked_order.last_update_timestamp,
             tracked_order.exchange_order_id_update_event.is_set(),
@@ -584,7 +597,17 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             expected_order_update.exchange_order_id,
             Decimal("0.300"),
             exact_quote,
-            ((expected_trade_update.trade_id, expected_trade_update),),
+            ((
+                expected_trade_update.trade_id,
+                expected_trade_update.trade_id,
+                expected_trade_update.client_order_id,
+                expected_trade_update.exchange_order_id,
+                expected_trade_update.trading_pair,
+                expected_trade_update.fill_timestamp,
+                expected_trade_update.fill_price,
+                expected_trade_update.fill_base_amount,
+                expected_trade_update.fill_quote_amount,
+            ),),
             False,
             expected_order_update.update_timestamp,
             True,
@@ -594,13 +617,10 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             True,
             False,
         )
+        self.assertEqual(caller_context_before, caller_context_after)
         self.assertEqual(
-            (None, caller_context_before, expected_after),
-            (
-                error_name,
-                caller_context_after,
-                self._submission_unknown_mutation_snapshot(tracked_order),
-            ),
+            (None, expected_after),
+            (error_name, self._submission_unknown_mutation_snapshot(tracked_order)),
         )
 
     def _get_reconciliation_trade(
