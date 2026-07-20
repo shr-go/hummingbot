@@ -301,6 +301,102 @@ def test_ack_without_prepared_is_rejected_without_snapshot_mutation(manager: SQL
     assert repository.load_snapshot(initial.executor_id) == initial
 
 
+def test_side_effect_status_without_intent_is_rejected_without_snapshot_mutation(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    orphan_ack = JournalEventV1(
+        event_id="event-maker-ack-without-intent",
+        event_type=JournalEventType.ACKNOWLEDGED,
+        connector_name="binance_perpetual",
+        trading_pair="SNXX-USDT",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        payload=CanonicalOpaquePayload.from_value(
+            schema_version=1,
+            kind="ORDER_STATUS",
+            value={"terminal": False},
+        ),
+        created_at_utc=UPDATED_AT,
+    )
+
+    with pytest.raises(JournalConflictError, match="intent|PREPARED"):
+        repository.append_and_reduce(initial.executor_id, orphan_ack, _snapshot_at(initial, 1))
+    assert repository.events(initial.executor_id) == ()
+    assert repository.load_snapshot(initial.executor_id) == initial
+
+
+def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
+    manager: SQLConnectionManager,
+    vectors: dict,
+):
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    prepared = _prepared_snapshot(initial)
+    repository.create_executor(initial)
+    repository.append_and_reduce(initial.executor_id, _prepared_event(), prepared)
+    fill = JournalEventV1(
+        event_id="event-maker-fill-1",
+        event_type=JournalEventType.FILL,
+        intent_id="intent-maker-1",
+        connector_name="binance_perpetual",
+        trading_pair="SNXX-USDT",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-order-1",
+        exchange_trade_id="exchange-trade-1",
+        payload=CanonicalOpaquePayload.from_value(
+            schema_version=1,
+            kind="ORDER_FILL",
+            value={"price": "30", "quantity": "1", "terminal": False},
+        ),
+        created_at_utc=UPDATED_AT,
+    )
+    filled_snapshot = _snapshot_at(prepared, 2, "MAKER_PARTIALLY_FILLED")
+    committed = repository.append_and_reduce(initial.executor_id, fill, filled_snapshot)
+    duplicate_fill = JournalEventV1.model_validate(
+        {
+            **fill.model_dump(mode="json"),
+            "event_id": "event-maker-fill-duplicate",
+        }
+    )
+
+    assert repository.append_and_reduce(
+        initial.executor_id,
+        duplicate_fill,
+        _snapshot_at(filled_snapshot, 3),
+    ) == committed
+    assert repository.load_snapshot(initial.executor_id) == filled_snapshot
+    assert tuple(event.sequence for event in repository.events(initial.executor_id)) == (1, 2)
+
+    distinct_fill = JournalEventV1.model_validate(
+        {
+            **fill.model_dump(mode="json"),
+            "event_id": "event-maker-fill-conflict",
+            "payload": CanonicalOpaquePayload.from_value(
+                schema_version=1,
+                kind="ORDER_FILL",
+                value={"price": "30", "quantity": "2", "terminal": False},
+            ).model_dump(mode="json"),
+        }
+    )
+    with pytest.raises(JournalIntegrityError, match="trade|payload"):
+        repository.append_and_reduce(
+            initial.executor_id,
+            distinct_fill,
+            _snapshot_at(filled_snapshot, 3),
+        )
+
+    with pytest.raises(JournalConflictError, match="sequence"):
+        repository.append_and_reduce(
+            initial.executor_id,
+            _followup_event(JournalEventType.ACKNOWLEDGED, "event-maker-ack-out-of-order"),
+            _snapshot_at(filled_snapshot, 4),
+        )
+    assert repository.load_snapshot(initial.executor_id) == filled_snapshot
+
+
 def test_reservation_uniqueness_release_and_incomplete_executor_query(manager: SQLConnectionManager, vectors: dict):
     repository = LeveragedEtfJournalRepository(manager)
     initial = _initial_snapshot(vectors)
