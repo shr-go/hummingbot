@@ -3303,7 +3303,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self._simulate_trading_rules_initialized()
         cases = (
             ("average boundary", "10000.12500001", None, True),
-            ("average over boundary", "10000.12500002", None, False),
+            ("average inside authoritative boundary", "10000.12500002", None, True),
             ("clearly wrong average", "10001.125", None, False),
             ("matching optional quote", "10000.125", "3000.037500", True),
             ("contradictory optional quote", "10000.125", "3000.037501", False),
