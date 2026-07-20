@@ -20,15 +20,50 @@ from sqlalchemy.schema import Table
 from hummingbot.model import HummingbotBase
 
 
+def _sha256_check(column_name: str) -> str:
+    return (
+        f"length({column_name}) = 64 "
+        f"AND {column_name} = lower({column_name}) "
+        f"AND {column_name} NOT GLOB '*[^0-9a-f]*'"
+    )
+
+
+def _canonical_nonnegative_decimal_check(column_name: str) -> str:
+    return f"""
+        {column_name} = '0' OR (
+            length({column_name}) > 0
+            AND {column_name} NOT GLOB '*[^0-9.]*'
+            AND length({column_name}) - length(replace({column_name}, '.', '')) <= 1
+            AND (
+                (
+                    instr({column_name}, '.') = 0
+                    AND substr({column_name}, 1, 1) GLOB '[1-9]'
+                ) OR (
+                    instr({column_name}, '.') > 0
+                    AND instr({column_name}, '.') < length({column_name})
+                    AND (
+                        substr({column_name}, 1, instr({column_name}, '.') - 1) = '0'
+                        OR substr({column_name}, 1, 1) GLOB '[1-9]'
+                    )
+                    AND substr({column_name}, instr({column_name}, '.') + 1)
+                        NOT GLOB '*[^0-9]*'
+                    AND substr({column_name}, -1, 1) GLOB '[1-9]'
+                )
+            )
+        )
+    """
+
+
+def _canonical_positive_decimal_check(column_name: str) -> str:
+    return f"({column_name} <> '0') AND ({_canonical_nonnegative_decimal_check(column_name)})"
+
+
 class LeveragedEtfExecutorSnapshot(HummingbotBase):
     __tablename__ = "LeveragedEtfExecutorSnapshot"
     __table_args__ = (
         CheckConstraint("schema_version = 1", name="ck_lepf_snapshot_schema_version"),
         CheckConstraint("last_journal_sequence >= 0", name="ck_lepf_snapshot_sequence"),
-        CheckConstraint(
-            "length(snapshot_hash) = 64 AND snapshot_hash = lower(snapshot_hash)",
-            name="ck_lepf_snapshot_hash",
-        ),
+        CheckConstraint(_sha256_check("snapshot_hash"), name="ck_lepf_snapshot_hash"),
         Index("lepf_snapshot_controller_state", "controller_id", "state"),
         Index("lepf_snapshot_pair_cycle", "pair_id", "nav_cycle_id"),
         Index("lepf_snapshot_updated", "updated_at_utc"),
@@ -51,9 +86,10 @@ class LeveragedEtfJournalEvent(HummingbotBase):
     __tablename__ = "LeveragedEtfJournalEvent"
     __table_args__ = (
         CheckConstraint("sequence >= 1", name="ck_lepf_journal_sequence"),
+        CheckConstraint(_sha256_check("payload_hash"), name="ck_lepf_journal_hash"),
         CheckConstraint(
-            "length(payload_hash) = 64 AND payload_hash = lower(payload_hash)",
-            name="ck_lepf_journal_hash",
+            "exchange_trade_id IS NULL OR " "(connector_name IS NOT NULL AND trading_pair IS NOT NULL)",
+            name="ck_lepf_journal_trade_identity",
         ),
         UniqueConstraint("executor_id", "sequence", name="uq_lepf_journal_executor_sequence"),
         Index("lepf_journal_executor_type_sequence", "executor_id", "event_type", "sequence"),
@@ -103,13 +139,16 @@ class LeveragedEtfStrategyReservation(HummingbotBase):
     __tablename__ = "LeveragedEtfStrategyReservation"
     __table_args__ = (
         CheckConstraint("leg IN ('ETF', 'STOCK')", name="ck_lepf_reservation_leg"),
-        CheckConstraint("length(quantity) > 0", name="ck_lepf_reservation_quantity"),
-        CheckConstraint("leverage >= 1", name="ck_lepf_reservation_leverage"),
-        CheckConstraint("length(notional_cap) > 0", name="ck_lepf_reservation_notional_cap"),
         CheckConstraint(
-            "length(payload_hash) = 64 AND payload_hash = lower(payload_hash)",
-            name="ck_lepf_reservation_hash",
+            _canonical_nonnegative_decimal_check("quantity"),
+            name="ck_lepf_reservation_quantity",
         ),
+        CheckConstraint("leverage >= 1", name="ck_lepf_reservation_leverage"),
+        CheckConstraint(
+            _canonical_positive_decimal_check("notional_cap"),
+            name="ck_lepf_reservation_notional_cap",
+        ),
+        CheckConstraint(_sha256_check("payload_hash"), name="ck_lepf_reservation_hash"),
         UniqueConstraint("reservation_key", name="uq_lepf_reservation_key"),
         Index(
             "lepf_reservation_active_leg",
@@ -163,13 +202,10 @@ class LeveragedEtfAnchorState(HummingbotBase):
             name="ck_lepf_anchor_official_close_state",
         ),
         CheckConstraint(
-            "evidence_hash IS NULL OR " "(length(evidence_hash) = 64 AND evidence_hash = lower(evidence_hash))",
+            f"evidence_hash IS NULL OR ({_sha256_check('evidence_hash')})",
             name="ck_lepf_anchor_evidence_hash",
         ),
-        CheckConstraint(
-            "length(payload_hash) = 64 AND payload_hash = lower(payload_hash)",
-            name="ck_lepf_anchor_payload_hash",
-        ),
+        CheckConstraint(_sha256_check("payload_hash"), name="ck_lepf_anchor_payload_hash"),
         UniqueConstraint("evidence_hash", name="uq_lepf_anchor_evidence_hash"),
         Index("lepf_anchor_deadline_state", "deadline_utc", "state_kind"),
         Index("lepf_anchor_session_date", "target_session_date"),
@@ -192,10 +228,7 @@ class LeveragedEtfAnchorState(HummingbotBase):
 class LeveragedEtfAnchorRevisionObservation(HummingbotBase):
     __tablename__ = "LeveragedEtfAnchorRevisionObservation"
     __table_args__ = (
-        CheckConstraint(
-            "length(evidence_hash) = 64 AND evidence_hash = lower(evidence_hash)",
-            name="ck_lepf_anchor_observation_hash",
-        ),
+        CheckConstraint(_sha256_check("evidence_hash"), name="ck_lepf_anchor_observation_hash"),
         Index("lepf_anchor_observation_cycle_time", "cycle_id", "observed_at_utc"),
     )
 
@@ -223,6 +256,18 @@ LEVERAGED_ETF_PERSISTENCE_TABLES: Tuple[Table, ...] = (
 
 
 SQLITE_GUARD_DDL: Mapping[str, str] = {
+    "lepf_snapshot_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_snapshot_identity_insert
+        BEFORE INSERT ON LeveragedEtfExecutorSnapshot
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfExecutorSnapshot
+            WHERE executor_id = NEW.executor_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfExecutorSnapshot identity already exists');
+        END
+    """,
     "lepf_snapshot_executor_id_no_update": """
         CREATE TRIGGER IF NOT EXISTS lepf_snapshot_executor_id_no_update
         BEFORE UPDATE OF executor_id ON LeveragedEtfExecutorSnapshot
@@ -257,6 +302,25 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
             SELECT RAISE(ABORT, 'LeveragedEtfJournalEvent executor_id does not exist');
         END
     """,
+    "lepf_journal_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_journal_identity_insert
+        BEFORE INSERT ON LeveragedEtfJournalEvent
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfJournalEvent
+            WHERE event_id = NEW.event_id
+               OR (executor_id = NEW.executor_id AND sequence = NEW.sequence)
+               OR (
+                    NEW.exchange_trade_id IS NOT NULL
+                    AND connector_name = NEW.connector_name
+                    AND trading_pair = NEW.trading_pair
+                    AND exchange_trade_id = NEW.exchange_trade_id
+               )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfJournalEvent identity already exists');
+        END
+    """,
     "lepf_reservation_executor_fk_insert": """
         CREATE TRIGGER IF NOT EXISTS lepf_reservation_executor_fk_insert
         BEFORE INSERT ON LeveragedEtfStrategyReservation
@@ -279,6 +343,27 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         )
         BEGIN
             SELECT RAISE(ABORT, 'LeveragedEtfStrategyReservation executor_id does not exist');
+        END
+    """,
+    "lepf_reservation_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_reservation_identity_insert
+        BEFORE INSERT ON LeveragedEtfStrategyReservation
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfStrategyReservation
+            WHERE reservation_id = NEW.reservation_id
+               OR reservation_key = NEW.reservation_key
+               OR (
+                    NEW.released_at_utc IS NULL
+                    AND released_at_utc IS NULL
+                    AND executor_id = NEW.executor_id
+                    AND connector_name = NEW.connector_name
+                    AND trading_pair = NEW.trading_pair
+                    AND leg = NEW.leg
+               )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfStrategyReservation identity already exists');
         END
     """,
     "lepf_reservation_stable_ids_no_update": """
@@ -308,6 +393,20 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         )
         BEGIN
             SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation cycle_id does not exist');
+        END
+    """,
+    "lepf_anchor_observation_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_observation_identity_insert
+        BEFORE INSERT ON LeveragedEtfAnchorRevisionObservation
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfAnchorRevisionObservation
+            WHERE cycle_id = NEW.cycle_id
+              AND evidence_hash = NEW.evidence_hash
+              AND observed_at_utc = NEW.observed_at_utc
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation identity already exists');
         END
     """,
     "lepf_journal_no_update": """
@@ -347,6 +446,22 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
             SELECT RAISE(ABORT, 'finalized LeveragedEtfAnchorState is immutable');
         END
     """,
+    "lepf_anchor_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_identity_insert
+        BEFORE INSERT ON LeveragedEtfAnchorState
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfAnchorState
+            WHERE cycle_id = NEW.cycle_id
+               OR (
+                    NEW.evidence_hash IS NOT NULL
+                    AND evidence_hash = NEW.evidence_hash
+               )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorState identity already exists');
+        END
+    """,
     "lepf_anchor_cycle_id_no_update": """
         CREATE TRIGGER IF NOT EXISTS lepf_anchor_cycle_id_no_update
         BEFORE UPDATE OF cycle_id ON LeveragedEtfAnchorState
@@ -372,6 +487,86 @@ for table in LEVERAGED_ETF_PERSISTENCE_TABLES:
 
 def _normalize_sql(expression: object) -> str:
     return "".join(str(expression).replace('"', "").replace("`", "").lower().split())
+
+
+def _normalize_trigger_sql(expression: object) -> str:
+    return _normalize_sql(expression).replace("ifnotexists", "").rstrip(";")
+
+
+def _normalize_foreign_key_options(options: Mapping[str, object]) -> Tuple[Tuple[str, str], ...]:
+    return tuple(
+        sorted((str(name).lower(), str(value).upper()) for name, value in options.items() if value is not None)
+    )
+
+
+def _sqlite_named_check_constraints(connection: Connection, table_name: str) -> Dict[str, str]:
+    """Return named CHECK expressions without relying on SQLAlchemy's lossy SQLite parser."""
+
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :table_name"),
+        {"table_name": table_name},
+    ).scalar_one()
+    constraints: Dict[str, str] = {}
+    search_from = 0
+    upper_sql = create_sql.upper()
+    while True:
+        constraint_at = upper_sql.find("CONSTRAINT", search_from)
+        if constraint_at < 0:
+            break
+        name_start = constraint_at + len("CONSTRAINT")
+        while name_start < len(create_sql) and create_sql[name_start].isspace():
+            name_start += 1
+        if name_start >= len(create_sql):
+            break
+
+        quote = create_sql[name_start] if create_sql[name_start] in ('"', "`", "[") else None
+        if quote is None:
+            name_end = name_start
+            while name_end < len(create_sql) and (create_sql[name_end].isalnum() or create_sql[name_end] == "_"):
+                name_end += 1
+            constraint_name = create_sql[name_start:name_end]
+        else:
+            closing_quote = "]" if quote == "[" else quote
+            name_end = create_sql.find(closing_quote, name_start + 1)
+            if name_end < 0:
+                break
+            constraint_name = create_sql[name_start + 1 : name_end]
+            name_end += 1
+
+        check_at = upper_sql.find("CHECK", name_end)
+        next_constraint = upper_sql.find("CONSTRAINT", name_end)
+        if check_at < 0 or (next_constraint >= 0 and next_constraint < check_at):
+            search_from = name_end
+            continue
+        opening_at = create_sql.find("(", check_at + len("CHECK"))
+        if opening_at < 0:
+            break
+
+        depth = 0
+        string_quote = None
+        cursor = opening_at
+        while cursor < len(create_sql):
+            character = create_sql[cursor]
+            if string_quote is not None:
+                if character == string_quote:
+                    if cursor + 1 < len(create_sql) and create_sql[cursor + 1] == string_quote:
+                        cursor += 2
+                        continue
+                    string_quote = None
+            elif character in ("'", '"'):
+                string_quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    constraints[constraint_name] = create_sql[opening_at + 1 : cursor]
+                    cursor += 1
+                    break
+            cursor += 1
+        search_from = cursor
+
+    return constraints
 
 
 def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ...]:
@@ -405,11 +600,17 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
         for constraint in table.constraints
         if isinstance(constraint, CheckConstraint) and constraint.name is not None
     }
-    actual_checks = {
-        constraint["name"]: _normalize_sql(constraint["sqltext"])
-        for constraint in inspector.get_check_constraints(table.name)
-        if constraint.get("name") is not None
-    }
+    if connection.dialect.name == "sqlite":
+        actual_checks = {
+            name: _normalize_sql(sqltext)
+            for name, sqltext in _sqlite_named_check_constraints(connection, table.name).items()
+        }
+    else:
+        actual_checks = {
+            constraint["name"]: _normalize_sql(constraint["sqltext"])
+            for constraint in inspector.get_check_constraints(table.name)
+            if constraint.get("name") is not None
+        }
     for name, sqltext in expected_checks.items():
         if name not in actual_checks:
             errors.append(f"{table.name} check constraint {name} is missing")
@@ -436,6 +637,15 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
         constraint.name: (
             tuple(element.parent.name for element in constraint.elements),
             tuple(element.target_fullname for element in constraint.elements),
+            _normalize_foreign_key_options(
+                {
+                    "ondelete": constraint.ondelete,
+                    "onupdate": constraint.onupdate,
+                    "deferrable": constraint.deferrable,
+                    "initially": constraint.initially,
+                    "match": constraint.match,
+                }
+            ),
         )
         for constraint in table.foreign_key_constraints
         if constraint.name is not None
@@ -444,6 +654,7 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
         constraint["name"]: (
             tuple(constraint["constrained_columns"]),
             tuple(f"{constraint['referred_table']}.{column}" for column in constraint["referred_columns"]),
+            _normalize_foreign_key_options(constraint.get("options", {})),
         )
         for constraint in inspector.get_foreign_keys(table.name)
         if constraint.get("name") is not None
@@ -452,7 +663,7 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
         if name not in actual_foreign_keys:
             errors.append(f"{table.name} foreign key {name} is missing")
         elif actual_foreign_keys[name] != shape:
-            errors.append(f"{table.name} foreign key {name} has incompatible columns")
+            errors.append(f"{table.name} foreign key {name} has incompatible definition")
 
     actual_indexes = {index["name"]: index for index in inspector.get_indexes(table.name)}
     for index in table.indexes:
@@ -476,28 +687,52 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
     return tuple(errors)
 
 
+def validate_leveraged_etf_persistence_schema(connection: Connection) -> None:
+    """Validate the complete SQLite v1 schema without mutating it."""
+
+    if connection.dialect.name != "sqlite":
+        raise RuntimeError("leveraged ETF persistence supports SQLite only")
+
+    errors = []
+    actual_table_names = set(inspect(connection).get_table_names())
+    for table in LEVERAGED_ETF_PERSISTENCE_TABLES:
+        if table.name not in actual_table_names:
+            errors.append(f"table {table.name} is missing")
+        else:
+            errors.extend(_validate_table_shape(connection, table))
+
+    actual_triggers = {
+        row[0]: row[2]
+        for row in connection.execute(text("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'"))
+    }
+    expected_trigger_names = set(SQLITE_GUARD_DDL)
+    for unexpected in sorted(
+        name for name in actual_triggers if name.startswith("lepf_") and name not in expected_trigger_names
+    ):
+        errors.append(f"SQLite safety trigger {unexpected} is unexpected")
+    for name, expected_sql in SQLITE_GUARD_DDL.items():
+        actual_sql = actual_triggers.get(name)
+        if actual_sql is None:
+            errors.append(f"SQLite trigger {name} is missing")
+        elif _normalize_trigger_sql(actual_sql) != _normalize_trigger_sql(expected_sql):
+            errors.append(f"SQLite trigger {name} has incompatible definition")
+
+    if errors:
+        raise RuntimeError("incompatible leveraged ETF persistence schema: " + "; ".join(errors))
+
+
 def ensure_leveraged_etf_persistence_schema(connection: Connection) -> None:
-    """Create missing v1 tables/indexes/guards and reject incompatible partial tables."""
+    """Create missing v1 SQLite objects, then validate their exact definitions."""
+
+    if connection.dialect.name != "sqlite":
+        raise RuntimeError("leveraged ETF persistence supports SQLite only")
 
     for table in LEVERAGED_ETF_PERSISTENCE_TABLES:
         table.create(bind=connection, checkfirst=True)
         for index in sorted(table.indexes, key=lambda candidate: candidate.name):
             index.create(bind=connection, checkfirst=True)
 
-    if connection.dialect.name == "sqlite":
-        for statement in SQLITE_GUARD_DDL.values():
-            connection.execute(text(statement))
+    for statement in SQLITE_GUARD_DDL.values():
+        connection.execute(text(statement))
 
-    errors = []
-    for table in LEVERAGED_ETF_PERSISTENCE_TABLES:
-        errors.extend(_validate_table_shape(connection, table))
-
-    if connection.dialect.name == "sqlite":
-        actual_triggers = {
-            row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type = 'trigger'"))
-        }
-        for missing in sorted(set(SQLITE_GUARD_DDL) - actual_triggers):
-            errors.append(f"SQLite trigger {missing} is missing")
-
-    if errors:
-        raise RuntimeError("incompatible leveraged ETF persistence schema: " + "; ".join(errors))
+    validate_leveraged_etf_persistence_schema(connection)
