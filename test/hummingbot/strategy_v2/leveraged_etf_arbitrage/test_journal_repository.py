@@ -1830,6 +1830,19 @@ def _append_fact(
     return reduced
 
 
+def _assert_fact_rejected_atomically(
+    repository: LeveragedEtfJournalRepository,
+    executor_id: str,
+    event: JournalEventV1,
+) -> None:
+    before_snapshot = repository.load_snapshot(executor_id)
+    before_events = repository.events(executor_id)
+    with pytest.raises((JournalConflictError, JournalIntegrityError)):
+        repository.append_and_reduce(executor_id, event)
+    assert repository.load_snapshot(executor_id) == before_snapshot
+    assert repository.events(executor_id) == before_events
+
+
 def test_journal_event_facts_authoritatively_derive_snapshot(manager: SQLConnectionManager, vectors: dict):
     repository = LeveragedEtfJournalRepository(manager)
     initial = _initial_snapshot(vectors)
@@ -2848,6 +2861,538 @@ def test_fill_before_ack_and_order_created_preserves_authoritative_progress(
         reopened_repository = LeveragedEtfJournalRepository(reopened)
         assert reopened_repository.replay(initial.executor_id) == current
         assert reopened_repository.incomplete_intents() == ()
+    finally:
+        reopened.engine.dispose()
+
+
+def _concurrent_hedges_filled_in_reverse_order(
+    db_path: Path,
+    vectors: dict,
+) -> tuple[
+    SQLConnectionManager,
+    LeveragedEtfJournalRepository,
+    LeveragedEtfPairExecutorSnapshotV1,
+    LeveragedEtfPairExecutorSnapshotV1,
+    dict[str, dict],
+]:
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    maker = {
+        "logical_quantity": "2",
+        "order_quantity": "2",
+        "intent_id": "intent-r5-concurrent-maker",
+        "client_order_id": "client-r5-concurrent-maker",
+    }
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-r5-concurrent-maker-prepared", **maker),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-r5-concurrent-maker-created",
+            exchange_order_id="exchange-r5-concurrent-maker",
+            **maker,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-r5-concurrent-maker-fill",
+            exchange_order_id="exchange-r5-concurrent-maker",
+            exchange_trade_id="trade-r5-concurrent-maker",
+            fill_quantity="2",
+            order_cumulative_filled_quantity="2",
+            leg_cumulative_filled_quantity="2",
+            outcome="FILLED",
+            **maker,
+        ),
+    )
+    hedges = {
+        "older": {
+            "action": "STOCK_HEDGE",
+            "leg": "STOCK",
+            "logical_quantity": "1.2449",
+            "order_quantity": "1.2449",
+            "attempt": 1,
+            "intent_id": "intent-r5-concurrent-older",
+            "client_order_id": "client-r5-concurrent-older",
+            "exchange_order_id": "exchange-r5-concurrent-older",
+        },
+        "newer": {
+            "action": "STOCK_HEDGE",
+            "leg": "STOCK",
+            "logical_quantity": "2.4898",
+            "order_quantity": "1.2449",
+            "attempt": 2,
+            "intent_id": "intent-r5-concurrent-newer",
+            "client_order_id": "client-r5-concurrent-newer",
+            "exchange_order_id": "exchange-r5-concurrent-newer",
+        },
+    }
+    for name in ("older", "newer"):
+        hedge = {key: value for key, value in hedges[name].items() if key != "exchange_order_id"}
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                f"event-r5-concurrent-{name}-prepared",
+                **hedge,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.HEDGE_REQUESTED,
+                f"event-r5-concurrent-{name}-requested",
+                **hedge,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.ORDER_CREATED,
+                f"event-r5-concurrent-{name}-created",
+                exchange_order_id=hedges[name]["exchange_order_id"],
+                **hedge,
+            ),
+        )
+    fills = (
+        ("newer", "a", "0.4", "0.4", "0.4", "PARTIAL"),
+        ("older", "a", "0.5", "0.5", "0.9", "PARTIAL"),
+        ("newer", "b", "0.8449", "1.2449", "1.7449", "FILLED"),
+        ("older", "b", "0.7449", "1.2449", "2.4898", "FILLED"),
+    )
+    for name, suffix, fill_quantity, order_cumulative, leg_cumulative, outcome in fills:
+        hedge = {key: value for key, value in hedges[name].items() if key != "exchange_order_id"}
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.FILL,
+                f"event-r5-concurrent-{name}-fill-{suffix}",
+                exchange_order_id=hedges[name]["exchange_order_id"],
+                exchange_trade_id=f"trade-r5-concurrent-{name}-{suffix}",
+                fill_quantity=fill_quantity,
+                order_cumulative_filled_quantity=order_cumulative,
+                leg_cumulative_filled_quantity=leg_cumulative,
+                outcome=outcome,
+                **hedge,
+            ),
+        )
+    return manager, repository, initial, current, hedges
+
+
+@pytest.mark.parametrize(
+    ("first_name", "first_type", "second_name", "second_type"),
+    (
+        ("newer", JournalEventType.HEDGE_CONFIRMED, "older", JournalEventType.RECONCILIATION),
+        ("older", JournalEventType.RECONCILIATION, "newer", JournalEventType.HEDGE_CONFIRMED),
+    ),
+    ids=("newer-confirmed-first", "older-reconciled-first"),
+)
+def test_concurrent_hedge_terminal_facts_close_in_either_order(
+    tmp_path: Path,
+    vectors: dict,
+    first_name: str,
+    first_type: JournalEventType,
+    second_name: str,
+    second_type: JournalEventType,
+):
+    db_path = tmp_path / f"concurrent-terminal-{first_name}.sqlite"
+    manager, repository, initial, current, hedges = _concurrent_hedges_filled_in_reverse_order(db_path, vectors)
+
+    def terminal_fact(name: str, event_type: JournalEventType, suffix: str) -> JournalEventV1:
+        hedge = {key: value for key, value in hedges[name].items() if key != "exchange_order_id"}
+        parameters = {}
+        if event_type == JournalEventType.RECONCILIATION:
+            parameters = {
+                "exchange_order_id": hedges[name]["exchange_order_id"],
+                "order_cumulative_filled_quantity": "1.2449",
+                "outcome": "FILLED",
+            }
+        return _fact_event(
+            initial,
+            event_type,
+            f"event-r5-terminal-{suffix}-{name}",
+            **parameters,
+            **hedge,
+        )
+
+    current = _append_fact(repository, current, terminal_fact(first_name, first_type, "first"))
+    assert current.state.value == "STOCK_HEDGE_PENDING"
+    assert tuple(intent.intent_id for intent in repository.incomplete_intents(initial.executor_id)) == (
+        hedges[second_name]["intent_id"],
+    )
+
+    second_hedge = {key: value for key, value in hedges[second_name].items() if key != "exchange_order_id"}
+    _assert_fact_rejected_atomically(
+        repository,
+        initial.executor_id,
+        _fact_event(
+            initial,
+            JournalEventType.RECONCILIATION,
+            f"event-r5-terminal-conflicting-{second_name}",
+            exchange_order_id=hedges[second_name]["exchange_order_id"],
+            order_cumulative_filled_quantity="1",
+            outcome="FILLED",
+            **second_hedge,
+        ),
+    )
+
+    current = _append_fact(repository, current, terminal_fact(second_name, second_type, "second"))
+    assert current.state.value == "MAKER_WORKING"
+    assert current.etf_filled_quantity == Decimal("2")
+    assert current.stock_filled_quantity == Decimal("2.4898")
+    assert current.etf_filled_quantity * Decimal("1.2449") == current.stock_filled_quantity
+    assert repository.incomplete_intents(initial.executor_id) == ()
+    terminal_audit = tuple(
+        (committed.event.intent_id, committed.event.event_type)
+        for committed in repository.events(initial.executor_id)
+        if committed.event.event_id.startswith("event-r5-terminal-")
+    )
+    assert terminal_audit == (
+        (hedges[first_name]["intent_id"], first_type),
+        (hedges[second_name]["intent_id"], second_type),
+    )
+    assert repository.replay(initial.executor_id) == current
+    committed_events = repository.events(initial.executor_id)
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.incomplete_intents(initial.executor_id) == ()
+        assert reopened_repository.events(initial.executor_id) == committed_events
+    finally:
+        reopened.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("fill_quantity", "fill_outcome"),
+    (("0.4", "PARTIAL"), ("1", "FILLED")),
+    ids=("partial-fill", "full-fill"),
+)
+def test_late_maker_facts_survive_intervening_rollback_state(
+    tmp_path: Path,
+    vectors: dict,
+    fill_quantity: str,
+    fill_outcome: str,
+):
+    db_path = tmp_path / f"late-maker-rollback-{fill_outcome.lower()}.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    maker = {
+        "logical_quantity": "1",
+        "order_quantity": "1",
+        "intent_id": f"intent-r5-late-maker-{fill_outcome.lower()}",
+        "client_order_id": f"client-r5-late-maker-{fill_outcome.lower()}",
+    }
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            f"event-r5-late-maker-{fill_outcome.lower()}-prepared",
+            **maker,
+        ),
+    )
+    exchange_order_id = f"exchange-r5-late-maker-{fill_outcome.lower()}"
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            f"event-r5-late-maker-{fill_outcome.lower()}-fill",
+            exchange_order_id=exchange_order_id,
+            exchange_trade_id=f"trade-r5-late-maker-{fill_outcome.lower()}",
+            fill_quantity=fill_quantity,
+            order_cumulative_filled_quantity=fill_quantity,
+            leg_cumulative_filled_quantity=fill_quantity,
+            outcome=fill_outcome,
+            **maker,
+        ),
+    )
+    rollback = {
+        "action": "ETF_ROLLBACK",
+        "leg": "ETF",
+        "logical_quantity": fill_quantity,
+        "order_quantity": fill_quantity,
+        "intent_id": f"intent-r5-rollback-{fill_outcome.lower()}",
+        "client_order_id": f"client-r5-rollback-{fill_outcome.lower()}",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            f"event-r5-rollback-{fill_outcome.lower()}-prepared",
+            **rollback,
+        ),
+    )
+    assert current.state.value == "ETF_ROLLBACK_PENDING"
+    frozen_exposure = (current.etf_filled_quantity, current.stock_filled_quantity)
+
+    _assert_fact_rejected_atomically(
+        repository,
+        initial.executor_id,
+        _fact_event(
+            initial,
+            JournalEventType.ACKNOWLEDGED,
+            f"event-r5-late-maker-{fill_outcome.lower()}-wrong-ack",
+            logical_quantity="1",
+            order_quantity="1",
+            intent_id=maker["intent_id"],
+            client_order_id=f"{maker['client_order_id']}-conflict",
+        ),
+    )
+    acknowledged = _fact_event(
+        initial,
+        JournalEventType.ACKNOWLEDGED,
+        f"event-r5-late-maker-{fill_outcome.lower()}-ack",
+        **maker,
+    )
+    current = _append_fact(repository, current, acknowledged)
+    assert current.state.value == "ETF_ROLLBACK_PENDING"
+    assert (current.etf_filled_quantity, current.stock_filled_quantity) == frozen_exposure
+    event_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, acknowledged)
+    assert len(repository.events(initial.executor_id)) == event_count
+
+    _assert_fact_rejected_atomically(
+        repository,
+        initial.executor_id,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            f"event-r5-late-maker-{fill_outcome.lower()}-wrong-created",
+            exchange_order_id=f"{exchange_order_id}-conflict",
+            **maker,
+        ),
+    )
+    created = _fact_event(
+        initial,
+        JournalEventType.ORDER_CREATED,
+        f"event-r5-late-maker-{fill_outcome.lower()}-created",
+        exchange_order_id=exchange_order_id,
+        **maker,
+    )
+    current = _append_fact(repository, current, created)
+    assert current.state.value == "ETF_ROLLBACK_PENDING"
+    assert (current.etf_filled_quantity, current.stock_filled_quantity) == frozen_exposure
+    assert tuple(order.exchange_order_id for order in current.maker_order_ids) == (exchange_order_id,)
+    event_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, created)
+    assert len(repository.events(initial.executor_id)) == event_count
+    late_audit = tuple(
+        committed.event.event_id
+        for committed in repository.events(initial.executor_id)
+        if "late-maker" in committed.event.event_id
+    )
+    assert late_audit[-2:] == (acknowledged.event_id, created.event_id)
+    assert repository.replay(initial.executor_id) == current
+    committed_events = repository.events(initial.executor_id)
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.events(initial.executor_id) == committed_events
+    finally:
+        reopened.engine.dispose()
+
+
+def test_late_stock_facts_survive_post_confirmation_maker_state(tmp_path: Path, vectors: dict):
+    db_path = tmp_path / "late-stock-post-confirmation.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial_snapshot(vectors)
+    repository.create_executor(initial)
+    maker = {
+        "logical_quantity": "1",
+        "order_quantity": "1",
+        "intent_id": "intent-r5-post-confirm-maker",
+        "client_order_id": "client-r5-post-confirm-maker",
+    }
+    current = _append_fact(
+        repository,
+        initial,
+        _fact_event(initial, JournalEventType.PREPARED, "event-r5-post-confirm-maker-prepared", **maker),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-r5-post-confirm-maker-created",
+            exchange_order_id="exchange-r5-post-confirm-maker",
+            **maker,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-r5-post-confirm-maker-fill",
+            exchange_order_id="exchange-r5-post-confirm-maker",
+            exchange_trade_id="trade-r5-post-confirm-maker",
+            fill_quantity="1",
+            order_cumulative_filled_quantity="1",
+            leg_cumulative_filled_quantity="1",
+            outcome="FILLED",
+            **maker,
+        ),
+    )
+    hedge = {
+        "action": "STOCK_HEDGE",
+        "leg": "STOCK",
+        "logical_quantity": "1.2449",
+        "order_quantity": "1.2449",
+        "intent_id": "intent-r5-post-confirm-hedge",
+        "client_order_id": "client-r5-post-confirm-hedge",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(initial, JournalEventType.PREPARED, "event-r5-post-confirm-hedge-prepared", **hedge),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.HEDGE_REQUESTED,
+            "event-r5-post-confirm-hedge-requested",
+            **hedge,
+        ),
+    )
+    stock_exchange_order_id = "exchange-r5-post-confirm-hedge"
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-r5-post-confirm-hedge-fill",
+            exchange_order_id=stock_exchange_order_id,
+            exchange_trade_id="trade-r5-post-confirm-hedge",
+            fill_quantity="1.2449",
+            order_cumulative_filled_quantity="1.2449",
+            leg_cumulative_filled_quantity="1.2449",
+            outcome="FILLED",
+            **hedge,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.HEDGE_CONFIRMED,
+            "event-r5-post-confirm-hedge-confirmed",
+            **hedge,
+        ),
+    )
+    assert current.state.value == "MAKER_WORKING"
+    assert repository.incomplete_intents(initial.executor_id) == ()
+    frozen_exposure = (current.etf_filled_quantity, current.stock_filled_quantity)
+
+    _assert_fact_rejected_atomically(
+        repository,
+        initial.executor_id,
+        _fact_event(
+            initial,
+            JournalEventType.ACKNOWLEDGED,
+            "event-r5-post-confirm-wrong-ack",
+            action="STOCK_HEDGE",
+            leg="STOCK",
+            logical_quantity="1.2449",
+            order_quantity="1.2449",
+            intent_id=hedge["intent_id"],
+            client_order_id=f"{hedge['client_order_id']}-conflict",
+        ),
+    )
+    acknowledged = _fact_event(
+        initial,
+        JournalEventType.ACKNOWLEDGED,
+        "event-r5-post-confirm-ack",
+        **hedge,
+    )
+    current = _append_fact(repository, current, acknowledged)
+    assert current.state.value == "MAKER_WORKING"
+    assert (current.etf_filled_quantity, current.stock_filled_quantity) == frozen_exposure
+    event_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, acknowledged)
+    assert len(repository.events(initial.executor_id)) == event_count
+
+    _assert_fact_rejected_atomically(
+        repository,
+        initial.executor_id,
+        _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-r5-post-confirm-wrong-created",
+            exchange_order_id=f"{stock_exchange_order_id}-conflict",
+            **hedge,
+        ),
+    )
+    created = _fact_event(
+        initial,
+        JournalEventType.ORDER_CREATED,
+        "event-r5-post-confirm-created",
+        exchange_order_id=stock_exchange_order_id,
+        **hedge,
+    )
+    current = _append_fact(repository, current, created)
+    assert current.state.value == "MAKER_WORKING"
+    assert (current.etf_filled_quantity, current.stock_filled_quantity) == frozen_exposure
+    assert tuple(order.exchange_order_id for order in current.stock_order_ids) == (stock_exchange_order_id,)
+    event_count = len(repository.events(initial.executor_id))
+    repository.append_and_reduce(initial.executor_id, created)
+    assert len(repository.events(initial.executor_id)) == event_count
+    assert repository.incomplete_intents(initial.executor_id) == ()
+    late_audit = tuple(
+        committed.event.event_id
+        for committed in repository.events(initial.executor_id)
+        if committed.event.event_id.startswith("event-r5-post-confirm-")
+    )
+    assert late_audit[-2:] == (acknowledged.event_id, created.event_id)
+    assert repository.replay(initial.executor_id) == current
+    committed_events = repository.events(initial.executor_id)
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.incomplete_intents(initial.executor_id) == ()
+        assert reopened_repository.events(initial.executor_id) == committed_events
     finally:
         reopened.engine.dispose()
 
