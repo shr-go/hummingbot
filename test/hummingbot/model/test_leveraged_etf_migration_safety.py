@@ -550,7 +550,21 @@ def test_same_named_incompatible_trigger_is_rejected_before_version_stamp(
         (
             lambda create_sql: _append_compiled_constraint(
                 create_sql,
+                "CHECK (snapshot_json <> 'blocked')",
+            ),
+            None,
+        ),
+        (
+            lambda create_sql: _append_compiled_constraint(
+                create_sql,
                 "CONSTRAINT sabotage_controller_unique UNIQUE (controller_id)",
+            ),
+            None,
+        ),
+        (
+            lambda create_sql: _append_compiled_constraint(
+                create_sql,
+                "UNIQUE (controller_id)",
             ),
             None,
         ),
@@ -559,6 +573,13 @@ def test_same_named_incompatible_trigger_is_rejected_before_version_stamp(
                 create_sql,
                 'CONSTRAINT sabotage_executor_fk FOREIGN KEY (executor_id) REFERENCES "Executors" (id) '
                 "ON DELETE CASCADE",
+            ),
+            None,
+        ),
+        (
+            lambda create_sql: _append_compiled_constraint(
+                create_sql,
+                'FOREIGN KEY (executor_id) REFERENCES "Executors" (id) ON DELETE CASCADE',
             ),
             None,
         ),
@@ -582,9 +603,12 @@ def test_same_named_incompatible_trigger_is_rejected_before_version_stamp(
     ],
     ids=[
         "extra_required_column",
-        "extra_check_constraint",
-        "extra_unique_constraint",
-        "extra_foreign_key",
+        "extra_named_check_constraint",
+        "extra_unnamed_check_constraint",
+        "extra_named_unique_constraint",
+        "extra_unnamed_unique_constraint",
+        "extra_named_foreign_key",
+        "extra_unnamed_foreign_key",
         "extra_unique_index",
         "arbitrary_named_blocking_trigger",
     ],
@@ -610,6 +634,37 @@ def test_managed_schema_rejects_unexpected_behavior_before_version_stamp(
 
     _assert_legacy_data_unchanged(db_path)
     assert "LeveragedEtfStrategyReservation" not in _table_names(db_path)
+
+
+def test_schema_validation_accepts_equivalent_expressions_and_sqlite_autoindexes(tmp_path: Path):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "CHECK (schema_version = 1)",
+                "CHECK (((schema_version == 1)))",
+            ),
+        )
+        _create_compiled_table(connection, LeveragedEtfJournalEvent.__table__)
+        connection.execute("""
+            CREATE UNIQUE INDEX lepf_journal_trade_dedup
+            ON LeveragedEtfJournalEvent (connector_name, trading_pair, exchange_trade_id)
+            WHERE ((exchange_trade_id IS NOT NULL))
+            """)
+
+    manager = _open_manager(db_path)
+    try:
+        assert _version(db_path) == TARGET_VERSION
+        with manager.engine.connect() as connection:
+            origins = {row[3] for row in connection.execute(text('PRAGMA index_list("LeveragedEtfJournalEvent")'))}
+            assert {"pk", "u"} <= origins
+    finally:
+        manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    reopened.engine.dispose()
 
 
 OR_REPLACE_CASES = [
