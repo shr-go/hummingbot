@@ -16,11 +16,9 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
     RoundTripCosts,
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
+    DecisionValue,
     decision_decimal_context,
-    displayed_decision_value,
-    exact_decision_value,
     validate_bounded_decimal,
-    with_exact_decision_value,
 )
 
 
@@ -34,6 +32,56 @@ def _decimal(value: object, name: str, *, positive: bool = False, nonnegative: b
         positive=positive,
         nonnegative=nonnegative,
     )
+
+
+def _decision_parts(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> tuple[Decimal, Fraction | None]:
+    """Separate display from exact decision authority.
+
+    A plain Decimal is explicitly caller-supplied raw data and therefore has an
+    exact finite ratio. A DecisionValue is derived data and may only supply an
+    exact ratio when its serialized contract remains intact.
+    """
+
+    if isinstance(value, DecisionValue):
+        value.validate_integrity()
+        display = _decimal(
+            value.display,
+            f"{name} display",
+            positive=positive,
+            nonnegative=nonnegative,
+        )
+        exact = value.exact_fraction
+        if exact is not None:
+            if positive and exact <= 0:
+                raise ValueError(f"{name} exact value must be positive")
+            if nonnegative and exact < 0:
+                raise ValueError(f"{name} exact value must be nonnegative")
+        return display, exact
+    display = _decimal(value, name, positive=positive, nonnegative=nonnegative)
+    return display, Fraction(display)
+
+
+def _threshold_display(
+    value: object,
+    name: str,
+    *,
+    nonnegative: bool = False,
+) -> tuple[Decimal, bool]:
+    """Parse a configured threshold and report whether derived input is trusted."""
+
+    if isinstance(value, DecisionValue):
+        value.validate_integrity()
+        return (
+            _decimal(value.display, f"{name} display", nonnegative=nonnegative),
+            value.exact_fraction is not None,
+        )
+    return _decimal(value, name, nonnegative=nonnegative), True
 
 
 def _fixed_decimal_context(function):
@@ -51,11 +99,11 @@ def _exact_theoretical_price(
     etf_anchor: Decimal,
     etf_daily_multiplier: Decimal,
 ) -> Fraction:
-    stock_price_fraction = exact_decision_value(stock_price)
-    stock_anchor_fraction = exact_decision_value(stock_anchor)
-    return exact_decision_value(etf_anchor) * (
+    stock_price_fraction = Fraction(stock_price)
+    stock_anchor_fraction = Fraction(stock_anchor)
+    return Fraction(etf_anchor) * (
         1
-        + exact_decision_value(etf_daily_multiplier)
+        + Fraction(etf_daily_multiplier)
         * (stock_price_fraction / stock_anchor_fraction - 1)
     )
 
@@ -74,7 +122,7 @@ def _display_exact_fraction(
         positive=positive,
         nonnegative=nonnegative,
     )
-    return with_exact_decision_value(display_value, exact_value)
+    return display_value
 
 
 def _exact_opportunity_bp(
@@ -91,14 +139,14 @@ def _exact_opportunity_bp(
     taker_fee_bp: Decimal,
     maker_slippage_bp_per_fill: Decimal,
 ) -> tuple[Fraction, Fraction, Fraction]:
-    stock_anchor_fraction = exact_decision_value(stock_anchor)
-    etf_anchor_fraction = exact_decision_value(etf_anchor)
-    multiplier_fraction = exact_decision_value(etf_daily_multiplier)
-    stock_price_fraction = exact_decision_value(stock_entry_price)
-    etf_price_fraction = exact_decision_value(etf_entry_price)
-    etf_quantity_fraction = exact_decision_value(etf_quantity)
-    stock_contract_fraction = exact_decision_value(stock_contract_multiplier)
-    etf_contract_fraction = exact_decision_value(etf_contract_multiplier)
+    stock_anchor_fraction = Fraction(stock_anchor)
+    etf_anchor_fraction = Fraction(etf_anchor)
+    multiplier_fraction = Fraction(etf_daily_multiplier)
+    stock_price_fraction = Fraction(stock_entry_price)
+    etf_price_fraction = Fraction(etf_entry_price)
+    etf_quantity_fraction = Fraction(etf_quantity)
+    stock_contract_fraction = Fraction(stock_contract_multiplier)
+    etf_contract_fraction = Fraction(etf_contract_multiplier)
     exact_hedge_ratio = multiplier_fraction * etf_anchor_fraction / stock_anchor_fraction
     exact_theoretical = _exact_theoretical_price(
         stock_entry_price,
@@ -122,10 +170,10 @@ def _exact_opportunity_bp(
     )
     exact_raw_bp = Fraction(BASIS_POINTS) * exact_gross_profit / exact_gross_notional
     exact_total_quote = 2 * (
-        exact_etf_notional * exact_decision_value(maker_fee_bp) / Fraction(BASIS_POINTS)
-        + exact_stock_notional * exact_decision_value(taker_fee_bp) / Fraction(BASIS_POINTS)
+        exact_etf_notional * Fraction(maker_fee_bp) / Fraction(BASIS_POINTS)
+        + exact_stock_notional * Fraction(taker_fee_bp) / Fraction(BASIS_POINTS)
         + exact_etf_notional
-        * exact_decision_value(maker_slippage_bp_per_fill)
+        * Fraction(maker_slippage_bp_per_fill)
         / Fraction(BASIS_POINTS)
     )
     exact_cost_bp = Fraction(BASIS_POINTS) * exact_total_quote / exact_gross_notional
@@ -153,11 +201,7 @@ def calculate_hedge_ratio(
     stock_anchor = _decimal(stock_anchor, "stock anchor", positive=True)
     etf_anchor = _decimal(etf_anchor, "ETF anchor", positive=True)
     etf_daily_multiplier = _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True)
-    exact_ratio = (
-        exact_decision_value(etf_daily_multiplier)
-        * exact_decision_value(etf_anchor)
-        / exact_decision_value(stock_anchor)
-    )
+    exact_ratio = Fraction(etf_daily_multiplier) * Fraction(etf_anchor) / Fraction(stock_anchor)
     return _display_exact_fraction(
         exact_ratio,
         "hedge ratio result",
@@ -171,7 +215,7 @@ def calculate_theoretical_etf_price(
     stock_anchor: Decimal,
     etf_anchor: Decimal,
     etf_daily_multiplier: Decimal,
-) -> Decimal:
+) -> DecisionValue:
     stock_price = _decimal(stock_price, "stock price", positive=True)
     stock_anchor = _decimal(stock_anchor, "stock anchor", positive=True)
     etf_anchor = _decimal(etf_anchor, "ETF anchor", positive=True)
@@ -184,22 +228,27 @@ def calculate_theoretical_etf_price(
     )
     if exact_price <= 0:
         raise ValueError("theoretical ETF price must be positive")
-    return _display_exact_fraction(
+    display = _display_exact_fraction(
         exact_price,
         "theoretical ETF price result",
         positive=True,
     )
+    return DecisionValue.from_exact_fraction(exact_price, display=display)
 
 
 @_fixed_decimal_context
 def determine_arbitrage_direction(
-    etf_price: Decimal,
-    theoretical_etf_price: Decimal,
+    etf_price: Decimal | DecisionValue,
+    theoretical_etf_price: Decimal | DecisionValue,
 ) -> Optional[ArbitrageDirection]:
-    etf_price = _decimal(etf_price, "ETF price", positive=True)
-    theoretical_etf_price = _decimal(theoretical_etf_price, "theoretical ETF price", positive=True)
-    exact_etf_price = exact_decision_value(etf_price)
-    exact_theoretical_price = exact_decision_value(theoretical_etf_price)
+    _, exact_etf_price = _decision_parts(etf_price, "ETF price", positive=True)
+    _, exact_theoretical_price = _decision_parts(
+        theoretical_etf_price,
+        "theoretical ETF price",
+        positive=True,
+    )
+    if exact_etf_price is None or exact_theoretical_price is None:
+        return None
     if exact_etf_price > exact_theoretical_price:
         return ArbitrageDirection.SHORT_ETF_LONG_STOCK
     if exact_etf_price < exact_theoretical_price:
@@ -327,7 +376,7 @@ def calculate_opportunity(
         etf_anchor,
         etf_daily_multiplier,
     )
-    etf_entry_fraction = exact_decision_value(etf_entry_price)
+    etf_entry_fraction = Fraction(etf_entry_price)
     if etf_entry_fraction > exact_theoretical_price:
         direction = ArbitrageDirection.SHORT_ETF_LONG_STOCK
     elif etf_entry_fraction < exact_theoretical_price:
@@ -351,7 +400,7 @@ def calculate_opportunity(
         etf_contract_multiplier,
         stock_contract_multiplier,
     )
-    exact_gross_profit, exact_raw_bp, exact_net_bp = _exact_opportunity_bp(
+    exact_gross_profit, _exact_raw_bp, exact_net_bp = _exact_opportunity_bp(
         stock_anchor=stock_anchor,
         etf_anchor=etf_anchor,
         etf_daily_multiplier=etf_daily_multiplier,
@@ -370,14 +419,13 @@ def calculate_opportunity(
         positive=True,
     )
     raw_bp_display = BASIS_POINTS * gross_profit_quote / notionals.gross
-    raw_bp = with_exact_decision_value(raw_bp_display, exact_raw_bp)
     costs = calculate_round_trip_costs(
         notionals,
         maker_fee_bp,
         taker_fee_bp,
         maker_slippage_bp_per_fill,
     )
-    net_bp_display = raw_bp - costs.total_bp
+    net_bp_display = raw_bp_display - costs.total_bp
     return Opportunity(
         direction=direction,
         hedge_ratio=hedge_ratio,
@@ -385,9 +433,9 @@ def calculate_opportunity(
         quantities=quantities,
         notionals=notionals,
         gross_profit_quote=gross_profit_quote,
-        raw_bp=raw_bp,
+        raw_bp=raw_bp_display,
         costs=costs,
-        net_bp=with_exact_decision_value(net_bp_display, exact_net_bp),
+        net_bp=DecisionValue.from_exact_fraction(exact_net_bp, display=net_bp_display),
     )
 
 
@@ -438,36 +486,49 @@ def stock_book_walk_bp(vwap: Decimal, best_quote: Decimal, side: BookSide) -> De
     return validate_bounded_decimal(impact, "stock book walk result", nonnegative=True)
 
 
-def _ordered_tiers(position_tiers: Mapping[Decimal, Decimal]) -> tuple[tuple[Decimal, Decimal], ...]:
+def _ordered_tiers(
+    position_tiers: Mapping[Decimal | DecisionValue, Decimal],
+) -> tuple[tuple[tuple[Decimal, Decimal], ...], bool]:
     if not isinstance(position_tiers, Mapping):
         raise TypeError("position tiers must be a mapping")
     parsed: list[tuple[Decimal, Decimal]] = []
+    all_thresholds_trusted = True
     for threshold, target in position_tiers.items():
+        threshold_display, threshold_is_trusted = _threshold_display(
+            threshold,
+            "tier threshold",
+            nonnegative=True,
+        )
+        all_thresholds_trusted = all_thresholds_trusted and threshold_is_trusted
         parsed.append(
             (
-                _decimal(threshold, "tier threshold", nonnegative=True),
+                threshold_display,
                 _decimal(target, "tier target", positive=True),
             )
         )
-    ordered = tuple(sorted(parsed))
+    ordered = tuple(sorted(parsed, key=lambda tier: tier[0]))
     if not ordered or ordered[0][0] != 0:
         raise ValueError("position tiers must contain the base threshold 0")
     if any(current[1] < previous[1] for previous, current in zip(ordered, ordered[1:])):
         raise ValueError("position tier targets must be monotonic nondecreasing")
-    return ordered
+    return ordered, all_thresholds_trusted
 
 
 @_fixed_decimal_context
-def select_entry_target(net_bp: Decimal, position_tiers: Mapping[Decimal, Decimal]) -> Decimal:
-    net_bp = _decimal(net_bp, "net bp")
-    ordered_tiers = _ordered_tiers(position_tiers)
-    exact_net_bp = exact_decision_value(net_bp)
+def select_entry_target(
+    net_bp: Decimal | DecisionValue,
+    position_tiers: Mapping[Decimal | DecisionValue, Decimal],
+) -> Decimal:
+    _, exact_net_bp = _decision_parts(net_bp, "net bp")
+    ordered_tiers, all_thresholds_trusted = _ordered_tiers(position_tiers)
+    if exact_net_bp is None or not all_thresholds_trusted:
+        return Decimal("0")
     if exact_net_bp <= 0:
         return Decimal("0")
     return max(
         target
         for threshold, target in ordered_tiers
-        if displayed_decision_value(threshold) <= exact_net_bp
+        if Fraction(threshold) <= exact_net_bp
     )
 
 
@@ -494,14 +555,14 @@ def advance_entry_confirmation(
 
 @_fixed_decimal_context
 def select_reduce_target(
-    net_bp: Decimal,
+    net_bp: Decimal | DecisionValue,
     current_target: Decimal,
-    position_tiers: Mapping[Decimal, Decimal],
-    reduce_bp_by_current_target: Mapping[Decimal, Decimal],
+    position_tiers: Mapping[Decimal | DecisionValue, Decimal],
+    reduce_bp_by_current_target: Mapping[Decimal, Decimal | DecisionValue],
 ) -> Decimal:
-    net_bp = _decimal(net_bp, "net bp")
+    _, exact_net_bp = _decision_parts(net_bp, "net bp")
     current_target = _decimal(current_target, "current target", nonnegative=True)
-    ordered_tiers = _ordered_tiers(position_tiers)
+    ordered_tiers, all_tier_thresholds_trusted = _ordered_tiers(position_tiers)
     if current_target == 0:
         return Decimal("0")
     ordered_targets: list[Decimal] = []
@@ -510,20 +571,33 @@ def select_reduce_target(
             ordered_targets.append(target)
     if current_target not in ordered_targets:
         raise ValueError("current target is not a configured position tier")
-    exact_net_bp = exact_decision_value(net_bp)
-    if exact_net_bp <= 0:
-        return Decimal("0")
     if not isinstance(reduce_bp_by_current_target, Mapping):
         raise TypeError("reduce thresholds must be a mapping")
-    parsed_reductions = {
-        _decimal(target, "reduce target", positive=True): _decimal(threshold, "reduce threshold", nonnegative=True)
-        for target, threshold in reduce_bp_by_current_target.items()
-    }
+    parsed_reductions: dict[Decimal, Decimal] = {}
+    all_reduce_thresholds_trusted = True
+    for target, threshold in reduce_bp_by_current_target.items():
+        parsed_target = _decimal(target, "reduce target", positive=True)
+        parsed_threshold, threshold_is_trusted = _threshold_display(
+            threshold,
+            "reduce threshold",
+            nonnegative=True,
+        )
+        parsed_reductions[parsed_target] = parsed_threshold
+        all_reduce_thresholds_trusted = all_reduce_thresholds_trusted and threshold_is_trusted
     if current_target not in parsed_reductions:
         raise ValueError("current target has no reduce threshold")
-    if exact_net_bp < displayed_decision_value(parsed_reductions[current_target]):
-        current_index = ordered_targets.index(current_target)
-        return Decimal("0") if current_index == 0 else ordered_targets[current_index - 1]
+    current_index = ordered_targets.index(current_target)
+    previous_target = Decimal("0") if current_index == 0 else ordered_targets[current_index - 1]
+    if (
+        exact_net_bp is None
+        or not all_tier_thresholds_trusted
+        or not all_reduce_thresholds_trusted
+    ):
+        return previous_target
+    if exact_net_bp <= 0:
+        return Decimal("0")
+    if exact_net_bp < Fraction(parsed_reductions[current_target]):
+        return previous_target
     return current_target
 
 

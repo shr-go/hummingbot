@@ -4,6 +4,8 @@ from enum import Enum
 from typing import Optional
 
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
+    DecisionCertainty,
+    DecisionValue,
     decision_decimal_context,
     validate_bounded_decimal,
 )
@@ -104,24 +106,33 @@ class RoundTripCosts:
 class Opportunity:
     direction: ArbitrageDirection
     hedge_ratio: Decimal
-    theoretical_etf_price: Decimal
+    theoretical_etf_price: DecisionValue
     quantities: LegQuantities
     notionals: LegNotionals
     gross_profit_quote: Decimal
     raw_bp: Decimal
     costs: RoundTripCosts
-    net_bp: Decimal
+    net_bp: DecisionValue
 
     def __post_init__(self) -> None:
         if not isinstance(self.direction, ArbitrageDirection):
             raise TypeError("direction must be an ArbitrageDirection")
         _validate_decimal(self.hedge_ratio, "hedge ratio", positive=True)
-        _validate_decimal(self.theoretical_etf_price, "theoretical ETF price", positive=True)
+        for decision_value, field_name in (
+            (self.theoretical_etf_price, "theoretical ETF price"),
+            (self.net_bp, "net bp"),
+        ):
+            if not isinstance(decision_value, DecisionValue):
+                raise TypeError(f"{field_name} must be a DecisionValue")
+            decision_value.validate_integrity()
+            if decision_value.certainty is not DecisionCertainty.EXACT:
+                raise ValueError(f"{field_name} must retain exact decision authority")
+        _validate_decimal(self.theoretical_etf_price.display, "theoretical ETF price", positive=True)
         _validate_decimal(self.gross_profit_quote, "gross profit quote", positive=True)
         _validate_decimal(self.raw_bp, "raw bp", positive=True)
-        _validate_decimal(self.net_bp, "net bp")
+        _validate_decimal(self.net_bp.display, "net bp")
         with decision_decimal_context():
-            if self.net_bp != self.raw_bp - self.costs.total_bp:
+            if self.net_bp.display != self.raw_bp - self.costs.total_bp:
                 raise ValueError("net bp must subtract the fixed cost ledger exactly once")
 
 
