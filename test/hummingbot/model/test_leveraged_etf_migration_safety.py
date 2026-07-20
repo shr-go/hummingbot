@@ -340,6 +340,69 @@ def _evaluate_round7_sqlite_expression(connection: sqlite3.Connection, expressio
         """).fetchone()[0]
 
 
+ROUND8_SIGNED_NUMERIC_COLUMNS = ("quantity", "notional_cap")
+
+
+def _round8_group_signed_substr_offset(create_sql: str, column_name: str) -> str:
+    canonical = f"substr({column_name}, -1, 1)"
+    equivalent = f"substr({column_name}, (-1), 1)"
+    assert create_sql.count(canonical) == 1
+    return create_sql.replace(canonical, equivalent, 1)
+
+
+def _install_round8_reservation_variant(connection: sqlite3.Connection, column_name: str) -> None:
+    _create_compiled_table(
+        connection,
+        LeveragedEtfStrategyReservation.__table__,
+        transform=lambda create_sql: _round8_group_signed_substr_offset(create_sql, column_name),
+    )
+
+
+def _round8_rebuild_current_reservation_variant(db_path: Path, column_name: str) -> None:
+    table_name = LeveragedEtfStrategyReservation.__tablename__
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        objects = connection.execute(
+            """
+            SELECT type, name, sql
+            FROM sqlite_master
+            WHERE (type = 'table' AND name = ?)
+               OR (tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL)
+            ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name
+            """,
+            (table_name, table_name),
+        ).fetchall()
+        table_sql = next(sql for object_type, _, sql in objects if object_type == "table")
+        dependent_sql = [sql for object_type, _, sql in objects if object_type != "table"]
+
+        connection.execute(f'DROP TABLE "{table_name}"')
+        connection.execute(_round8_group_signed_substr_offset(table_sql, column_name))
+        for create_sql in dependent_sql:
+            connection.execute(create_sql)
+
+
+def _round8_reservation_sql(db_path: Path) -> str:
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (LeveragedEtfStrategyReservation.__tablename__,),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _assert_round8_decimal_examples(manager: SQLConnectionManager, column_name: str) -> None:
+    with manager.engine.begin() as connection:
+        _insert_snapshot(connection)
+
+    valid_quantity = "12.34" if column_name == "quantity" else "1"
+    valid_notional_cap = "12.34" if column_name == "notional_cap" else "1000"
+    invalid_quantity = "12.30" if column_name == "quantity" else valid_quantity
+    invalid_notional_cap = "12.30" if column_name == "notional_cap" else valid_notional_cap
+    _assert_round4_decimal_insert(manager, valid_quantity, valid_notional_cap, accepted=True)
+    _assert_round4_decimal_insert(manager, invalid_quantity, invalid_notional_cap, accepted=False)
+
+
 def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "original") -> None:
     connection.execute(
         text("""
@@ -1370,6 +1433,75 @@ def test_round7_trigger_body_parentheses_and_literals_remain_token_significant()
     )
     assert persistence_module._normalize_trigger_sql(expected_sql) != persistence_module._normalize_trigger_sql(
         changed_literal
+    )
+
+
+@pytest.mark.parametrize("column_name", ROUND8_SIGNED_NUMERIC_COLUMNS)
+def test_round8_signed_numeric_grouping_survives_partial_migration_and_reopen(
+    tmp_path: Path,
+    column_name: str,
+):
+    db_path = _materialize_legacy_database(tmp_path, f"round8-partial-{column_name}.sqlite")
+    with sqlite3.connect(db_path) as connection:
+        _install_round8_reservation_variant(connection, column_name)
+
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+    assert _version(db_path) == TARGET_VERSION
+
+    persisted_sql = _round8_reservation_sql(db_path)
+    assert f"substr({column_name}, (-1), 1)" in persisted_sql
+
+    reopened = _open_manager(db_path)
+    try:
+        _assert_round8_decimal_examples(reopened, column_name)
+    finally:
+        reopened.engine.dispose()
+    assert _round8_reservation_sql(db_path) == persisted_sql
+
+
+@pytest.mark.parametrize("column_name", ROUND8_SIGNED_NUMERIC_COLUMNS)
+def test_round8_signed_numeric_grouping_survives_current_version_validation_and_reopen(
+    tmp_path: Path,
+    column_name: str,
+):
+    db_path = tmp_path / f"round8-current-{column_name}.sqlite"
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+    assert _version(db_path) == TARGET_VERSION
+
+    _round8_rebuild_current_reservation_variant(db_path, column_name)
+    persisted_sql = _round8_reservation_sql(db_path)
+    assert f"substr({column_name}, (-1), 1)" in persisted_sql
+
+    validated = _open_manager(db_path)
+    try:
+        _assert_round8_decimal_examples(validated, column_name)
+    finally:
+        validated.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    reopened.engine.dispose()
+    assert _round8_reservation_sql(db_path) == persisted_sql
+
+
+@pytest.mark.parametrize("column_name", ROUND8_SIGNED_NUMERIC_COLUMNS)
+def test_round8_unary_signed_numeric_atom_grouping_is_normalized(column_name: str):
+    canonical_sql = f"substr({column_name}, -1, 1)"
+    equivalent_sql = f"substr({column_name}, (-1), 1)"
+
+    assert persistence_module._normalize_sql(equivalent_sql) == persistence_module._normalize_sql(canonical_sql)
+
+
+@pytest.mark.parametrize("column_name", ROUND8_SIGNED_NUMERIC_COLUMNS)
+def test_round8_meaningful_signed_numeric_drift_remains_distinct(column_name: str):
+    canonical_sql = f"substr({column_name}, -1, 1)"
+
+    assert persistence_module._normalize_sql(f"substr({column_name}, (-2), 1)") != persistence_module._normalize_sql(
+        canonical_sql
+    )
+    assert persistence_module._normalize_sql(f"substr({column_name}, (1), 1)") != persistence_module._normalize_sql(
+        canonical_sql
     )
 
 
