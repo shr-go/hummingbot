@@ -2837,11 +2837,20 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self._simulate_trading_rules_initialized()
         tracked_order = self._track_submission_unknown_order(client_order_id)
         self.exchange._last_poll_timestamp = 0
-        self.exchange._api_get = AsyncMock(return_value=self._get_reconciliation_order(
+        positive = self._get_reconciliation_order(
             client_order_id=client_order_id,
             status="NEW",
             executed_quantity="0",
-        ))
+        )
+
+        async def response(path_url: str, **_: Any) -> Any:
+            if path_url == CONSTANTS.ORDER_URL:
+                return positive
+            if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                return []
+            raise AssertionError(f"unexpected path {path_url}")
+
+        self.exchange._api_get = AsyncMock(side_effect=response)
 
         await self.exchange._update_order_status()
         await asyncio.sleep(0.001)
@@ -2849,7 +2858,11 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderState.OPEN, tracked_order.current_state)
         self.assertEqual("8886774", tracked_order.exchange_order_id)
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
-        request = self.exchange._api_get.await_args.kwargs
+        self.assertEqual(
+            [CONSTANTS.ORDER_URL, CONSTANTS.ACCOUNT_TRADE_LIST_URL],
+            [call.kwargs["path_url"] for call in self.exchange._api_get.await_args_list],
+        )
+        request = self.exchange._api_get.await_args_list[0].kwargs
         self.assertEqual(CONSTANTS.GET_ORDER_LIMIT_ID, request["limit_id"])
         self.assertNotIn(CONSTANTS.ORDERS_1MIN, request.values())
         self.assertNotIn(CONSTANTS.ORDERS_1SEC, request.values())
@@ -2889,7 +2902,16 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             status="NEW",
             executed_quantity="0",
         )
-        self.exchange._api_get = AsyncMock(side_effect=[not_found, positive, positive.copy()])
+        status_responses = iter((not_found, positive, positive.copy()))
+
+        async def response(path_url: str, **_: Any) -> Any:
+            if path_url == CONSTANTS.ORDER_URL:
+                return next(status_responses)
+            if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                return []
+            raise AssertionError(f"unexpected path {path_url}")
+
+        self.exchange._api_get = AsyncMock(side_effect=response)
 
         not_found_fact = await self.exchange.get_order_status_by_client_order_id(
             self.trading_pair,
@@ -4272,6 +4294,39 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                     [CONSTANTS.ORDER_URL, CONSTANTS.ACCOUNT_TRADE_LIST_URL],
                     [call.kwargs["path_url"] for call in self.exchange._api_get.await_args_list],
                 )
+
+    async def test_risk_zero_fill_status_with_trade_history_contradiction_retains_unknown(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "risk-zero-fill-trade-contradiction-0"
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        snapshot = self._get_reconciliation_order(
+            client_order_id=client_order_id,
+            status="NEW",
+            executed_quantity="0",
+        )
+
+        async def response(path_url: str, **_: Any) -> Any:
+            if path_url == CONSTANTS.ORDER_URL:
+                return snapshot
+            if path_url == CONSTANTS.ACCOUNT_TRADE_LIST_URL:
+                return [self._get_reconciliation_trade()]
+            raise AssertionError(f"unexpected path {path_url}")
+
+        self.exchange._api_get = AsyncMock(side_effect=response)
+
+        await self.exchange.get_order_status_by_client_order_id(
+            self.trading_pair,
+            client_order_id,
+        )
+
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertEqual(Decimal("0"), tracked_order.executed_amount_base)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(
+            [CONSTANTS.ORDER_URL, CONSTANTS.ACCOUNT_TRADE_LIST_URL],
+            [call.kwargs["path_url"] for call in self.exchange._api_get.await_args_list],
+        )
 
     async def test_risk_eventually_consistent_trade_gap_and_contradiction_retain_unknown(self):
         self._simulate_trading_rules_initialized()
