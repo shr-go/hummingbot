@@ -19,6 +19,8 @@ from enum import Enum
 from fractions import Fraction
 from typing import Any, Iterator
 
+from pydantic import StrictInt
+
 
 DECISION_PRECISION = 28
 MAX_DECIMAL_COEFFICIENT_DIGITS = 28
@@ -220,12 +222,12 @@ def _bounded_fraction_fields(exact_value: Fraction) -> tuple[str, str]:
 class RawExactDecision:
     """An explicit exact raw value whose intended decision use is kind-bound."""
 
-    schema_version: int
+    schema_version: StrictInt
     kind: RawDecisionKind
     value: Decimal
 
     def __post_init__(self) -> None:
-        if isinstance(self.schema_version, bool) or self.schema_version != RAW_EXACT_DECISION_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != RAW_EXACT_DECISION_SCHEMA_VERSION:
             raise DecisionValueIntegrityError("raw exact decision schema version must be 1")
         if not isinstance(self.kind, RawDecisionKind):
             raise DecisionValueIntegrityError("raw exact decision kind is invalid")
@@ -495,6 +497,19 @@ def _recompute_decision(
             raise DecisionValueIntegrityError("theoretical ETF price must be positive")
         return exact, _display_fraction(exact, "theoretical ETF price display")
     if kind is DecisionSemanticKind.OPPORTUNITY_NET_BP:
+        exact_theoretical = Fraction(values["etf_anchor"]) * (
+            1
+            + Fraction(values["etf_daily_multiplier"])
+            * (
+                Fraction(values["stock_entry_price"])
+                / Fraction(values["stock_anchor"])
+                - 1
+            )
+        )
+        if exact_theoretical <= 0:
+            raise DecisionValueIntegrityError(
+                "opportunity operands produce a nonpositive theoretical ETF price"
+            )
         exact_gross_profit, _, exact = _exact_net_bp_from_values(values)
         if exact_gross_profit <= 0:
             raise DecisionValueIntegrityError("opportunity operands contain no directional spread")
@@ -527,7 +542,7 @@ def _decision_value_payload(
 class DecisionValue:
     """A derived decision whose authority is recomputed from fixed semantics."""
 
-    schema_version: int
+    schema_version: StrictInt
     certainty: DecisionCertainty
     semantic_kind: DecisionSemanticKind | None
     operands: tuple[tuple[str, str], ...]
@@ -540,7 +555,7 @@ class DecisionValue:
         self.validate_integrity()
 
     def _validate(self) -> None:
-        if isinstance(self.schema_version, bool) or self.schema_version != DECISION_VALUE_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != DECISION_VALUE_SCHEMA_VERSION:
             raise DecisionValueIntegrityError("decision value schema version must be 2")
         if not isinstance(self.certainty, DecisionCertainty):
             raise DecisionValueIntegrityError("decision certainty is invalid")
@@ -811,6 +826,22 @@ class DecisionValue:
         fields = self._payload()
         fields["integrity_hash"] = self.integrity_hash
         return fields
+
+    def verified_operand_values(
+        self,
+        semantic_kind: DecisionSemanticKind,
+    ) -> dict[str, Decimal]:
+        """Return a fresh, revalidated operand mapping for one exact use-site role."""
+
+        self.validate_integrity()
+        if (
+            self.certainty is not DecisionCertainty.EXACT_DERIVED
+            or self.semantic_kind is not semantic_kind
+        ):
+            raise DecisionValueIntegrityError(
+                "decision value does not have exact authority for the requested semantic role"
+            )
+        return _operand_values(semantic_kind, self.operands)
 
     def _operand_display(self, other: object) -> Decimal | None:
         if isinstance(other, DecisionValue):

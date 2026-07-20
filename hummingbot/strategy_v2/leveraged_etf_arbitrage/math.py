@@ -41,7 +41,7 @@ def _decision_parts(
     value: object,
     name: str,
     *,
-    semantic_kind: DecisionSemanticKind,
+    semantic_kind: DecisionSemanticKind | None,
     raw_kind: RawDecisionKind | None,
     positive: bool = False,
     nonnegative: bool = False,
@@ -57,7 +57,9 @@ def _decision_parts(
             nonnegative=nonnegative,
         )
         exact = value.exact_fraction
-        if exact is not None and value.semantic_kind is not semantic_kind:
+        if exact is not None and (
+            semantic_kind is None or value.semantic_kind is not semantic_kind
+        ):
             return display, None
         if exact is not None:
             if positive and exact <= 0:
@@ -92,7 +94,8 @@ def _threshold_display(
         value.validate_integrity()
         return (
             _decimal(value.display, f"{name} display", nonnegative=nonnegative),
-            value.exact_fraction is not None,
+            value.exact_fraction is not None
+            and value.semantic_kind is DecisionSemanticKind.OPPORTUNITY_NET_BP,
         )
     return _decimal(value, name, nonnegative=nonnegative), True
 
@@ -257,7 +260,7 @@ def determine_arbitrage_direction(
     _, exact_etf_price = _decision_parts(
         etf_price,
         "ETF price",
-        semantic_kind=DecisionSemanticKind.THEORETICAL_ETF_PRICE,
+        semantic_kind=None,
         raw_kind=RawDecisionKind.ETF_PRICE,
         positive=True,
     )
