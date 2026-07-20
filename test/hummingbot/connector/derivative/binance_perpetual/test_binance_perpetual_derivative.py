@@ -352,6 +352,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                 "l": "0",
                 "z": "0",
                 "L": "0",
+                "Z": "0",
                 "N": self.quote_asset,
                 "n": "0",
                 "T": 1700000000123,
@@ -363,6 +364,31 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                 "rp": "0",
             },
         }
+
+    def _submission_unknown_fill_event(
+            self,
+            client_order_id: str,
+            status: str,
+            last_fill_quantity: str,
+            cumulative_quantity: str,
+            trade_id: int,
+            cumulative_quote: Optional[str] = None,
+            average_price: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        fill_price = Decimal("10000.125")
+        cumulative = Decimal(cumulative_quantity)
+        event = self._submission_unknown_user_event(client_order_id=client_order_id)
+        event["o"].update({
+            "ap": average_price or f"{fill_price:f}",
+            "x": "TRADE",
+            "X": status,
+            "l": last_fill_quantity,
+            "z": cumulative_quantity,
+            "L": f"{fill_price:f}",
+            "Z": cumulative_quote or f"{fill_price * cumulative:f}",
+            "t": trade_id,
+        })
+        return event
 
     def _get_reconciliation_trade(
             self,
@@ -2681,6 +2707,356 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("8886774", tracked_order.exchange_order_id)
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
         self.assertEqual(1, len(created_logger.event_log))
+
+    async def test_submission_unknown_stream_atomic_rejects_zero_fill_partial_before_mutation(self):
+        client_order_id = "exec-sndk-snxx-0030-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        event = self._submission_unknown_user_event(client_order_id=client_order_id)
+        event["o"]["X"] = "PARTIALLY_FILLED"
+
+        with self.assertRaises(ValueError):
+            await self.exchange._process_user_stream_event(event)
+
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertEqual(Decimal("0"), tracked_order.executed_amount_base)
+        self.assertEqual({}, tracked_order.order_fills)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_submission_unknown_stream_atomic_rejects_overfill_before_mutation(self):
+        client_order_id = "exec-sndk-snxx-0031-stock-0"
+        self._simulate_trading_rules_initialized()
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        event = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="2.000",
+            cumulative_quantity="2.000",
+            trade_id=1,
+        )
+
+        with self.assertRaises(ValueError):
+            await self.exchange._process_user_stream_event(event)
+
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertEqual(Decimal("0"), tracked_order.executed_amount_base)
+        self.assertEqual({}, tracked_order.order_fills)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_submission_unknown_stream_atomic_rejects_identity_contradictions(self):
+        self._simulate_trading_rules_initialized()
+        contradictions = (
+            ("side", "S", "BUY"),
+            ("type", "o", "MARKET"),
+            ("quantity", "q", "1.251"),
+            ("price", "p", "10000.126"),
+        )
+        observations = []
+
+        for index, (label, field, value) in enumerate(contradictions, start=2):
+            client_order_id = f"exec-sndk-snxx-003{index}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            event = self._submission_unknown_user_event(client_order_id=client_order_id)
+            event["o"][field] = value
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except ValueError:
+                rejected = True
+            observations.append((
+                label,
+                rejected,
+                tracked_order.current_state,
+                tracked_order.exchange_order_id,
+                tracked_order.executed_amount_base,
+                len(tracked_order.order_fills),
+                self.exchange.is_order_submission_unknown(client_order_id),
+            ))
+
+        self.assertEqual(
+            [
+                (label, True, OrderState.PENDING_CREATE, None, Decimal("0"), 0, True)
+                for label, _, _ in contradictions
+            ],
+            observations,
+        )
+
+    async def test_submission_unknown_stream_atomic_rejects_missing_and_invalid_fill_facts(self):
+        self._simulate_trading_rules_initialized()
+        invalid_cases = []
+        for field in ("l", "z", "ap", "L", "Z", "t"):
+            invalid_cases.append((f"missing {field}", "missing", field, None))
+        invalid_cases.extend((
+            ("non-finite last quantity", "replace", "l", "NaN"),
+            ("non-finite cumulative quantity", "replace", "z", "Infinity"),
+            ("non-finite average price", "replace", "ap", "NaN"),
+            ("non-finite last price", "replace", "L", "Infinity"),
+            ("non-finite cumulative quote", "replace", "Z", "NaN"),
+            ("negative cumulative quantity", "replace", "z", "-0.125"),
+            ("negative average price", "replace", "ap", "-10000.125"),
+            ("negative cumulative quote", "replace", "Z", "-1250.015625"),
+            ("negative trade ID", "replace", "t", -1),
+            ("zero trade ID with fill", "replace", "t", 0),
+        ))
+        observations = []
+
+        for index, (label, operation, field, value) in enumerate(invalid_cases, start=40):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            event = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity="0.125",
+                cumulative_quantity="0.125",
+                trade_id=1,
+            )
+            if operation == "missing":
+                del event["o"][field]
+            else:
+                event["o"][field] = value
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except ValueError:
+                rejected = True
+            observations.append((
+                label,
+                rejected,
+                tracked_order.current_state,
+                tracked_order.exchange_order_id,
+                tracked_order.executed_amount_base,
+                len(tracked_order.order_fills),
+                self.exchange.is_order_submission_unknown(client_order_id),
+            ))
+
+        self.assertEqual(
+            [
+                (label, True, OrderState.PENDING_CREATE, None, Decimal("0"), 0, True)
+                for label, _, _, _ in invalid_cases
+            ],
+            observations,
+        )
+
+    async def test_submission_unknown_stream_atomic_rejects_execution_status_contradictions(self):
+        self._simulate_trading_rules_initialized()
+        private_sentinel = "private-response-payload-sentinel"
+        cases = (
+            ("NEW", "NEW", "0.125", "0.125", 1),
+            ("TRADE", "FILLED", "0.500", "0.500", 2),
+            ("CANCELED", "CANCELED", "0.125", "0.125", 3),
+            ("EXPIRED", "EXPIRED", "0.125", "0.125", 4),
+            (private_sentinel, "NEW", "0", "0", 0),
+        )
+        observations = []
+
+        for index, (execution, status, last_fill, cumulative, trade_id) in enumerate(cases, start=60):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            if last_fill == "0":
+                event = self._submission_unknown_user_event(client_order_id=client_order_id)
+            else:
+                event = self._submission_unknown_fill_event(
+                    client_order_id=client_order_id,
+                    status=status,
+                    last_fill_quantity=last_fill,
+                    cumulative_quantity=cumulative,
+                    trade_id=trade_id,
+                )
+            event["o"]["x"] = execution
+            event["o"]["X"] = status
+            rejected = False
+            sanitized = False
+            with patch.object(self.exchange._order_tracker, "process_trade_update") as process_trade_update:
+                with patch.object(
+                    self.exchange._order_tracker,
+                    "process_order_update",
+                    new=AsyncMock(),
+                ) as process_order_update:
+                    try:
+                        await self.exchange._process_user_stream_event(event)
+                    except ValueError as error:
+                        rejected = True
+                        sanitized = (
+                            private_sentinel not in str(error)
+                            and error.__cause__ is None
+                            and error.__context__ is None
+                        )
+            observations.append((
+                execution,
+                rejected,
+                sanitized,
+                process_trade_update.call_count,
+                process_order_update.await_count,
+                tracked_order.current_state,
+                self.exchange.is_order_submission_unknown(client_order_id),
+            ))
+
+        self.assertEqual(
+            [
+                (execution, True, True, 0, 0, OrderState.PENDING_CREATE, True)
+                for execution, _, _, _, _ in cases
+            ],
+            observations,
+        )
+
+    async def test_submission_unknown_stream_atomic_rejects_cumulative_rollback_and_jumps(self):
+        self._simulate_trading_rules_initialized()
+        cumulative_quote = Decimal("10000.125") * Decimal("0.250")
+        cases = (
+            ("rollback", "0.050", "0.100", None, None),
+            ("base jump", "0.125", "0.500", None, None),
+            (
+                "quote jump",
+                "0.125",
+                "0.250",
+                f"{cumulative_quote + Decimal('1'):f}",
+                f"{(cumulative_quote + Decimal('1')) / Decimal('0.250'):f}",
+            ),
+        )
+        observations = []
+
+        for index, (label, last_fill, cumulative, quote, average) in enumerate(cases, start=70):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            first_partial = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity="0.125",
+                cumulative_quantity="0.125",
+                trade_id=1,
+            )
+            await self.exchange._process_user_stream_event(first_partial)
+            self.exchange._unknown_submission_order_ids.add(client_order_id)
+            invalid = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity=last_fill,
+                cumulative_quantity=cumulative,
+                trade_id=2,
+                cumulative_quote=quote,
+                average_price=average,
+            )
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(invalid)
+            except ValueError:
+                rejected = True
+            observations.append((
+                label,
+                rejected,
+                tracked_order.current_state,
+                tracked_order.executed_amount_base,
+                tracked_order.executed_amount_quote,
+                len(tracked_order.order_fills),
+                self.exchange.is_order_submission_unknown(client_order_id),
+            ))
+
+        first_quote = Decimal("10000.125") * Decimal("0.125")
+        self.assertEqual(
+            [
+                (label, True, OrderState.PARTIALLY_FILLED, Decimal("0.125"), first_quote, 1, True)
+                for label, _, _, _, _ in cases
+            ],
+            observations,
+        )
+
+    async def test_submission_unknown_stream_atomic_accepts_valid_lifecycle_and_duplicate_trade(self):
+        self._simulate_trading_rules_initialized()
+
+        new_id = "exec-sndk-snxx-0080-stock-0"
+        new_order = self._track_submission_unknown_order(new_id)
+        await self.exchange._process_user_stream_event(
+            self._submission_unknown_user_event(client_order_id=new_id)
+        )
+
+        fill_id = "exec-sndk-snxx-0081-stock-0"
+        fill_order = self._track_submission_unknown_order(fill_id)
+        partial = self._submission_unknown_fill_event(
+            client_order_id=fill_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="0.125",
+            cumulative_quantity="0.125",
+            trade_id=1,
+        )
+        await self.exchange._process_user_stream_event(partial)
+        self.exchange._unknown_submission_order_ids.add(fill_id)
+        await self.exchange._process_user_stream_event(partial)
+        duplicate_snapshot = (
+            fill_order.executed_amount_base,
+            fill_order.executed_amount_quote,
+            len(fill_order.order_fills),
+        )
+        self.exchange._unknown_submission_order_ids.add(fill_id)
+        filled = self._submission_unknown_fill_event(
+            client_order_id=fill_id,
+            status="FILLED",
+            last_fill_quantity="1.125",
+            cumulative_quantity="1.250",
+            trade_id=2,
+        )
+        await self.exchange._process_user_stream_event(filled)
+
+        canceled_id = "exec-sndk-snxx-0082-stock-0"
+        canceled_order = self._track_submission_unknown_order(canceled_id)
+        canceled = self._submission_unknown_user_event(client_order_id=canceled_id)
+        canceled["o"].update({"x": "CANCELED", "X": "CANCELED"})
+        await self.exchange._process_user_stream_event(canceled)
+
+        expired_id = "exec-sndk-snxx-0083-stock-0"
+        expired_order = self._track_submission_unknown_order(expired_id)
+        expired = self._submission_unknown_user_event(client_order_id=expired_id)
+        expired["o"].update({"x": "EXPIRED", "X": "EXPIRED"})
+        await self.exchange._process_user_stream_event(expired)
+
+        self.assertEqual(OrderState.OPEN, new_order.current_state)
+        self.assertEqual("8886774", new_order.exchange_order_id)
+        self.assertFalse(self.exchange.is_order_submission_unknown(new_id))
+        self.assertEqual(
+            (Decimal("0.125"), Decimal("1250.015625"), 1),
+            duplicate_snapshot,
+        )
+        self.assertEqual(OrderState.FILLED, fill_order.current_state)
+        self.assertEqual(Decimal("1.250"), fill_order.executed_amount_base)
+        self.assertEqual(2, len(fill_order.order_fills))
+        self.assertFalse(self.exchange.is_order_submission_unknown(fill_id))
+        self.assertEqual(OrderState.CANCELED, canceled_order.current_state)
+        self.assertFalse(self.exchange.is_order_submission_unknown(canceled_id))
+        self.assertEqual(OrderState.CANCELED, expired_order.current_state)
+        self.assertFalse(self.exchange.is_order_submission_unknown(expired_id))
+
+    async def test_submission_unknown_stream_atomic_clears_only_after_tracker_success_and_propagates_cancel(self):
+        self._simulate_trading_rules_initialized()
+
+        failure_id = "exec-sndk-snxx-0084-stock-0"
+        failure_order = self._track_submission_unknown_order(failure_id)
+        failure_event = self._submission_unknown_user_event(client_order_id=failure_id)
+        with patch.object(
+            self.exchange._order_tracker,
+            "process_order_update",
+            new=AsyncMock(side_effect=RuntimeError("tracker update failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "tracker update failed"):
+                await self.exchange._process_user_stream_event(failure_event)
+
+        cancel_id = "exec-sndk-snxx-0085-stock-0"
+        cancel_order = self._track_submission_unknown_order(cancel_id)
+        cancel_event = self._submission_unknown_user_event(client_order_id=cancel_id)
+        with patch.object(
+            self.exchange._order_tracker,
+            "process_order_update",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.exchange._process_user_stream_event(cancel_event)
+
+        self.assertEqual(OrderState.PENDING_CREATE, failure_order.current_state)
+        self.assertIsNone(failure_order.exchange_order_id)
+        self.assertTrue(self.exchange.is_order_submission_unknown(failure_id))
+        self.assertEqual(OrderState.PENDING_CREATE, cancel_order.current_state)
+        self.assertIsNone(cancel_order.exchange_order_id)
+        self.assertTrue(self.exchange.is_order_submission_unknown(cancel_id))
 
     async def test_submission_unknown_restore_pending_without_exchange_id_is_conservative(self):
         client_order_id = "exec-sndk-snxx-0023-stock-0"
