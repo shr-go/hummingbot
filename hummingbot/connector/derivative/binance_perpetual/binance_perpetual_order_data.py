@@ -50,7 +50,7 @@ _BINANCE_ERROR_CODE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN = re.compile(
-    r"\b(?:execution|send)\s+status\s+(?:is\s+)?unknown\b",
+    r"\b(?:execution|send)\s+status(?:(?:\s+is)?\s+|\s*[:=]\s*)unknown\b",
     re.IGNORECASE,
 )
 _BINANCE_NEW_ORDER_REJECTED_PATTERN = re.compile(
@@ -150,10 +150,11 @@ def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
                 else:
                     malformed_message = True
 
-    try:
-        texts.append(str(failure))
-    except Exception:
-        pass
+    for candidate in candidates:
+        try:
+            texts.append(str(candidate))
+        except Exception:
+            malformed_message = True
     texts.extend(messages)
     for text in texts:
         codes.update(int(match.group("code")) for match in _BINANCE_ERROR_CODE_PATTERN.finditer(text))
