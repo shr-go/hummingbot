@@ -1,8 +1,8 @@
 import asyncio
 import math
 from collections import defaultdict
-from decimal import Decimal
-from typing import Any, AsyncIterable, Collection, Dict, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, AsyncIterable, Collection, Dict, List, Mapping, Optional, Tuple
 
 from bidict import bidict
 
@@ -155,6 +155,94 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     def is_order_submission_unknown(self, client_order_id: str) -> bool:
         return client_order_id in self._unknown_submission_order_ids
 
+    def _resolve_order_submission_unknown(self, client_order_id: str) -> None:
+        self._unknown_submission_order_ids.discard(client_order_id)
+        self._order_tracker._order_not_found_records.pop(client_order_id, None)
+
+    @staticmethod
+    def _validated_non_negative_integer_string(value: Any, field: str) -> str:
+        if isinstance(value, bool):
+            raise BinancePerpetualOrderDataError(f"{field} must be a non-negative integer")
+        if isinstance(value, int):
+            if value < 0:
+                raise BinancePerpetualOrderDataError(f"{field} must be a non-negative integer")
+            return str(value)
+        if (
+            isinstance(value, str)
+            and value.isascii()
+            and value.isdigit()
+            and (value == "0" or not value.startswith("0"))
+        ):
+            return value
+        raise BinancePerpetualOrderDataError(f"{field} must be a non-negative integer")
+
+    @staticmethod
+    def _validated_finite_decimal(value: Any, field: str) -> Decimal:
+        parsed = None
+        if isinstance(value, str) and value != "" and value.strip() == value:
+            try:
+                parsed = Decimal(value)
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+        if parsed is None or not parsed.is_finite():
+            raise BinancePerpetualOrderDataError(f"{field} must be a finite decimal")
+        return parsed
+
+    def _validate_snapshot_matches_tracked_order(
+            self,
+            snapshot: BinancePerpetualOrderSnapshot,
+            tracked_order: InFlightOrder,
+    ) -> None:
+        if snapshot.client_order_id != tracked_order.client_order_id:
+            raise BinancePerpetualOrderDataError("order snapshot client order ID is contradictory")
+        if snapshot.trading_pair != tracked_order.trading_pair:
+            raise BinancePerpetualOrderDataError("order snapshot trading pair is contradictory")
+        if (
+            tracked_order.exchange_order_id is not None
+            and snapshot.exchange_order_id != tracked_order.exchange_order_id
+        ):
+            raise BinancePerpetualOrderDataError("order snapshot exchange order ID is contradictory")
+        if snapshot.side is not tracked_order.trade_type:
+            raise BinancePerpetualOrderDataError("order snapshot side is contradictory")
+        expected_order_type = (
+            OrderType.LIMIT
+            if tracked_order.order_type is OrderType.LIMIT_MAKER
+            else tracked_order.order_type
+        )
+        if snapshot.order_type is not expected_order_type:
+            raise BinancePerpetualOrderDataError("order snapshot type is contradictory")
+        if snapshot.original_quantity != tracked_order.amount:
+            raise BinancePerpetualOrderDataError("order snapshot quantity is contradictory")
+        if tracked_order.order_type.is_limit_type() and snapshot.price != tracked_order.price:
+            raise BinancePerpetualOrderDataError("order snapshot price is contradictory")
+
+    async def _apply_authoritative_order_snapshot(
+            self,
+            snapshot: BinancePerpetualOrderSnapshot,
+    ) -> bool:
+        if snapshot.is_not_found or not self.is_order_submission_unknown(snapshot.client_order_id):
+            return False
+        tracked_order = self._order_tracker.all_updatable_orders.get(snapshot.client_order_id)
+        if tracked_order is None:
+            return False
+        self._validate_snapshot_matches_tracked_order(snapshot, tracked_order)
+        order_update = OrderUpdate(
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=snapshot.update_time_ms * 1e-3,
+            new_state=CONSTANTS.ORDER_STATE[snapshot.status.value],
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=snapshot.exchange_order_id,
+        )
+        await self._order_tracker.process_order_update(order_update)
+        self._resolve_order_submission_unknown(snapshot.client_order_id)
+        return True
+
+    def restore_tracking_states(self, saved_states: Dict[str, Any]):
+        super().restore_tracking_states(saved_states)
+        for tracked_order in self.in_flight_orders.values():
+            if tracked_order.is_pending_create and tracked_order.exchange_order_id is None:
+                self._unknown_submission_order_ids.add(tracked_order.client_order_id)
+
     def supported_position_modes(self):
         """
         This method needs to be overridden to provide the accurate information depending on the exchange.
@@ -225,7 +313,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             expected_client_order_id=client_order_id,
             data_time=data_time,
         )
-        self._unknown_submission_order_ids.discard(client_order_id)
+        await self._apply_authoritative_order_snapshot(fact)
         return fact
 
     async def get_open_orders(
@@ -914,14 +1002,74 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.ORDER_URL,
             params=api_params,
             is_auth_required=True)
-        if cancel_result.get("code") == -2011 and "Unknown order sent." == cancel_result.get("msg", ""):
-            self.logger().debug(f"The order {order_id} does not exist on Binance Perpetuals. "
-                                f"No cancelation needed.")
-            await self._order_tracker.process_order_not_found(order_id)
-            raise IOError(f"{cancel_result.get('code')} - {cancel_result['msg']}")
+        is_cancel_not_found = (
+            cancel_result.get("code") == CONSTANTS.UNKNOWN_ORDER_ERROR_CODE
+            and CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancel_result.get("msg", ""))
+        )
+        is_order_not_found = (
+            cancel_result.get("code") == CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE
+            and CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(cancel_result.get("msg", ""))
+        )
+        if is_cancel_not_found or is_order_not_found:
+            if self.is_order_submission_unknown(order_id):
+                self.logger().debug(
+                    f"Cancel found no authoritative order for submission-unknown order {order_id}."
+                )
+                return False
+            if is_cancel_not_found:
+                self.logger().debug(
+                    f"The order {order_id} does not exist on Binance Perpetuals. "
+                    f"No cancelation needed."
+                )
+                raise IOError(
+                    f"{CONSTANTS.UNKNOWN_ORDER_ERROR_CODE} - {CONSTANTS.UNKNOWN_ORDER_MESSAGE}"
+                )
+            return False
         if cancel_result.get("status") == "CANCELED":
+            if self.is_order_submission_unknown(order_id):
+                if cancel_result.get("clientOrderId") != order_id:
+                    raise BinancePerpetualOrderDataError(
+                        "cancel confirmation client order ID is contradictory"
+                    )
+                exchange_order_id = self._validated_non_negative_integer_string(
+                    cancel_result.get("orderId"),
+                    "cancel confirmation exchange order ID",
+                )
+                if (
+                    tracked_order.exchange_order_id is not None
+                    and exchange_order_id != tracked_order.exchange_order_id
+                ):
+                    raise BinancePerpetualOrderDataError(
+                        "cancel confirmation exchange order ID is contradictory"
+                    )
             return True
         return False
+
+    async def _execute_order_cancel(self, order: InFlightOrder) -> Optional[str]:
+        if not self.is_order_submission_unknown(order.client_order_id):
+            return await super()._execute_order_cancel(order)
+        try:
+            cancelled = await self._place_cancel(order.client_order_id, order)
+            if not cancelled:
+                return None
+            update_timestamp = self.current_timestamp
+            if update_timestamp is None or math.isnan(update_timestamp):
+                update_timestamp = self._time()
+            await self._order_tracker.process_order_update(OrderUpdate(
+                client_order_id=order.client_order_id,
+                trading_pair=order.trading_pair,
+                update_timestamp=update_timestamp,
+                new_state=CONSTANTS.ORDER_STATE["CANCELED"],
+            ))
+            self._resolve_order_submission_unknown(order.client_order_id)
+            return order.client_order_id
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().warning(
+                f"Cancel did not resolve submission-unknown order {order.client_order_id}."
+            )
+            return None
 
     async def _place_order(
             self,
@@ -1090,7 +1238,6 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                     client_order_id=tracked_order.client_order_id,
                 )
                 return _order_update
-        self._unknown_submission_order_ids.discard(tracked_order.client_order_id)
         _order_update: OrderUpdate = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
 
@@ -1129,12 +1276,151 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().error(f"Unexpected error in user stream listener loop: {e}", exc_info=True)
                 await self._sleep(5.0)
 
+    async def _validated_unknown_user_stream_updates(
+            self,
+            event_message: Mapping[str, Any],
+            order_message: Mapping[str, Any],
+            tracked_order: InFlightOrder,
+    ) -> Tuple[Optional[TradeUpdate], OrderUpdate]:
+        client_order_id = validate_binance_client_order_id(order_message.get("c"))
+        if client_order_id != tracked_order.client_order_id:
+            raise BinancePerpetualOrderDataError("user stream client order ID is contradictory")
+
+        exchange_order_id = self._validated_non_negative_integer_string(
+            order_message.get("i"),
+            "user stream exchange order ID",
+        )
+        if (
+            tracked_order.exchange_order_id is not None
+            and exchange_order_id != tracked_order.exchange_order_id
+        ):
+            raise BinancePerpetualOrderDataError("user stream exchange order ID is contradictory")
+
+        expected_symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
+        if order_message.get("s") not in {expected_symbol, tracked_order.trading_pair}:
+            raise BinancePerpetualOrderDataError("user stream symbol is contradictory")
+        expected_side = "BUY" if tracked_order.trade_type is TradeType.BUY else "SELL"
+        if order_message.get("S") != expected_side:
+            raise BinancePerpetualOrderDataError("user stream side is contradictory")
+        expected_order_type = "MARKET" if tracked_order.order_type is OrderType.MARKET else "LIMIT"
+        if order_message.get("o") != expected_order_type:
+            raise BinancePerpetualOrderDataError("user stream order type is contradictory")
+
+        original_quantity = self._validated_finite_decimal(
+            order_message.get("q"),
+            "user stream order quantity",
+        )
+        if original_quantity != tracked_order.amount:
+            raise BinancePerpetualOrderDataError("user stream order quantity is contradictory")
+        if tracked_order.order_type.is_limit_type():
+            order_price = self._validated_finite_decimal(
+                order_message.get("p"),
+                "user stream order price",
+            )
+            if order_price != tracked_order.price:
+                raise BinancePerpetualOrderDataError("user stream order price is contradictory")
+
+        raw_status = order_message.get("X")
+        if not isinstance(raw_status, str) or raw_status not in CONSTANTS.ORDER_STATE:
+            raise BinancePerpetualOrderDataError("user stream order status is unsupported")
+        event_timestamp_ms = int(self._validated_non_negative_integer_string(
+            event_message.get("T"),
+            "user stream event timestamp",
+        ))
+        trade_id = self._validated_non_negative_integer_string(
+            order_message.get("t"),
+            "user stream trade ID",
+        )
+
+        trade_update = None
+        if trade_id != "0":
+            fill_timestamp_ms = int(self._validated_non_negative_integer_string(
+                order_message.get("T"),
+                "user stream fill timestamp",
+            ))
+            fill_price = self._validated_finite_decimal(
+                order_message.get("L"),
+                "user stream fill price",
+            )
+            fill_base_amount = self._validated_finite_decimal(
+                order_message.get("l"),
+                "user stream fill quantity",
+            )
+            if fill_price <= 0 or fill_base_amount <= 0:
+                raise BinancePerpetualOrderDataError(
+                    "user stream fill price and quantity must be positive"
+                )
+            fee_amount = self._validated_finite_decimal(
+                order_message.get("n", "0"),
+                "user stream fee amount",
+            )
+            if fee_amount < 0:
+                raise BinancePerpetualOrderDataError("user stream fee amount must be non-negative")
+            fee_asset = order_message.get("N") or tracked_order.quote_asset
+            if not isinstance(fee_asset, str) or fee_asset == "":
+                raise BinancePerpetualOrderDataError("user stream fee asset must be a string")
+            position_side = order_message.get("ps", "LONG")
+            if position_side not in {"BOTH", "LONG", "SHORT"}:
+                raise BinancePerpetualOrderDataError("user stream position side is unsupported")
+            position_action = (
+                PositionAction.OPEN
+                if (
+                    tracked_order.trade_type is TradeType.BUY and position_side == "LONG"
+                    or tracked_order.trade_type is TradeType.SELL and position_side == "SHORT"
+                )
+                else PositionAction.CLOSE
+            )
+            flat_fees = [] if fee_amount == Decimal("0") else [
+                TokenAmount(amount=fee_amount, token=fee_asset)
+            ]
+            fee = TradeFeeBase.new_perpetual_fee(
+                fee_schema=self.trade_fee_schema(),
+                position_action=position_action,
+                percent_token=fee_asset,
+                flat_fees=flat_fees,
+            )
+            trade_update = TradeUpdate(
+                trade_id=trade_id,
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                fill_timestamp=fill_timestamp_ms * 1e-3,
+                fill_price=fill_price,
+                fill_base_amount=fill_base_amount,
+                fill_quote_amount=fill_price * fill_base_amount,
+                fee=fee,
+            )
+
+        order_update = OrderUpdate(
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=event_timestamp_ms * 1e-3,
+            new_state=CONSTANTS.ORDER_STATE[raw_status],
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+        )
+        return trade_update, order_update
+
     async def _process_user_stream_event(self, event_message: Dict[str, Any]):
         event_type = event_message.get("e")
         if event_type == "ORDER_TRADE_UPDATE":
             order_message = event_message.get("o")
+            if not isinstance(order_message, Mapping):
+                raise BinancePerpetualOrderDataError("user stream order update must be an object")
             client_order_id = order_message.get("c", None)
-            self._unknown_submission_order_ids.discard(client_order_id)
+            if self.is_order_submission_unknown(client_order_id):
+                tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                if tracked_order is None:
+                    return
+                trade_update, order_update = await self._validated_unknown_user_stream_updates(
+                    event_message=event_message,
+                    order_message=order_message,
+                    tracked_order=tracked_order,
+                )
+                if trade_update is not None:
+                    self._order_tracker.process_trade_update(trade_update)
+                await self._order_tracker.process_order_update(order_update)
+                self._resolve_order_submission_unknown(client_order_id)
+                return
             tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
             if tracked_order is not None:
                 trade_id: str = str(order_message["t"])
@@ -1434,43 +1720,98 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         current_tick = int(self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
         if current_tick > last_tick and len(self._order_tracker.active_orders) > 0:
             tracked_orders = list(self._order_tracker.active_orders.values())
+            exchange_symbols = [
+                await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+                for order in tracked_orders
+            ]
             tasks = [
                 self._api_get(
                     path_url=CONSTANTS.ORDER_URL,
                     params={
-                        "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
+                        "symbol": exchange_symbol,
                         "origClientOrderId": order.client_order_id
                     },
                     is_auth_required=True,
                     return_err=True,
+                    limit_id=CONSTANTS.GET_ORDER_LIMIT_ID,
                 )
-                for order in tracked_orders
+                for order, exchange_symbol in zip(tracked_orders, exchange_symbols)
             ]
             self.logger().debug(f"Polling for order status updates of {len(tasks)} orders.")
             results = await safe_gather(*tasks, return_exceptions=True)
 
-            for order_update, tracked_order in zip(results, tracked_orders):
+            for order_update, tracked_order, exchange_symbol in zip(
+                    results,
+                    tracked_orders,
+                    exchange_symbols,
+            ):
                 client_order_id = tracked_order.client_order_id
                 if client_order_id not in self._order_tracker.all_orders:
                     continue
-                if isinstance(order_update, Exception) or "code" in order_update:
-                    if not isinstance(order_update, Exception) and \
-                            (order_update["code"] == -2013 or order_update["msg"] == "Order does not exist."):
+                if isinstance(order_update, asyncio.CancelledError):
+                    raise order_update
+                if isinstance(order_update, BaseException):
+                    if not isinstance(order_update, Exception):
+                        raise order_update
+                    self.logger().network(
+                        f"Error fetching status update for order {client_order_id}."
+                    )
+                    continue
+                if not isinstance(order_update, Mapping):
+                    self.logger().network(
+                        f"Malformed status update for order {client_order_id}."
+                    )
+                    continue
+                if "code" in order_update:
+                    is_not_found = (
+                        order_update.get("code") == CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE
+                        or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(order_update.get("msg", ""))
+                    )
+                    if is_not_found and self.is_order_submission_unknown(client_order_id):
+                        self.logger().debug(
+                            f"Order {client_order_id} remains submission-unknown after status NOT_FOUND."
+                        )
+                    elif is_not_found:
                         await self._order_tracker.process_order_not_found(client_order_id)
                     else:
                         self.logger().network(
-                            f"Error fetching status update for the order {client_order_id}: " f"{order_update}."
+                            f"Exchange rejected the status request for order {client_order_id}."
                         )
                     continue
 
-                new_order_update: OrderUpdate = OrderUpdate(
-                    trading_pair=await self.trading_pair_associated_to_exchange_symbol(order_update['symbol']),
-                    update_timestamp=order_update["updateTime"] * 1e-3,
-                    new_state=CONSTANTS.ORDER_STATE[order_update["status"]],
-                    client_order_id=order_update["clientOrderId"],
-                    exchange_order_id=order_update["orderId"],
-                )
+                if self.is_order_submission_unknown(client_order_id):
+                    try:
+                        snapshot = BinancePerpetualOrderSnapshot.from_payload(
+                            payload=order_update,
+                            expected_symbol=exchange_symbol,
+                            trading_pair=tracked_order.trading_pair,
+                            expected_client_order_id=client_order_id,
+                            data_time=self.current_timestamp,
+                        )
+                        await self._apply_authoritative_order_snapshot(snapshot)
+                    except asyncio.CancelledError:
+                        raise
+                    except BinancePerpetualOrderDataError:
+                        self.logger().network(
+                            f"Malformed authoritative status update for order {client_order_id}."
+                        )
+                    continue
 
+                try:
+                    new_order_update = OrderUpdate(
+                        trading_pair=await self.trading_pair_associated_to_exchange_symbol(order_update["symbol"]),
+                        update_timestamp=order_update["updateTime"] * 1e-3,
+                        new_state=CONSTANTS.ORDER_STATE[order_update["status"]],
+                        client_order_id=order_update["clientOrderId"],
+                        exchange_order_id=order_update["orderId"],
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (KeyError, TypeError, ValueError):
+                    self.logger().network(
+                        f"Malformed status update for order {client_order_id}."
+                    )
+                    continue
                 self._order_tracker.process_order_update(new_order_update)
 
     async def _fetch_account_position_mode(self) -> Optional[PositionMode]:
