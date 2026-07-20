@@ -288,6 +288,17 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         position = replace(position, notional=notional)
         return instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets
 
+    @classmethod
+    def _bundle_with_consistent_position_notional(
+            cls,
+            bundle: Tuple[Any, ...],
+            notional: Decimal,
+    ) -> Tuple[Any, ...]:
+        result = cls._bundle_with_notional(bundle, notional)
+        position = result[2]
+        mark_price = abs(notional / position.position_amount)
+        return result[0], result[1], replace(position, mark_price=mark_price), *result[3:]
+
     def _configure_preflight_sources(
             self,
             exchange: BinancePerpetualDerivative,
@@ -708,7 +719,7 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
             ),
             (
                 "exact cap enters next bracket",
-                self._bundle_with_notional(base, Decimal("1500")),
+                self._bundle_with_consistent_position_notional(base, Decimal("1500")),
                 "leverage",
             ),
         )
@@ -723,7 +734,7 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
                         max_age_seconds=5,
                     )
 
-        allowed_boundary = self._bundle_with_notional(base, Decimal("1500"))
+        allowed_boundary = self._bundle_with_consistent_position_notional(base, Decimal("1500"))
         allowed_boundary = (
             allowed_boundary[0],
             allowed_boundary[1],
@@ -742,7 +753,7 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
             max_age_seconds=5,
         )
 
-        last_cap = self._bundle_with_notional(allowed_boundary, Decimal("7500"))
+        last_cap = self._bundle_with_consistent_position_notional(allowed_boundary, Decimal("7500"))
         exchange = self._new_exchange()
         self._configure_preflight_sources(exchange, last_cap)
         with self.assertRaisesRegex(BinancePerpetualPreflightError, "outside leverage brackets"):
