@@ -493,6 +493,13 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                     trade_update.fill_price,
                     trade_update.fill_base_amount,
                     trade_update.fill_quote_amount,
+                    type(trade_update.fee).__name__,
+                    trade_update.fee.percent,
+                    trade_update.fee.percent_token,
+                    tuple(
+                        (flat_fee.token, flat_fee.amount)
+                        for flat_fee in trade_update.fee.flat_fees
+                    ),
                 )
                 for trade_id, trade_update in tracked_order.order_fills.items()
             ),
@@ -3261,6 +3268,37 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderState.CANCELED, expired_order.current_state)
         self.assertFalse(self.exchange.is_order_submission_unknown(expired_id))
 
+    async def test_submission_unknown_stream_valid_fill_publishes_once_wakes_waiter_and_deduplicates(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "exec-sndk-snxx-0088-stock-0"
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        fill_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFilled, fill_logger)
+        completion_waiter = asyncio.create_task(tracked_order.wait_until_completely_filled())
+        await asyncio.sleep(0)
+        event = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="FILLED",
+            last_fill_quantity="1.250",
+            cumulative_quantity="1.250",
+            trade_id=1,
+        )
+
+        await self.exchange._process_user_stream_event(event)
+        await asyncio.wait_for(completion_waiter, timeout=1)
+        committed_snapshot = self._submission_unknown_mutation_snapshot(tracked_order)
+
+        self.assertEqual(1, len(fill_logger.event_log))
+        self.assertEqual("1", fill_logger.event_log[0].exchange_trade_id)
+        self.assertTrue(tracked_order.completely_filled_event.is_set())
+        self.assertEqual(OrderState.FILLED, tracked_order.current_state)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+
+        await self.exchange._process_user_stream_event(event)
+
+        self.assertEqual(committed_snapshot, self._submission_unknown_mutation_snapshot(tracked_order))
+        self.assertEqual(1, len(fill_logger.event_log))
+
     async def test_submission_unknown_stream_atomic_clears_only_after_tracker_success_and_propagates_cancel(self):
         self._simulate_trading_rules_initialized()
 
@@ -3708,22 +3746,109 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         )
         before = self._submission_unknown_mutation_snapshot(tracked_order)
 
-        def partially_mutate_then_fail(trade_update):
-            tracked_order.order_fills[trade_update.trade_id] = trade_update
-            tracked_order.executed_amount_base = trade_update.fill_base_amount
-            tracked_order.last_update_timestamp = trade_update.fill_timestamp
-            tracked_order.completely_filled_event.set()
+        def partially_mutate_then_fail(staged_order, trade_update):
+            staged_order.order_fills[trade_update.trade_id] = trade_update
+            staged_order.executed_amount_base = trade_update.fill_base_amount
+            staged_order.last_update_timestamp = trade_update.fill_timestamp
+            staged_order.completely_filled_event.set()
             raise Overflow("simulated tracker arithmetic failure")
 
         with patch.object(
-            tracked_order,
+            type(tracked_order),
             "update_with_trade_update",
-            side_effect=partially_mutate_then_fail,
+            new=partially_mutate_then_fail,
         ):
             with self.assertRaises(Overflow):
                 await self.exchange._process_user_stream_event(event)
 
         self.assertEqual(before, self._submission_unknown_mutation_snapshot(tracked_order))
+
+    async def test_submission_unknown_stream_failed_trade_application_is_not_observable(self):
+        self._simulate_trading_rules_initialized()
+        observations = []
+        cases = (
+            ("exception", Overflow, "Overflow"),
+            ("cancellation", asyncio.CancelledError, "CancelledError"),
+            ("mismatched totals", None, "BinancePerpetualOrderDataError"),
+        )
+
+        for index, (label, failure_type, expected_error_name) in enumerate(cases, start=118):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            first_partial = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity="0.250",
+                cumulative_quantity="0.250",
+                trade_id=1,
+            )
+            first_partial["o"]["n"] = "0.010"
+            await self.exchange._process_user_stream_event(first_partial)
+            self.exchange._unknown_submission_order_ids.add(client_order_id)
+            final_fill = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="FILLED",
+                last_fill_quantity="1.000",
+                cumulative_quantity="1.250",
+                trade_id=2,
+            )
+            before = self._submission_unknown_mutation_snapshot(tracked_order)
+            fill_logger = EventLogger()
+            self.exchange.add_listener(MarketEvent.OrderFilled, fill_logger)
+            completion_waiter = asyncio.create_task(tracked_order.wait_until_completely_filled())
+            await asyncio.sleep(0)
+
+            def mutate_before_failure(staged_order, trade_update):
+                staged_order.order_fills["1"].fee.flat_fees.append(
+                    TokenAmount(token=self.quote_asset, amount=Decimal("99"))
+                )
+                staged_order.order_fills[trade_update.trade_id] = trade_update
+                staged_order.executed_amount_base += trade_update.fill_base_amount
+                staged_order.executed_amount_quote += trade_update.fill_quote_amount
+                if failure_type is None:
+                    staged_order.executed_amount_quote += Decimal("1")
+                staged_order.last_update_timestamp = trade_update.fill_timestamp
+                staged_order.check_filled_condition()
+                if failure_type is not None:
+                    raise failure_type("simulated staged update failure")
+                return True
+
+            error_name = None
+            with patch.object(
+                type(tracked_order),
+                "update_with_trade_update",
+                new=mutate_before_failure,
+            ):
+                try:
+                    await self.exchange._process_user_stream_event(final_fill)
+                except BaseException as error:
+                    error_name = type(error).__name__
+            await asyncio.sleep(0)
+            waiter_woke = completion_waiter.done() and not completion_waiter.cancelled()
+            observations.append((
+                label,
+                error_name,
+                before == self._submission_unknown_mutation_snapshot(tracked_order),
+                len(fill_logger.event_log),
+                waiter_woke,
+                len(tracked_order.order_fills["1"].fee.flat_fees),
+                self.exchange.is_order_submission_unknown(client_order_id),
+            ))
+            self.exchange.remove_listener(MarketEvent.OrderFilled, fill_logger)
+            if completion_waiter.done():
+                await completion_waiter
+            else:
+                completion_waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await completion_waiter
+
+        self.assertEqual(
+            [
+                (label, expected_error_name, True, 0, False, 1, True)
+                for label, _, expected_error_name in cases
+            ],
+            observations,
+        )
 
     async def test_submission_unknown_stream_precision_rejects_sub_tick_misaligned_and_unsupported_prices(self):
         self._simulate_trading_rules_initialized()

@@ -706,6 +706,116 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             order_filled_event.trade_fee, AddedToCostTradeFee(flat_fees=[TokenAmount(self.quote_asset, fee_paid)])
         )
 
+    def test_staged_trade_update_is_invisible_until_commit_and_duplicate_is_idempotent(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id="someClientOrderId",
+            exchange_order_id="someExchangeOrderId",
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            initial_state=OrderState.OPEN,
+        )
+        self.tracker.start_tracking_order(order)
+        trade_update: TradeUpdate = TradeUpdate(
+            trade_id=1,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fill_price=order.price,
+            fill_base_amount=order.amount,
+            fill_quote_amount=order.price * order.amount,
+            fee=AddedToCostTradeFee(
+                flat_fees=[TokenAmount(token=self.quote_asset, amount=Decimal("1"))]
+            ),
+            fill_timestamp=1,
+        )
+        completion_waiter = self.ev_loop.create_task(order.wait_until_completely_filled())
+        self.ev_loop.run_until_complete(asyncio.sleep(0))
+
+        staged_update = self.tracker.stage_trade_update(trade_update)
+        self.ev_loop.run_until_complete(asyncio.sleep(0))
+
+        self.assertIsNotNone(staged_update)
+        self.assertTrue(staged_update.updated)
+        self.assertEqual(order.amount, staged_update.staged_order.executed_amount_base)
+        self.assertTrue(staged_update.staged_order.completely_filled_event.is_set())
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
+        self.assertEqual({}, order.order_fills)
+        self.assertFalse(order.completely_filled_event.is_set())
+        self.assertFalse(completion_waiter.done())
+        self.assertEqual(0, len(self.order_filled_logger.event_log))
+
+        self.tracker.commit_trade_update(staged_update)
+        self.async_run_with_timeout(completion_waiter)
+
+        self.assertEqual(order.amount, order.executed_amount_base)
+        self.assertEqual(trade_update, order.order_fills[trade_update.trade_id])
+        self.assertTrue(order.completely_filled_event.is_set())
+        self.assertEqual(1, len(self.order_filled_logger.event_log))
+
+        duplicate = self.tracker.stage_trade_update(trade_update)
+        self.assertIsNotNone(duplicate)
+        self.assertFalse(duplicate.updated)
+        self.tracker.commit_trade_update(duplicate)
+
+        self.assertEqual(order.amount, order.executed_amount_base)
+        self.assertEqual(1, len(order.order_fills))
+        self.assertEqual(1, len(self.order_filled_logger.event_log))
+
+    def test_staged_trade_update_deeply_isolates_existing_fill_values_on_failure(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id="someClientOrderId",
+            exchange_order_id="someExchangeOrderId",
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            initial_state=OrderState.OPEN,
+        )
+        self.tracker.start_tracking_order(order)
+        first_update = TradeUpdate(
+            trade_id=1,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fill_price=order.price,
+            fill_base_amount=Decimal("100"),
+            fill_quote_amount=Decimal("100"),
+            fee=AddedToCostTradeFee(
+                flat_fees=[TokenAmount(token=self.quote_asset, amount=Decimal("0.1"))]
+            ),
+            fill_timestamp=1,
+        )
+        self.tracker.process_trade_update(first_update)
+        self.order_filled_logger.event_log.clear()
+        second_update = first_update._replace(
+            trade_id=2,
+            fill_timestamp=2,
+        )
+
+        def mutate_nested_fee_then_fail(staged_order: InFlightOrder, trade_update: TradeUpdate):
+            staged_order.order_fills[first_update.trade_id].fee.flat_fees.append(
+                TokenAmount(token=self.quote_asset, amount=Decimal("99"))
+            )
+            raise RuntimeError("simulated staged update failure")
+
+        with patch.object(InFlightOrder, "update_with_trade_update", new=mutate_nested_fee_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "simulated staged update failure"):
+                self.tracker.stage_trade_update(second_update)
+
+        self.assertEqual(
+            [TokenAmount(token=self.quote_asset, amount=Decimal("0.1"))],
+            order.order_fills[first_update.trade_id].fee.flat_fees,
+        )
+        self.assertEqual(Decimal("100"), order.executed_amount_base)
+        self.assertEqual(1, len(order.order_fills))
+        self.assertEqual(0, len(self.order_filled_logger.event_log))
+
     def test_updating_order_states_with_both_process_order_update_and_process_trade_update(self):
         order: InFlightOrder = InFlightOrder(
             client_order_id="someClientOrderId",
