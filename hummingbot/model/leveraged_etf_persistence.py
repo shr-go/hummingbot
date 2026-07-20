@@ -635,6 +635,8 @@ def _is_atomic_sql_expression(tokens: Sequence[_SQLiteToken]) -> bool:
         return False
     if len(canonical) == 1:
         return canonical[0][0] in ("identifier", "number", "string")
+    if len(canonical) == 2 and canonical[0] in (("symbol", "+"), ("symbol", "-")) and canonical[1][0] == "number":
+        return True
     if len(canonical) >= 3 and all(
         token[0] == "identifier" if index % 2 == 0 else token == ("symbol", ".")
         for index, token in enumerate(canonical)
