@@ -362,11 +362,14 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
         }
     )
 
-    assert repository.append_and_reduce(
-        initial.executor_id,
-        duplicate_fill,
-        _snapshot_at(filled_snapshot, 3),
-    ) == committed
+    assert (
+        repository.append_and_reduce(
+            initial.executor_id,
+            duplicate_fill,
+            _snapshot_at(filled_snapshot, 3),
+        )
+        == committed
+    )
     assert repository.load_snapshot(initial.executor_id) == filled_snapshot
     assert tuple(event.sequence for event in repository.events(initial.executor_id)) == (1, 2)
 
