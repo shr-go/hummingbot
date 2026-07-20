@@ -1,4 +1,6 @@
-from typing import Dict, Mapping, Tuple
+import sqlite3
+from collections import Counter
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from sqlalchemy import (
     DDL,
@@ -15,7 +17,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import Connection
-from sqlalchemy.schema import Table
+from sqlalchemy.schema import CreateIndex, CreateTable, Table
 
 from hummingbot.model import HummingbotBase
 
@@ -23,36 +25,36 @@ from hummingbot.model import HummingbotBase
 def _sha256_check(column_name: str) -> str:
     return (
         f"typeof({column_name}) = 'text' "
+        f"AND instr({column_name}, char(0)) = 0 "
         f"AND length({column_name}) = 64 "
-        f"AND length(CAST({column_name} AS BLOB)) = 64 "
         f"AND {column_name} = lower({column_name}) "
-        f"AND {column_name} NOT GLOB '*[^0-9a-f]*'"
+        f"AND {column_name} NOT GLOB '*[^0123456789abcdef]*'"
     )
 
 
 def _canonical_nonnegative_decimal_check(column_name: str) -> str:
     return f"""
         typeof({column_name}) = 'text'
-        AND length({column_name}) = length(CAST({column_name} AS BLOB))
+        AND instr({column_name}, char(0)) = 0
         AND (
             {column_name} = '0' OR (
                 length({column_name}) > 0
-                AND {column_name} NOT GLOB '*[^0-9.]*'
+                AND {column_name} NOT GLOB '*[^0123456789.]*'
                 AND length({column_name}) - length(replace({column_name}, '.', '')) <= 1
                 AND (
                     (
                         instr({column_name}, '.') = 0
-                        AND substr({column_name}, 1, 1) GLOB '[1-9]'
+                        AND substr({column_name}, 1, 1) GLOB '[123456789]'
                     ) OR (
                         instr({column_name}, '.') > 0
                         AND instr({column_name}, '.') < length({column_name})
                         AND (
                             substr({column_name}, 1, instr({column_name}, '.') - 1) = '0'
-                            OR substr({column_name}, 1, 1) GLOB '[1-9]'
+                            OR substr({column_name}, 1, 1) GLOB '[123456789]'
                         )
                         AND substr({column_name}, instr({column_name}, '.') + 1)
-                            NOT GLOB '*[^0-9]*'
-                        AND substr({column_name}, -1, 1) GLOB '[1-9]'
+                            NOT GLOB '*[^0123456789]*'
+                        AND substr({column_name}, -1, 1) GLOB '[123456789]'
                     )
                 )
             )
@@ -491,63 +493,56 @@ for table in LEVERAGED_ETF_PERSISTENCE_TABLES:
             event.listen(table, "after_create", DDL(statement).execute_if(dialect="sqlite"))
 
 
-def _has_redundant_outer_parentheses(expression: str) -> bool:
-    if len(expression) < 2 or expression[0] != "(" or expression[-1] != ")":
-        return False
-
-    depth = 0
-    in_string = False
-    cursor = 0
-    while cursor < len(expression):
-        character = expression[cursor]
-        if in_string:
-            if character == "'":
-                if cursor + 1 < len(expression) and expression[cursor + 1] == "'":
-                    cursor += 2
-                    continue
-                in_string = False
-        elif character == "'":
-            in_string = True
-        elif character == "(":
-            depth += 1
-        elif character == ")":
-            depth -= 1
-            if depth == 0 and cursor != len(expression) - 1:
-                return False
-        cursor += 1
-    return depth == 0 and not in_string
+class _SQLiteToken(NamedTuple):
+    kind: str
+    value: str
 
 
-def _normalize_sql(expression: object) -> str:
-    """Canonicalize SQLite syntax while preserving string-literal semantics."""
+CanonicalSql = Tuple[Tuple[str, str], ...]
+
+
+def _sqlite_tokens(expression: object) -> Tuple[_SQLiteToken, ...]:
+    """Tokenize the SQLite DDL subset used by the persistence schema."""
 
     source = str(expression)
-    normalized = []
+    tokens: List[_SQLiteToken] = []
     cursor = 0
     while cursor < len(source):
         character = source[cursor]
         if character.isspace():
             cursor += 1
             continue
+        if source.startswith("--", cursor):
+            newline_at = source.find("\n", cursor + 2)
+            cursor = len(source) if newline_at < 0 else newline_at + 1
+            continue
+        if source.startswith("/*", cursor):
+            closing_at = source.find("*/", cursor + 2)
+            if closing_at < 0:
+                raise RuntimeError("unterminated SQLite block comment")
+            cursor = closing_at + 2
+            continue
         if character == "'":
-            literal = [character]
             cursor += 1
+            literal: List[str] = []
             while cursor < len(source):
-                literal.append(source[cursor])
                 if source[cursor] == "'":
                     if cursor + 1 < len(source) and source[cursor + 1] == "'":
-                        literal.append(source[cursor + 1])
+                        literal.append("'")
                         cursor += 2
                         continue
                     cursor += 1
                     break
+                literal.append(source[cursor])
                 cursor += 1
-            normalized.extend(literal)
+            else:
+                raise RuntimeError("unterminated SQLite string literal")
+            tokens.append(_SQLiteToken("string", "".join(literal)))
             continue
         if character in ('"', "`", "["):
             closing_quote = "]" if character == "[" else character
             cursor += 1
-            identifier = []
+            identifier: List[str] = []
             while cursor < len(source):
                 if source[cursor] == closing_quote:
                     if cursor + 1 < len(source) and source[cursor + 1] == closing_quote:
@@ -558,27 +553,137 @@ def _normalize_sql(expression: object) -> str:
                     break
                 identifier.append(source[cursor])
                 cursor += 1
-            normalized.extend("".join(identifier).lower())
+            else:
+                raise RuntimeError("unterminated SQLite quoted identifier")
+            tokens.append(_SQLiteToken("quoted_identifier", "".join(identifier).lower()))
+            continue
+        if character.isalpha() or character == "_" or ord(character) >= 128:
+            start = cursor
+            cursor += 1
+            while cursor < len(source):
+                candidate = source[cursor]
+                if not (candidate.isalnum() or candidate in ("_", "$") or ord(candidate) >= 128):
+                    break
+                cursor += 1
+            tokens.append(_SQLiteToken("word", source[start:cursor].lower()))
+            continue
+        if character.isdigit():
+            start = cursor
+            cursor += 1
+            while cursor < len(source) and (source[cursor].isalnum() or source[cursor] in (".", "_")):
+                cursor += 1
+            tokens.append(_SQLiteToken("number", source[start:cursor].lower()))
             continue
         if source.startswith("==", cursor):
-            normalized.append("=")
+            tokens.append(_SQLiteToken("symbol", "="))
             cursor += 2
             continue
         if source.startswith("!=", cursor):
-            normalized.append("<>")
+            tokens.append(_SQLiteToken("symbol", "<>"))
             cursor += 2
             continue
-        normalized.append(character.lower())
+        matched_operator = next(
+            (
+                operator
+                for operator in ("->>", "<=", ">=", "<>", "||", "<<", ">>", "->")
+                if source.startswith(operator, cursor)
+            ),
+            None,
+        )
+        if matched_operator is not None:
+            tokens.append(_SQLiteToken("symbol", matched_operator.lower()))
+            cursor += len(matched_operator)
+            continue
+        tokens.append(_SQLiteToken("symbol", character.lower()))
         cursor += 1
-
-    normalized_sql = "".join(normalized)
-    while _has_redundant_outer_parentheses(normalized_sql):
-        normalized_sql = normalized_sql[1:-1]
-    return normalized_sql
+    return tuple(tokens)
 
 
-def _normalize_trigger_sql(expression: object) -> str:
-    return _normalize_sql(expression).replace("ifnotexists", "").rstrip(";")
+def _token_is_identifier(token: _SQLiteToken) -> bool:
+    return token.kind in ("word", "quoted_identifier")
+
+
+def _has_redundant_outer_parentheses(tokens: Sequence[Tuple[str, str]]) -> bool:
+    if len(tokens) < 2 or tokens[0] != ("symbol", "(") or tokens[-1] != ("symbol", ")"):
+        return False
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token == ("symbol", "("):
+            depth += 1
+        elif token == ("symbol", ")"):
+            depth -= 1
+            if depth < 0 or (depth == 0 and index != len(tokens) - 1):
+                return False
+    return depth == 0
+
+
+def _canonicalize_sql_tokens(tokens: Sequence[_SQLiteToken]) -> CanonicalSql:
+    canonical: List[Tuple[str, str]] = []
+    for token in tokens:
+        if token.kind in ("word", "quoted_identifier"):
+            canonical.append(("identifier", token.value.lower()))
+        else:
+            canonical.append((token.kind, token.value))
+    while _has_redundant_outer_parentheses(canonical):
+        canonical = canonical[1:-1]
+    return tuple(canonical)
+
+
+def _normalize_sql(expression: object) -> CanonicalSql:
+    """Canonicalize SQLite syntax while preserving literal and identifier boundaries."""
+
+    return _canonicalize_sql_tokens(_sqlite_tokens(expression))
+
+
+def _normalize_trigger_sql(expression: object) -> CanonicalSql:
+    tokens = list(_sqlite_tokens(expression))
+    while tokens and tokens[-1] == _SQLiteToken("symbol", ";"):
+        tokens.pop()
+    if not tokens or tokens[0] != _SQLiteToken("word", "create"):
+        raise RuntimeError("malformed SQLite CREATE TRIGGER statement")
+    cursor = 1
+    if (
+        cursor < len(tokens)
+        and tokens[cursor].kind == "word"
+        and tokens[cursor].value
+        in (
+            "temp",
+            "temporary",
+        )
+    ):
+        cursor += 1
+    if cursor >= len(tokens) or tokens[cursor] != _SQLiteToken("word", "trigger"):
+        raise RuntimeError("malformed SQLite CREATE TRIGGER statement")
+    optional_clause_at = cursor + 1
+    if tuple(tokens[optional_clause_at : optional_clause_at + 3]) == (
+        _SQLiteToken("word", "if"),
+        _SQLiteToken("word", "not"),
+        _SQLiteToken("word", "exists"),
+    ):
+        del tokens[optional_clause_at : optional_clause_at + 3]
+    return _canonicalize_sql_tokens(tokens)
+
+
+def _sqlite_trigger_target(expression: object) -> str:
+    tokens = _sqlite_tokens(expression)
+    begin_at = next(
+        (index for index, token in enumerate(tokens) if token == _SQLiteToken("word", "begin")),
+        len(tokens),
+    )
+    on_at = next(
+        (index for index, token in enumerate(tokens[:begin_at]) if token == _SQLiteToken("word", "on")),
+        -1,
+    )
+    if on_at < 0 or on_at + 1 >= begin_at or not _token_is_identifier(tokens[on_at + 1]):
+        raise RuntimeError("malformed SQLite trigger target")
+    target_at = on_at + 1
+    if (
+        target_at + 2 < begin_at
+        and tokens[target_at + 1] == _SQLiteToken("symbol", ".")
+        and _token_is_identifier(tokens[target_at + 2])
+    ):
+        target_at += 2
+    return tokens[target_at].value.lower()
 
 
 def _normalize_foreign_key_options(options: Mapping[str, object]) -> Tuple[Tuple[str, str], ...]:
@@ -598,109 +703,327 @@ def _normalize_foreign_key_options(options: Mapping[str, object]) -> Tuple[Tuple
     return tuple(sorted(normalized))
 
 
-def _find_unquoted_sql_keyword(source: str, keyword: str, start: int) -> int:
-    upper_keyword = keyword.upper()
-    cursor = start
-    while cursor < len(source):
-        character = source[cursor]
-        if character in ("'", '"', "`", "["):
-            closing_quote = "]" if character == "[" else character
-            cursor += 1
-            while cursor < len(source):
-                if source[cursor] == closing_quote:
-                    if cursor + 1 < len(source) and source[cursor + 1] == closing_quote:
-                        cursor += 2
-                        continue
-                    cursor += 1
-                    break
-                cursor += 1
-            continue
-        candidate = source[cursor : cursor + len(keyword)]
-        preceding = source[cursor - 1] if cursor > 0 else ""
-        following_at = cursor + len(keyword)
-        following = source[following_at] if following_at < len(source) else ""
-        if (
-            candidate.upper() == upper_keyword
-            and not (preceding.isalnum() or preceding == "_")
-            and not (following.isalnum() or following == "_")
-        ):
-            return cursor
-        cursor += 1
-    return -1
-
-
-def _extract_parenthesized_sql(source: str, opening_at: int) -> Tuple[str, int]:
+def _extract_parenthesized_tokens(
+    tokens: Sequence[_SQLiteToken], opening_at: int
+) -> Tuple[Tuple[_SQLiteToken, ...], int]:
+    if opening_at >= len(tokens) or tokens[opening_at] != _SQLiteToken("symbol", "("):
+        raise RuntimeError("malformed SQLite parenthesized expression")
     depth = 0
-    string_quote = None
     cursor = opening_at
-    while cursor < len(source):
-        character = source[cursor]
-        if string_quote is not None:
-            if character == string_quote:
-                if cursor + 1 < len(source) and source[cursor + 1] == string_quote:
-                    cursor += 2
-                    continue
-                string_quote = None
-        elif character in ("'", '"', "`"):
-            string_quote = character
-        elif character == "[":
-            string_quote = "]"
-        elif character == "(":
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == _SQLiteToken("symbol", "("):
             depth += 1
-        elif character == ")":
+        elif token == _SQLiteToken("symbol", ")"):
             depth -= 1
             if depth == 0:
-                return source[opening_at + 1 : cursor], cursor + 1
+                return tuple(tokens[opening_at + 1 : cursor]), cursor + 1
+            if depth < 0:
+                break
         cursor += 1
-    raise RuntimeError("malformed SQLite CHECK constraint")
+    raise RuntimeError("malformed SQLite parenthesized expression")
 
 
-def _sqlite_check_expressions(connection: Connection, table_name: str) -> Tuple[str, ...]:
+def _split_top_level_tokens(tokens: Sequence[_SQLiteToken]) -> Tuple[Tuple[_SQLiteToken, ...], ...]:
+    segments: List[Tuple[_SQLiteToken, ...]] = []
+    start = 0
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token == _SQLiteToken("symbol", "("):
+            depth += 1
+        elif token == _SQLiteToken("symbol", ")"):
+            depth -= 1
+            if depth < 0:
+                raise RuntimeError("malformed SQLite expression list")
+        elif token == _SQLiteToken("symbol", ",") and depth == 0:
+            segments.append(tuple(tokens[start:index]))
+            start = index + 1
+    if depth != 0:
+        raise RuntimeError("malformed SQLite expression list")
+    segments.append(tuple(tokens[start:]))
+    return tuple(segments)
+
+
+def _sqlite_check_expressions(connection: Connection, table_name: str) -> Tuple[CanonicalSql, ...]:
     """Return every CHECK expression, including unnamed and nested constraints."""
 
     create_sql = connection.execute(
         text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :table_name"),
         {"table_name": table_name},
     ).scalar_one()
-    expressions = []
+    tokens = _sqlite_tokens(create_sql)
+    expressions: List[CanonicalSql] = []
     search_from = 0
-    while True:
-        check_at = _find_unquoted_sql_keyword(create_sql, "CHECK", search_from)
+    while search_from < len(tokens):
+        check_at = next(
+            (index for index in range(search_from, len(tokens)) if tokens[index] == _SQLiteToken("word", "check")),
+            -1,
+        )
         if check_at < 0:
             break
-        opening_at = create_sql.find("(", check_at + len("CHECK"))
-        if opening_at < 0:
+        opening_at = check_at + 1
+        if opening_at >= len(tokens) or tokens[opening_at] != _SQLiteToken("symbol", "("):
             raise RuntimeError(f"malformed SQLite CHECK constraint on {table_name}")
-        expression, search_from = _extract_parenthesized_sql(create_sql, opening_at)
-        expressions.append(expression)
+        expression, search_from = _extract_parenthesized_tokens(tokens, opening_at)
+        expressions.append(_canonicalize_sql_tokens(expression))
     return tuple(expressions)
+
+
+def _normalized_declared_type(value: object) -> str:
+    return " ".join(str(value).strip().upper().split())
+
+
+def _sqlite_column_collations(create_sql: object, column_names: Sequence[str]) -> Dict[str, str]:
+    tokens = _sqlite_tokens(create_sql)
+    opening_at = next(
+        (index for index, token in enumerate(tokens) if token == _SQLiteToken("symbol", "(")),
+        -1,
+    )
+    if opening_at < 0:
+        raise RuntimeError("malformed SQLite CREATE TABLE statement")
+    table_body, _ = _extract_parenthesized_tokens(tokens, opening_at)
+    expected_names = {name.lower() for name in column_names}
+    collations: Dict[str, str] = {}
+    for segment in _split_top_level_tokens(table_body):
+        if not segment or not _token_is_identifier(segment[0]):
+            continue
+        column_name = segment[0].value.lower()
+        if column_name not in expected_names:
+            continue
+        depth = 0
+        declared_collations: List[str] = []
+        for index, token in enumerate(segment[1:], start=1):
+            if token == _SQLiteToken("symbol", "("):
+                depth += 1
+            elif token == _SQLiteToken("symbol", ")"):
+                depth -= 1
+            elif depth == 0 and token == _SQLiteToken("word", "collate"):
+                if index + 1 >= len(segment) or not _token_is_identifier(segment[index + 1]):
+                    raise RuntimeError(f"malformed SQLite COLLATE clause for {column_name}")
+                declared_collations.append(segment[index + 1].value.lower())
+        if depth != 0 or len(declared_collations) > 1:
+            raise RuntimeError(f"malformed SQLite column definition for {column_name}")
+        collations[column_name] = declared_collations[0] if declared_collations else "binary"
+    return collations
+
+
+def _sqlite_conflict_clauses(create_sql: object) -> Tuple[str, ...]:
+    tokens = _sqlite_tokens(create_sql)
+    clauses: List[str] = []
+    for index in range(len(tokens) - 2):
+        if tokens[index] == _SQLiteToken("word", "on") and tokens[index + 1] == _SQLiteToken("word", "conflict"):
+            resolution = tokens[index + 2]
+            if resolution.kind != "word" or resolution.value not in (
+                "rollback",
+                "abort",
+                "fail",
+                "ignore",
+                "replace",
+            ):
+                raise RuntimeError("malformed SQLite ON CONFLICT clause")
+            clauses.append(resolution.value)
+    return tuple(sorted(clauses))
+
+
+def _sqlite_table_options(create_sql: object) -> CanonicalSql:
+    tokens = _sqlite_tokens(create_sql)
+    opening_at = next(
+        (index for index, token in enumerate(tokens) if token == _SQLiteToken("symbol", "(")),
+        -1,
+    )
+    if opening_at < 0:
+        raise RuntimeError("malformed SQLite CREATE TABLE statement")
+    _, after_table_body = _extract_parenthesized_tokens(tokens, opening_at)
+    options = list(tokens[after_table_body:])
+    while options and options[-1] == _SQLiteToken("symbol", ";"):
+        options.pop()
+    return _canonicalize_sql_tokens(options)
+
+
+class _IndexSignature(NamedTuple):
+    unique: bool
+    origin: str
+    partial: bool
+    xinfo: Tuple[Tuple[int, int, Optional[str], bool, Optional[str], bool], ...]
+    definition: Optional[Tuple[str, Tuple[CanonicalSql, ...], CanonicalSql]]
+
+
+def _index_definition_signature(
+    create_sql: Optional[str],
+) -> Optional[Tuple[str, Tuple[CanonicalSql, ...], CanonicalSql]]:
+    if create_sql is None:
+        return None
+    tokens = _sqlite_tokens(create_sql)
+    on_at = next(
+        (index for index, token in enumerate(tokens) if token == _SQLiteToken("word", "on")),
+        -1,
+    )
+    if on_at < 0 or on_at + 1 >= len(tokens) or not _token_is_identifier(tokens[on_at + 1]):
+        raise RuntimeError("malformed SQLite CREATE INDEX statement")
+    target_at = on_at + 1
+    if (
+        target_at + 2 < len(tokens)
+        and tokens[target_at + 1] == _SQLiteToken("symbol", ".")
+        and _token_is_identifier(tokens[target_at + 2])
+    ):
+        target_at += 2
+    opening_at = target_at + 1
+    if opening_at >= len(tokens) or tokens[opening_at] != _SQLiteToken("symbol", "("):
+        raise RuntimeError("malformed SQLite CREATE INDEX key list")
+    key_tokens, after_keys = _extract_parenthesized_tokens(tokens, opening_at)
+    keys = tuple(_canonicalize_sql_tokens(key) for key in _split_top_level_tokens(key_tokens))
+    remainder = list(tokens[after_keys:])
+    while remainder and remainder[-1] == _SQLiteToken("symbol", ";"):
+        remainder.pop()
+    if remainder:
+        if remainder[0] != _SQLiteToken("word", "where"):
+            raise RuntimeError("malformed SQLite CREATE INDEX predicate")
+        predicate = _canonicalize_sql_tokens(remainder[1:])
+    else:
+        predicate = tuple()
+    return tokens[target_at].value.lower(), keys, predicate
+
+
+def _index_xinfo_signature(
+    rows: Sequence[Sequence[object]],
+) -> Tuple[Tuple[int, int, Optional[str], bool, Optional[str], bool], ...]:
+    return tuple(
+        (
+            int(row[0]),
+            int(row[1]),
+            None if row[2] is None else str(row[2]).lower(),
+            bool(row[3]),
+            None if row[4] is None else str(row[4]).lower(),
+            bool(row[5]),
+        )
+        for row in rows
+    )
+
+
+def _actual_index_catalog(connection: Connection, table_name: str) -> Dict[str, _IndexSignature]:
+    catalog: Dict[str, _IndexSignature] = {}
+    rows = connection.execute(
+        text('SELECT seq, name, "unique", origin, partial ' "FROM pragma_index_list(:table_name) ORDER BY seq"),
+        {"table_name": table_name},
+    ).fetchall()
+    for row in rows:
+        index_name = str(row[1])
+        xinfo_rows = connection.execute(
+            text('SELECT seqno, cid, name, "desc", coll, "key" ' "FROM pragma_index_xinfo(:index_name) ORDER BY seqno"),
+            {"index_name": index_name},
+        ).fetchall()
+        create_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = :index_name"),
+            {"index_name": index_name},
+        ).scalar_one_or_none()
+        catalog[index_name] = _IndexSignature(
+            unique=bool(row[2]),
+            origin=str(row[3]).lower(),
+            partial=bool(row[4]),
+            xinfo=_index_xinfo_signature(xinfo_rows),
+            definition=_index_definition_signature(create_sql),
+        )
+    return catalog
+
+
+def _expected_index_catalog(table: Table, dialect) -> Dict[str, _IndexSignature]:
+    database = sqlite3.connect(":memory:")
+    try:
+        database.execute(str(CreateTable(table).compile(dialect=dialect)))
+        for index in sorted(table.indexes, key=lambda candidate: candidate.name):
+            database.execute(str(CreateIndex(index).compile(dialect=dialect)))
+        catalog: Dict[str, _IndexSignature] = {}
+        rows = database.execute(
+            'SELECT seq, name, "unique", origin, partial FROM pragma_index_list(?) ORDER BY seq',
+            (table.name,),
+        ).fetchall()
+        for row in rows:
+            index_name = str(row[1])
+            xinfo_rows = database.execute(
+                'SELECT seqno, cid, name, "desc", coll, "key" ' "FROM pragma_index_xinfo(?) ORDER BY seqno",
+                (index_name,),
+            ).fetchall()
+            create_sql_row = database.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            create_sql = None if create_sql_row is None else create_sql_row[0]
+            catalog[index_name] = _IndexSignature(
+                unique=bool(row[2]),
+                origin=str(row[3]).lower(),
+                partial=bool(row[4]),
+                xinfo=_index_xinfo_signature(xinfo_rows),
+                definition=_index_definition_signature(create_sql),
+            )
+        return catalog
+    finally:
+        database.close()
 
 
 def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ...]:
     inspector = inspect(connection)
-    errors = []
-    actual_columns: Dict[str, Mapping[str, object]] = {
-        column["name"]: column for column in inspector.get_columns(table.name)
+    errors: List[str] = []
+    actual_column_rows = connection.execute(
+        text(
+            'SELECT cid, name, type, "notnull", dflt_value, pk, hidden '
+            "FROM pragma_table_xinfo(:table_name) ORDER BY cid"
+        ),
+        {"table_name": table.name},
+    ).fetchall()
+    actual_columns = {str(row[1]).lower(): row for row in actual_column_rows}
+    expected_columns = {column.name.lower(): column for column in table.columns}
+    actual_column_order = tuple(str(row[1]).lower() for row in actual_column_rows)
+    expected_column_order = tuple(column.name.lower() for column in table.columns)
+    if actual_column_order != expected_column_order:
+        errors.append(f"{table.name} column order {actual_column_order} expected {expected_column_order}")
+    expected_primary_key_positions = {
+        column.name.lower(): position for position, column in enumerate(table.primary_key.columns, start=1)
     }
-    expected_column_names = {column.name for column in table.columns}
     for expected in table.columns:
-        actual = actual_columns.get(expected.name)
+        actual = actual_columns.get(expected.name.lower())
         if actual is None:
             errors.append(f"{table.name}.{expected.name} is missing")
             continue
-        if bool(actual["nullable"]) != bool(expected.nullable):
+        actual_not_null = bool(actual[3])
+        expected_not_null = not bool(expected.nullable)
+        if actual_not_null != expected_not_null:
+            errors.append(f"{table.name}.{expected.name} notnull={actual_not_null} " f"expected {expected_not_null}")
+        actual_type = _normalized_declared_type(actual[2])
+        expected_type = _normalized_declared_type(expected.type.compile(dialect=connection.dialect))
+        if actual_type != expected_type:
+            errors.append(f"{table.name}.{expected.name} declared type {actual_type} expected {expected_type}")
+        actual_default = None if actual[4] is None else _normalize_sql(actual[4])
+        expected_default = None if expected.server_default is None else _normalize_sql(expected.server_default.arg)
+        if actual_default != expected_default:
+            errors.append(f"{table.name}.{expected.name} has an incompatible default")
+        actual_primary_key_position = int(actual[5])
+        expected_primary_key_position = expected_primary_key_positions.get(expected.name.lower(), 0)
+        if actual_primary_key_position != expected_primary_key_position:
             errors.append(
-                f"{table.name}.{expected.name} nullable={actual['nullable']} " f"expected {expected.nullable}"
+                f"{table.name}.{expected.name} primary-key position "
+                f"{actual_primary_key_position} expected {expected_primary_key_position}"
             )
-        if actual["type"]._type_affinity is not expected.type._type_affinity:
-            errors.append(
-                f"{table.name}.{expected.name} type affinity "
-                f"{actual['type']._type_affinity.__name__} expected {expected.type._type_affinity.__name__}"
-            )
-        if expected.server_default is None and actual.get("default") is not None:
-            errors.append(f"{table.name}.{expected.name} has an unexpected default")
-    for unexpected_column in sorted(set(actual_columns) - expected_column_names):
+        if int(actual[6]) != 0:
+            errors.append(f"{table.name}.{expected.name} is generated or hidden")
+    for unexpected_column in sorted(set(actual_columns) - set(expected_columns)):
         errors.append(f"{table.name}.{unexpected_column} is an unexpected column")
+
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :table_name"),
+        {"table_name": table.name},
+    ).scalar_one()
+    actual_collations = _sqlite_column_collations(create_sql, expected_column_order)
+    expected_create_sql = str(CreateTable(table).compile(dialect=connection.dialect))
+    expected_collations = _sqlite_column_collations(
+        expected_create_sql,
+        expected_column_order,
+    )
+    if actual_collations != expected_collations:
+        errors.append(f"{table.name} column collation set is incompatible")
+    if _sqlite_conflict_clauses(create_sql) != _sqlite_conflict_clauses(expected_create_sql):
+        errors.append(f"{table.name} ON CONFLICT behavior is incompatible")
+    if _sqlite_table_options(create_sql) != _sqlite_table_options(expected_create_sql):
+        errors.append(f"{table.name} rowid/strict table options are incompatible")
 
     expected_primary_key = tuple(column.name.lower() for column in table.primary_key.columns)
     actual_primary_key = tuple(
@@ -716,9 +1039,7 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
             if isinstance(constraint, CheckConstraint)
         )
     )
-    actual_checks = tuple(
-        sorted(_normalize_sql(sqltext) for sqltext in _sqlite_check_expressions(connection, table.name))
-    )
+    actual_checks = tuple(sorted(_sqlite_check_expressions(connection, table.name)))
     if actual_checks != expected_checks:
         errors.append(f"{table.name} CHECK constraint set is incompatible")
 
@@ -772,38 +1093,32 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
     if actual_foreign_keys != expected_foreign_keys:
         errors.append(f"{table.name} foreign key constraint set is incompatible")
 
-    expected_indexes = {index.name: index for index in table.indexes}
-    actual_indexes = {index["name"]: index for index in inspector.get_indexes(table.name)}
-    explicit_index_names = {
-        row[0]
-        for row in connection.execute(
-            text(
-                "SELECT name FROM sqlite_master " "WHERE type = 'index' AND tbl_name = :table_name AND sql IS NOT NULL"
-            ),
-            {"table_name": table.name},
-        )
+    expected_index_catalog = _expected_index_catalog(table, connection.dialect)
+    actual_index_catalog = _actual_index_catalog(connection, table.name)
+    expected_explicit_indexes = {
+        name: signature for name, signature in expected_index_catalog.items() if signature.origin == "c"
     }
-    for unexpected_index in sorted(explicit_index_names - set(expected_indexes)):
+    actual_explicit_indexes = {
+        name: signature for name, signature in actual_index_catalog.items() if signature.origin == "c"
+    }
+    for unexpected_index in sorted(set(actual_explicit_indexes) - set(expected_explicit_indexes)):
         errors.append(f"{table.name} index {unexpected_index} is unexpected")
-    for index_name, index in expected_indexes.items():
-        actual = actual_indexes.get(index_name)
-        if index_name not in explicit_index_names or actual is None:
+    for index_name, expected_signature in expected_explicit_indexes.items():
+        actual_signature = actual_explicit_indexes.get(index_name)
+        if actual_signature is None:
             errors.append(f"{table.name} index {index_name} is missing")
             continue
-        expected_columns = tuple(column.name.lower() for column in index.columns)
-        actual_index_columns = tuple(
-            None if column_name is None else column_name.lower() for column_name in actual["column_names"]
-        )
-        if actual_index_columns != expected_columns:
-            errors.append(f"{table.name} index {index_name} has incompatible columns")
-        if bool(actual["unique"]) != bool(index.unique):
-            errors.append(f"{table.name} index {index_name} has incompatible uniqueness")
-        expected_where = index.dialect_options["sqlite"].get("where")
-        actual_where = actual.get("dialect_options", {}).get("sqlite_where")
-        expected_where_value = "" if expected_where is None else expected_where
-        actual_where_value = "" if actual_where is None else actual_where
-        if _normalize_sql(expected_where_value) != _normalize_sql(actual_where_value):
-            errors.append(f"{table.name} index {index_name} has incompatible predicate")
+        if actual_signature != expected_signature:
+            errors.append(f"{table.name} index {index_name} has incompatible definition")
+
+    expected_internal_indexes = Counter(
+        signature for signature in expected_index_catalog.values() if signature.origin != "c"
+    )
+    actual_internal_indexes = Counter(
+        signature for signature in actual_index_catalog.values() if signature.origin != "c"
+    )
+    if actual_internal_indexes != expected_internal_indexes:
+        errors.append(f"{table.name} constraint-owned index set is incompatible")
 
     return tuple(errors)
 
@@ -835,7 +1150,11 @@ def validate_leveraged_etf_persistence_schema(connection: Connection) -> None:
         actual_trigger = actual_triggers.get(name)
         if actual_trigger is None:
             errors.append(f"SQLite trigger {name} is missing")
-        elif _normalize_trigger_sql(actual_trigger[1]) != _normalize_trigger_sql(expected_sql):
+            continue
+        expected_table_name = _sqlite_trigger_target(expected_sql)
+        if str(actual_trigger[0]).lower() != expected_table_name:
+            errors.append(f"SQLite trigger {name} has incompatible target")
+        if _normalize_trigger_sql(actual_trigger[1]) != _normalize_trigger_sql(expected_sql):
             errors.append(f"SQLite trigger {name} has incompatible definition")
 
     if errors:
