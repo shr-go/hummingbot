@@ -57,6 +57,67 @@ class SubmissionResponseText:
         return self._text
 
 
+class SubmissionResponseNode:
+    def __init__(self, text: str = "neutral response wrapper", response: Any = None):
+        self._text = text
+        self.response = response
+
+    def __str__(self) -> str:
+        return self._text
+
+
+class EqualityHostileSubmissionResponse(SubmissionResponseNode):
+    def __init__(self, text: str = "neutral equality-hostile response wrapper"):
+        super().__init__(text=text)
+        self.equality_checks = 0
+
+    def __eq__(self, other: Any) -> bool:
+        self.equality_checks += 1
+        raise AssertionError("submission response traversal must use identity, not equality")
+
+
+class ChangingSubmissionResponse:
+    def __init__(self, responses: List[Any], text: str = "neutral changing response wrapper"):
+        self._responses = responses
+        self._text = text
+        self.response_accesses = 0
+
+    @property
+    def response(self) -> Any:
+        index = min(self.response_accesses, len(self._responses) - 1)
+        self.response_accesses += 1
+        return self._responses[index]
+
+    def __str__(self) -> str:
+        return self._text
+
+
+class RaisingSubmissionResponseFailure(IOError):
+    def __init__(self):
+        super().__init__("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+        self.status = 400
+        self.code = -2010
+        self.msg = "NEW_ORDER_REJECTED"
+        self.response_accesses = 0
+
+    @property
+    def response(self) -> Any:
+        self.response_accesses += 1
+        raise RuntimeError("response accessor failed")
+
+
+class RaisingSubmissionResponseMapping(dict):
+    def __init__(self):
+        super().__init__(status=400, code=-2010, msg="NEW_ORDER_REJECTED")
+        self.response_accesses = 0
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "response":
+            self.response_accesses += 1
+            raise RuntimeError("response mapping accessor failed")
+        return super().get(key, default)
+
+
 class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
     # the level is required to receive logs from the data source logger
     level = 0
@@ -4577,6 +4638,218 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                 "msg": "NEW_ORDER_REJECTED",
             }),
         )
+
+    async def test_review_bounded_response_failures_preserve_public_unknown_lifecycle(self):
+        self._simulate_trading_rules_initialized()
+
+        def authoritative_failure() -> IOError:
+            failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+            failure.status = 400
+            failure.code = -2010
+            failure.msg = "NEW_ORDER_REJECTED"
+            return failure
+
+        over_depth_failure = authoritative_failure()
+        over_depth_failure.response = SubmissionResponseNode(
+            response=SubmissionResponseNode(
+                response=SubmissionResponseText(
+                    "HTTP status is 503; execution status: unknown"
+                )
+            )
+        )
+        self_cycle_failure = authoritative_failure()
+        self_cycle_failure.response = self_cycle_failure
+        multi_cycle_failure = authoritative_failure()
+        equality_hostile_response = EqualityHostileSubmissionResponse()
+        multi_cycle_failure.response = equality_hostile_response
+        equality_hostile_response.response = multi_cycle_failure
+        raising_accessor_failure = RaisingSubmissionResponseFailure()
+        changing_boundary = ChangingSubmissionResponse(responses=[
+            SubmissionResponseText("HTTP status is 408"),
+            None,
+        ])
+        changing_accessor_failure = authoritative_failure()
+        changing_accessor_failure.response = SubmissionResponseNode(
+            response=changing_boundary
+        )
+        cases = (
+            ("over-depth-503-unknown", over_depth_failure),
+            ("self-cycle", self_cycle_failure),
+            ("multi-node-equality-hostile-cycle", multi_cycle_failure),
+            ("raising-response-accessor", raising_accessor_failure),
+            ("changing-boundary-accessor", changing_accessor_failure),
+        )
+
+        for index, (label, failure) in enumerate(cases):
+            with self.subTest(boundary=label):
+                client_order_id = f"t007-public-{index}"
+                failure_logger = EventLogger()
+                self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+                try:
+                    self.exchange._api_post = AsyncMock(side_effect=failure)
+
+                    submitted_id = self.exchange.buy(
+                        trading_pair=self.trading_pair,
+                        amount=Decimal("3"),
+                        order_type=OrderType.MARKET,
+                        price=Decimal("10000"),
+                        client_order_id=client_order_id,
+                        position_action=PositionAction.OPEN,
+                    )
+                    await asyncio.sleep(0.01)
+
+                    tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+                    intent = self.exchange._unknown_submission_order_intents.get(client_order_id)
+                    observed = {
+                        "submitted_id": submitted_id,
+                        "client_order_id": tracked_order.client_order_id,
+                        "state": tracked_order.current_state,
+                        "exchange_order_id": tracked_order.exchange_order_id,
+                        "in_flight": client_order_id in self.exchange.in_flight_orders,
+                        "reserved": client_order_id in self.exchange._reserved_client_order_ids,
+                        "intent": None if intent is None else (
+                            intent.time_in_force,
+                            intent.reduce_only,
+                            intent.close_position,
+                            intent.position_side,
+                        ),
+                        "submission_unknown": self.exchange.is_order_submission_unknown(
+                            client_order_id
+                        ),
+                        "failure_events": len(failure_logger.event_log),
+                    }
+                    self.assertEqual(
+                        {
+                            "submitted_id": client_order_id,
+                            "client_order_id": client_order_id,
+                            "state": OrderState.PENDING_CREATE,
+                            "exchange_order_id": None,
+                            "in_flight": True,
+                            "reserved": True,
+                            "intent": (CONSTANTS.TIME_IN_FORCE_GTC, False, False, "BOTH"),
+                            "submission_unknown": True,
+                            "failure_events": 0,
+                        },
+                        observed,
+                    )
+                finally:
+                    self.exchange.remove_listener(MarketEvent.OrderFailure, failure_logger)
+
+        self.assertEqual(0, equality_hostile_response.equality_checks)
+        self.assertEqual(1, raising_accessor_failure.response_accesses)
+        self.assertEqual(1, changing_boundary.response_accesses)
+
+    def test_review_bounded_response_chain_completeness_fact_matrix(self):
+        def authoritative_failure() -> IOError:
+            failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+            failure.status = 400
+            failure.code = -2010
+            failure.msg = "NEW_ORDER_REJECTED"
+            return failure
+
+        def over_depth_failure(tail: Any) -> IOError:
+            failure = authoritative_failure()
+            failure.response = SubmissionResponseNode(
+                response=SubmissionResponseNode(response=tail)
+            )
+            return failure
+
+        self_cycle_failure = authoritative_failure()
+        self_cycle_failure.response = self_cycle_failure
+        multi_cycle_failure = authoritative_failure()
+        equality_hostile_response = EqualityHostileSubmissionResponse()
+        multi_cycle_failure.response = equality_hostile_response
+        equality_hostile_response.response = multi_cycle_failure
+        raising_accessor_failure = RaisingSubmissionResponseFailure()
+        raising_mapping = RaisingSubmissionResponseMapping()
+        changing_unseen_boundary = ChangingSubmissionResponse(responses=[
+            SubmissionResponseText("HTTP status is 503; execution status unknown"),
+            None,
+        ])
+        changing_unseen_failure = authoritative_failure()
+        changing_unseen_failure.response = SubmissionResponseNode(
+            response=changing_unseen_boundary
+        )
+        ambiguous_cases = (
+            (
+                "over-depth-503-unknown",
+                over_depth_failure(
+                    SubmissionResponseText(
+                        "HTTP status is 503; execution status: unknown"
+                    )
+                ),
+            ),
+            (
+                "over-depth-408",
+                over_depth_failure(SubmissionResponseText("HTTP status is 408")),
+            ),
+            (
+                "over-depth-ambiguous-code-1006",
+                over_depth_failure({"code": -1006, "msg": "UNEXPECTED_RESP"}),
+            ),
+            (
+                "over-depth-ambiguous-code-1007",
+                over_depth_failure({"code": -1007, "msg": "TIMEOUT"}),
+            ),
+            (
+                "over-depth-explicit-unknown",
+                over_depth_failure(
+                    SubmissionResponseText("send status = unknown")
+                ),
+            ),
+            (
+                "over-depth-neutral-unseen",
+                over_depth_failure(SubmissionResponseText("neutral unseen response")),
+            ),
+            ("self-cycle", self_cycle_failure),
+            ("multi-node-equality-hostile-cycle", multi_cycle_failure),
+            ("raising-object-response-accessor", raising_accessor_failure),
+            ("raising-mapping-response-accessor", raising_mapping),
+            ("changing-unseen-boundary", changing_unseen_failure),
+        )
+
+        for label, failure in ambiguous_cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+                    classify_binance_order_submission_failure(failure),
+                )
+
+        finite_boundary = ChangingSubmissionResponse(responses=[
+            None,
+            SubmissionResponseText("HTTP status is 503; execution status unknown"),
+        ])
+        exact_bound_failure = authoritative_failure()
+        exact_bound_failure.response = SubmissionResponseNode(
+            response=finite_boundary
+        )
+        short_null_failure = authoritative_failure()
+        short_null_failure.response = None
+        short_missing_failure = authoritative_failure()
+        short_missing_failure.response = SubmissionResponseText("neutral final response")
+        authoritative_cases = (
+            ("consistent-mapping", {
+                "status": 400,
+                "code": -2010,
+                "msg": "NEW_ORDER_REJECTED",
+            }),
+            ("exact-bound-null-completion", exact_bound_failure),
+            ("short-null-completion", short_null_failure),
+            ("short-missing-completion", short_missing_failure),
+        )
+
+        for label, failure in authoritative_cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION,
+                    classify_binance_order_submission_failure(failure),
+                )
+
+        self.assertEqual(0, equality_hostile_response.equality_checks)
+        self.assertEqual(1, raising_accessor_failure.response_accesses)
+        self.assertEqual(1, raising_mapping.response_accesses)
+        self.assertEqual(1, changing_unseen_boundary.response_accesses)
+        self.assertEqual(1, finite_boundary.response_accesses)
 
     def test_feature_submission_failure_fact_matrix_fails_closed(self):
         attribute_failure = IOError("NEW_ORDER_REJECTED")
