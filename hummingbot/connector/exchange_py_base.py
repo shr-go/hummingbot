@@ -52,6 +52,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._last_timestamp = 0
         self._trading_rules = {}
         self._trading_fees = {}
+        self._reserved_client_order_ids = set()
 
         self._status_polling_task: Optional[asyncio.Task] = None
         self._user_stream_tracker_task: Optional[asyncio.Task] = None
@@ -257,11 +258,52 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     # === Orders placing ===
 
+    def _validate_preallocated_client_order_id_format(self, client_order_id: str) -> None:
+        """Connector hook for exchange-specific client-order-ID syntax."""
+
+    def _reserve_preallocated_client_order_id(self, client_order_id: str) -> str:
+        if not isinstance(client_order_id, str):
+            raise TypeError("preallocated client_order_id must be a string")
+        if client_order_id == "" or client_order_id.isspace():
+            raise ValueError("preallocated client_order_id must not be empty")
+        if len(client_order_id) > self.client_order_id_max_length:
+            raise ValueError("preallocated client_order_id exceeds the connector length limit")
+        if self.client_order_id_prefix and client_order_id.startswith(self.client_order_id_prefix):
+            raise ValueError("preallocated client_order_id uses the reserved connector prefix")
+        self._validate_preallocated_client_order_id_format(client_order_id)
+
+        if client_order_id in self._reserved_client_order_ids:
+            raise ValueError(f"client order ID {client_order_id} is already reserved")
+        if client_order_id in self._order_tracker.all_fillable_orders:
+            raise ValueError(f"client order ID {client_order_id} collides with the order tracker")
+
+        # A caller-owned ID is intentionally single-use for this connector lifetime. Reusing a
+        # terminal ID would make a new exchange side effect indistinguishable from reconciliation
+        # of the durable intent that originally owned the ID.
+        self._reserved_client_order_ids.add(client_order_id)
+        return client_order_id
+
+    def _client_order_id(
+            self,
+            is_buy: bool,
+            trading_pair: str,
+            preallocated_client_order_id: Optional[str],
+    ) -> str:
+        if preallocated_client_order_id is not None:
+            return self._reserve_preallocated_client_order_id(preallocated_client_order_id)
+        return get_new_client_order_id(
+            is_buy=is_buy,
+            trading_pair=trading_pair,
+            hbot_order_id_prefix=self.client_order_id_prefix,
+            max_id_len=self.client_order_id_max_length,
+        )
+
     def buy(self,
             trading_pair: str,
             amount: Decimal,
             order_type=OrderType.LIMIT,
             price: Decimal = s_decimal_NaN,
+            client_order_id: Optional[str] = None,
             **kwargs) -> str:
         """
         Creates a promise to create a buy order using the parameters
@@ -270,14 +312,14 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param amount: the order amount
         :param order_type: the type of order to create (MARKET, LIMIT, LIMIT_MAKER)
         :param price: the order price
+        :param client_order_id: optional caller-preallocated, single-use client order ID
 
         :return: the id assigned by the connector to the order (the client id)
         """
-        order_id = get_new_client_order_id(
+        order_id = self._client_order_id(
             is_buy=True,
             trading_pair=trading_pair,
-            hbot_order_id_prefix=self.client_order_id_prefix,
-            max_id_len=self.client_order_id_max_length
+            preallocated_client_order_id=client_order_id,
         )
         safe_ensure_future(self._create_order(
             trade_type=TradeType.BUY,
@@ -294,6 +336,7 @@ class ExchangePyBase(ExchangeBase, ABC):
              amount: Decimal,
              order_type: OrderType = OrderType.LIMIT,
              price: Decimal = s_decimal_NaN,
+             client_order_id: Optional[str] = None,
              **kwargs) -> str:
         """
         Creates a promise to create a sell order using the parameters.
@@ -301,13 +344,13 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param amount: the order amount
         :param order_type: the type of order to create (MARKET, LIMIT, LIMIT_MAKER)
         :param price: the order price
+        :param client_order_id: optional caller-preallocated, single-use client order ID
         :return: the id assigned by the connector to the order (the client id)
         """
-        order_id = get_new_client_order_id(
+        order_id = self._client_order_id(
             is_buy=False,
             trading_pair=trading_pair,
-            hbot_order_id_prefix=self.client_order_id_prefix,
-            max_id_len=self.client_order_id_max_length
+            preallocated_client_order_id=client_order_id,
         )
         safe_ensure_future(self._create_order(
             trade_type=TradeType.SELL,
@@ -584,6 +627,15 @@ class ExchangePyBase(ExchangeBase, ABC):
 
         :param saved_states: The saved tracking_states.
         """
+        self._reserved_client_order_ids.update(
+            client_order_id
+            for client_order_id in saved_states
+            if isinstance(client_order_id, str)
+            and not (
+                self.client_order_id_prefix
+                and client_order_id.startswith(self.client_order_id_prefix)
+            )
+        )
         self._order_tracker.restore_tracking_states(tracking_states=saved_states)
 
     def start_tracking_order(self,

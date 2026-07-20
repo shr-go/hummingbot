@@ -1,10 +1,16 @@
+import asyncio
 import gc
 import unittest
 import weakref
 from test.mock.mock_events import MockEvent, MockEventType
 
+from hummingbot.core.event.event_forwarder import EventForwarder
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.pubsub import PubSub
+
+
+class DeliberateBaseException(BaseException):
+    pass
 
 
 class PubSubTest(unittest.TestCase):
@@ -66,6 +72,61 @@ class PubSubTest(unittest.TestCase):
         self.assertEqual(1, len(self.listener_zero.event_log))
         self.assertEqual(self.event, self.listener_zero.event_log[0])
         self.assertEqual(0, len(self.listener_one.event_log))
+
+    def test_trigger_event_continues_after_synchronous_listener_cancelled_error(self):
+        observations = []
+
+        for cancel_first in (True, False):
+            pubsub = PubSub()
+            recording_listener = EventLogger()
+            cancellation_calls = []
+
+            def cancel_synchronously(event):
+                cancellation_calls.append(event)
+                raise asyncio.CancelledError("listener-local cancellation")
+
+            canceling_listener = EventForwarder(cancel_synchronously)
+            listeners = (
+                (canceling_listener, recording_listener)
+                if cancel_first
+                else (recording_listener, canceling_listener)
+            )
+            for listener in listeners:
+                pubsub.add_listener(self.event_tag_zero, listener)
+
+            error_name = None
+            try:
+                pubsub.trigger_event(self.event_tag_zero, self.event)
+            except BaseException as error:
+                error_name = type(error).__name__
+            observations.append((
+                cancel_first,
+                error_name,
+                cancellation_calls,
+                recording_listener.event_log,
+            ))
+
+        self.assertEqual(
+            [
+                (cancel_first, None, [self.event], [self.event])
+                for cancel_first in (True, False)
+            ],
+            observations,
+        )
+
+    def test_trigger_event_does_not_swallow_other_base_exceptions(self):
+        for exception_type in (SystemExit, KeyboardInterrupt, DeliberateBaseException):
+            with self.subTest(exception_type=exception_type):
+                pubsub = PubSub()
+
+                def raise_base_exception(event):
+                    raise exception_type("must propagate")
+
+                listener = EventForwarder(raise_base_exception)
+                pubsub.add_listener(self.event_tag_zero, listener)
+
+                with self.assertRaises(exception_type):
+                    pubsub.trigger_event(self.event_tag_zero, self.event)
 
     def test_lapsed_listener_remove_on_get_listeners(self):
         self.pubsub.add_listener(self.event_tag_zero, self.listener_zero)

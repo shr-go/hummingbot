@@ -13,6 +13,7 @@ from cython.operator cimport(
 )
 from libcpp.vector cimport vector
 from enum import Enum
+import asyncio
 import logging
 import random
 from typing import List
@@ -163,6 +164,8 @@ cdef class PubSub:
             try:
                 typed_listener.c_set_event_info(event_tag, self)
                 typed_listener.c_call(arg)
+            except asyncio.CancelledError:
+                self.c_log_exception(event_tag, arg)
             except Exception:
                 self.c_log_exception(event_tag, arg)
             finally:
