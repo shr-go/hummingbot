@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.model.leveraged_etf_persistence import SQLITE_GUARD_DDL
 from hummingbot.model.leveraged_etf_repository import (
     AnchorIntegrityError,
     AnchorPollingCheckpointV1,
@@ -1334,12 +1335,14 @@ def test_recovery_discovery_rejects_gap_extra_and_orphan_rows(
             if corruption == "missing_sequence":
                 connection.execute("DROP TRIGGER lepf_journal_no_delete")
                 connection.execute("DELETE FROM LeveragedEtfJournalEvent WHERE sequence = 1")
+                connection.execute(SQLITE_GUARD_DDL["lepf_journal_no_delete"])
             else:
                 connection.execute("DROP TRIGGER lepf_snapshot_referenced_no_delete")
                 connection.execute(
                     "DELETE FROM LeveragedEtfExecutorSnapshot WHERE executor_id = ?",
                     (initial.executor_id,),
                 )
+                connection.execute(SQLITE_GUARD_DDL["lepf_snapshot_referenced_no_delete"])
     reopened = _open_manager(db_path)
     try:
         recovery_repository = LeveragedEtfJournalRepository(reopened)
