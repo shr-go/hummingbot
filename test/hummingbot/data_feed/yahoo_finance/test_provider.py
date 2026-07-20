@@ -43,6 +43,7 @@ class SyntheticAiohttpResponse:
         self.read_hook = read_hook
         self.read_hook_called = False
         self.released = False
+        self.release_calls = 0
 
     def run_read_hook(self):
         if self.read_hook is not None and not self.read_hook_called:
@@ -58,6 +59,7 @@ class SyntheticAiohttpResponse:
         return self.body
 
     def release(self):
+        self.release_calls += 1
         self.released = True
 
 
@@ -143,6 +145,7 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
         self,
         clock,
         *responses,
+        nav_config=None,
         throttler=None,
         connection_acquire_hook=None,
     ):
@@ -165,13 +168,22 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
             connections_factory=self.real_connections_factory,
         )
         return YahooChartProvider(
-            nav_config=self.nav_config,
+            nav_config=self.nav_config if nav_config is None else nav_config,
             web_assistants_factory=factory,
             utc_clock=clock.utcnow,
             monotonic_clock=clock.monotonic,
             sleep=clock.sleep,
             jitter=lambda upper_bound: 0.0,
         )
+
+    def nav_config_with_request_timeout(self, timeout_seconds):
+        values = self.nav_config.model_dump(mode="python")
+        values["anchor_http_request_timeout_seconds"] = timeout_seconds
+        values["anchor_pair_fetch_max_skew_seconds"] = min(
+            values["anchor_pair_fetch_max_skew_seconds"],
+            timeout_seconds,
+        )
+        return type(self.nav_config).model_validate(values)
 
     async def test_query2_success_uses_raw_rest_response_and_exact_chart_request(self):
         clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
@@ -408,6 +420,132 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
                 if isinstance(first_outcome, SyntheticAiohttpResponse):
                     assert first_outcome.released is True
 
+    async def test_real_query2_body_exceeding_attempt_timeout_fails_over_to_query1(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        nav_config = self.nav_config_with_request_timeout(1)
+        query2_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+            read_hook=lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1.2),
+        )
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(
+            clock,
+            query2_response,
+            query1_response,
+            nav_config=nav_config,
+        )
+
+        observation = await provider.fetch_close(
+            "SNDK",
+            TARGET_SESSION_DATE,
+            OFFICIAL_CLOSE + timedelta(seconds=600),
+        )
+
+        assert observation.source_url == query1_response.url
+        assert [call["url"].split("/")[2] for call in self.real_session.calls] == [
+            "query2.finance.yahoo.com",
+            "query1.finance.yahoo.com",
+        ]
+        assert query2_response.release_calls == 1
+        assert query1_response.release_calls == 1
+
+    async def test_real_query1_body_timeout_ends_failover_and_releases_response_once(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        nav_config = self.nav_config_with_request_timeout(1)
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+            read_hook=lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1.2),
+        )
+        provider = self.make_real_assistant_provider(
+            clock,
+            TimeoutError("synthetic query2 timeout"),
+            query1_response,
+            nav_config=nav_config,
+        )
+
+        with self.assertRaisesRegex(YahooHTTPError, "all approved hosts"):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert len(self.real_session.calls) == 2
+        assert query1_response.release_calls == 1
+
+    async def test_real_body_cancellation_propagates_and_releases_response_once(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+
+        def cancel_body_read():
+            raise asyncio.CancelledError()
+
+        query2_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+            read_hook=cancel_body_read,
+        )
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(clock, query2_response, query1_response)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await provider.fetch_close(
+                "SNDK",
+                TARGET_SESSION_DATE,
+                OFFICIAL_CLOSE + timedelta(seconds=600),
+            )
+
+        assert len(self.real_session.calls) == 1
+        assert query2_response.release_calls == 1
+        assert query1_response.release_calls == 0
+
+    async def test_real_request_headers_are_bounded_by_same_attempt_deadline(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        nav_config = self.nav_config_with_request_timeout(1)
+        query2_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+
+        def delayed_query2_headers():
+            clock.monotonic_value += 1
+            return query2_response
+
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(
+            clock,
+            delayed_query2_headers,
+            query1_response,
+            nav_config=nav_config,
+        )
+
+        observation = await provider.fetch_close(
+            "SNDK",
+            TARGET_SESSION_DATE,
+            OFFICIAL_CLOSE + timedelta(seconds=600),
+        )
+
+        assert observation.source_url == query1_response.url
+        assert query2_response.release_calls == 1
+        assert query1_response.release_calls == 1
+
     async def test_real_rest_assistant_cancellation_propagates_without_failover(self):
         clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
         provider = self.make_real_assistant_provider(clock, asyncio.CancelledError())
@@ -421,37 +559,55 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
 
         assert len(self.real_session.calls) == 1
 
-    async def test_real_async_throttler_wait_consumes_absolute_budget_and_releases_response(self):
-        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=599))
-        response = SyntheticAiohttpResponse(
+    async def test_real_async_throttler_wait_is_bounded_by_attempt_and_releases_responses_once(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        nav_config = self.nav_config_with_request_timeout(1)
+        query2_response = SyntheticAiohttpResponse(
             200,
             fixture_text("sndk_chart.json"),
             "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
         )
         throttler = AsyncThrottler(
             rate_limits=[RateLimit(YAHOO_CHART_RATE_LIMIT_ID, limit=100, time_interval=1)]
         )
         throttler._lock = DeadlineAdvancingLock(lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1))
-        provider = self.make_real_assistant_provider(clock, response, throttler=throttler)
+        provider = self.make_real_assistant_provider(
+            clock,
+            query2_response,
+            query1_response,
+            nav_config=nav_config,
+            throttler=throttler,
+        )
 
-        with self.assertRaises(YahooDeadlineExceeded):
-            await provider.fetch_close(
-                "SNDK",
-                TARGET_SESSION_DATE,
-                OFFICIAL_CLOSE + timedelta(seconds=600),
-            )
+        observation = await provider.fetch_close(
+            "SNDK",
+            TARGET_SESSION_DATE,
+            OFFICIAL_CLOSE + timedelta(seconds=600),
+        )
 
-        assert response.released is True
+        assert observation.source_url == query1_response.url
+        assert query2_response.release_calls == 1
+        assert query1_response.release_calls == 1
 
-    async def test_real_response_body_read_consumes_absolute_budget_and_releases_response(self):
+    async def test_shorter_cycle_remaining_wins_over_attempt_timeout_at_equality(self):
         clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=599))
-        response = SyntheticAiohttpResponse(
+        query2_response = SyntheticAiohttpResponse(
             200,
             fixture_text("sndk_chart.json"),
             "https://query2.finance.yahoo.com/v8/finance/chart/SNDK",
             read_hook=lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1),
         )
-        provider = self.make_real_assistant_provider(clock, response)
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
+        provider = self.make_real_assistant_provider(clock, query2_response, query1_response)
 
         with self.assertRaises(YahooDeadlineExceeded):
             await provider.fetch_close(
@@ -460,23 +616,44 @@ class YahooChartProviderTest(unittest.IsolatedAsyncioTestCase):
                 OFFICIAL_CLOSE + timedelta(seconds=600),
             )
 
-        assert response.released is True
+        assert len(self.real_session.calls) == 1
+        assert query2_response.release_calls == 1
+        assert query1_response.release_calls == 0
 
-    async def test_real_factory_acquisition_consumes_absolute_budget_before_request(self):
-        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=599))
+    async def test_real_factory_acquisition_is_bounded_by_attempt_before_request(self):
+        clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
+        nav_config = self.nav_config_with_request_timeout(1)
+        first_acquisition = True
+
+        def delay_first_acquisition():
+            nonlocal first_acquisition
+            if first_acquisition:
+                first_acquisition = False
+                clock.monotonic_value += 1
+
+        query1_response = SyntheticAiohttpResponse(
+            200,
+            fixture_text("sndk_chart.json"),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SNDK",
+        )
         provider = self.make_real_assistant_provider(
             clock,
-            connection_acquire_hook=lambda: setattr(clock, "monotonic_value", clock.monotonic_value + 1),
+            query1_response,
+            nav_config=nav_config,
+            connection_acquire_hook=delay_first_acquisition,
         )
 
-        with self.assertRaises(YahooDeadlineExceeded):
-            await provider.fetch_close(
-                "SNDK",
-                TARGET_SESSION_DATE,
-                OFFICIAL_CLOSE + timedelta(seconds=600),
-            )
+        observation = await provider.fetch_close(
+            "SNDK",
+            TARGET_SESSION_DATE,
+            OFFICIAL_CLOSE + timedelta(seconds=600),
+        )
 
-        assert self.real_session.calls == []
+        assert observation.source_url == query1_response.url
+        assert self.real_connections_factory.calls == 2
+        assert len(self.real_session.calls) == 1
+        assert self.real_session.calls[0]["url"].split("/")[2] == "query1.finance.yahoo.com"
+        assert query1_response.release_calls == 1
 
     async def test_final_response_url_must_remain_on_approved_https_chart_endpoint(self):
         clock = FakeClock(OFFICIAL_CLOSE + timedelta(seconds=60))
