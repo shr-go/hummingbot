@@ -660,41 +660,20 @@ def _is_atomic_sql_expression(tokens: Sequence[_SQLiteToken]) -> bool:
     return depth == 0
 
 
-_SQLITE_PREFIX_ATOMIC_OPERAND_KEYWORDS = frozenset(("not", "when", "then", "else"))
-_SQLITE_INFIX_ATOMIC_OPERAND_KEYWORDS = frozenset(
-    ("and", "or", "is", "between", "glob", "like", "match", "regexp", "escape")
+_SQLITE_INFIX_EXPRESSION_KEYWORDS = frozenset(
+    ("and", "or", "is", "between", "glob", "like", "match", "regexp", "escape", "collate")
 )
-_SQLITE_NEGATABLE_INFIX_KEYWORDS = frozenset(("between", "glob", "like", "match", "regexp"))
+_SQLITE_NEGATABLE_INFIX_KEYWORDS = frozenset(("between", "in", "glob", "like", "match", "regexp"))
+_SQLITE_REQUIRED_GROUP_PREFIX_KEYWORDS = frozenset(("exists",))
+_SQLITE_REQUIRED_GROUP_INFIX_KEYWORDS = frozenset(("in",))
+_SQLITE_REQUIRED_GROUP_POSTFIX_KEYWORDS = frozenset(("filter", "over"))
+_SQLITE_EXPRESSION_PREFIX_CONTINUATIONS = frozenset(("distinct", "from"))
+_SQLITE_EXPRESSION_POSTFIX_KEYWORDS = frozenset(("isnull", "notnull"))
+_SQLITE_CASE_OPERAND_KEYWORDS = frozenset(("case", "when", "then", "else"))
 
 
-def _token_can_end_sql_expression(token: _SQLiteToken) -> bool:
-    return token.kind in ("word", "quoted_identifier", "number", "string") or token == _SQLiteToken("symbol", ")")
-
-
-def _keyword_operator_expects_atomic_operand(tokens: Sequence[_SQLiteToken]) -> bool:
-    if not tokens or tokens[-1].kind != "word":
-        return False
-    keyword = tokens[-1].value
-    if keyword in _SQLITE_PREFIX_ATOMIC_OPERAND_KEYWORDS:
-        return True
-    if keyword == "from":
-        operator_at = len(tokens) - 2
-        if operator_at < 0 or tokens[operator_at] != _SQLiteToken("word", "distinct"):
-            return False
-        operator_at -= 1
-        if operator_at >= 0 and tokens[operator_at] == _SQLiteToken("word", "not"):
-            operator_at -= 1
-        return (
-            operator_at > 0
-            and tokens[operator_at] == _SQLiteToken("word", "is")
-            and _token_can_end_sql_expression(tokens[operator_at - 1])
-        )
-    if keyword not in _SQLITE_INFIX_ATOMIC_OPERAND_KEYWORDS:
-        return False
-    left_at = len(tokens) - 2
-    if keyword in _SQLITE_NEGATABLE_INFIX_KEYWORDS and left_at >= 0 and tokens[left_at] == _SQLiteToken("word", "not"):
-        left_at -= 1
-    return left_at >= 0 and _token_can_end_sql_expression(tokens[left_at])
+def _tokens_start_sqlite_subquery(tokens: Sequence[_SQLiteToken]) -> bool:
+    return bool(tokens and tokens[0].kind == "word" and tokens[0].value in ("select", "with", "values"))
 
 
 def _strip_redundant_operand_parentheses(tokens: Sequence[_SQLiteToken]) -> Tuple[_SQLiteToken, ...]:
@@ -702,26 +681,89 @@ def _strip_redundant_operand_parentheses(tokens: Sequence[_SQLiteToken]) -> Tupl
 
     normalized: List[_SQLiteToken] = []
     cursor = 0
+    operand_expected = True
+    qualified_identifier_expected = False
+    next_parentheses_required = False
     while cursor < len(tokens):
         token = tokens[cursor]
-        if token != _SQLiteToken("symbol", "("):
-            normalized.append(token)
-            cursor += 1
+        if token == _SQLiteToken("symbol", "("):
+            inner, after_group = _extract_parenthesized_tokens(tokens, cursor)
+            is_subquery = _tokens_start_sqlite_subquery(inner)
+            normalized_inner = tuple(inner) if is_subquery else _strip_redundant_operand_parentheses(inner)
+            if _is_atomic_sql_expression(normalized_inner) and not next_parentheses_required and not is_subquery:
+                normalized.extend(normalized_inner)
+            else:
+                normalized.append(_SQLiteToken("symbol", "("))
+                normalized.extend(normalized_inner)
+                normalized.append(_SQLiteToken("symbol", ")"))
+            operand_expected = False
+            qualified_identifier_expected = False
+            next_parentheses_required = False
+            cursor = after_group
             continue
-        inner, after_group = _extract_parenthesized_tokens(tokens, cursor)
-        normalized_inner = _strip_redundant_operand_parentheses(inner)
-        grammar_requires_parentheses = bool(
-            normalized
-            and _token_is_identifier(normalized[-1])
-            and not _keyword_operator_expects_atomic_operand(normalized)
-        )
-        if _is_atomic_sql_expression(normalized_inner) and not grammar_requires_parentheses:
-            normalized.extend(normalized_inner)
+
+        normalized.append(token)
+        next_parentheses_required = False
+        if _token_is_identifier(token):
+            if token.kind == "quoted_identifier" or qualified_identifier_expected:
+                operand_expected = False
+                next_parentheses_required = True
+            else:
+                keyword = token.value
+                next_token = tokens[cursor + 1] if cursor + 1 < len(tokens) else None
+                if keyword in _SQLITE_CASE_OPERAND_KEYWORDS:
+                    operand_expected = True
+                elif keyword == "end":
+                    operand_expected = False
+                elif keyword == "not":
+                    if not operand_expected and next_token is not None and next_token.kind == "word":
+                        operand_expected = next_token.value not in _SQLITE_NEGATABLE_INFIX_KEYWORDS
+                    else:
+                        operand_expected = True
+                elif operand_expected and keyword in _SQLITE_REQUIRED_GROUP_PREFIX_KEYWORDS:
+                    next_parentheses_required = True
+                elif operand_expected and keyword in _SQLITE_EXPRESSION_PREFIX_CONTINUATIONS:
+                    operand_expected = True
+                elif not operand_expected and keyword in _SQLITE_REQUIRED_GROUP_INFIX_KEYWORDS:
+                    operand_expected = True
+                    next_parentheses_required = True
+                elif not operand_expected and keyword in _SQLITE_REQUIRED_GROUP_POSTFIX_KEYWORDS:
+                    operand_expected = True
+                    next_parentheses_required = True
+                elif not operand_expected and keyword in _SQLITE_INFIX_EXPRESSION_KEYWORDS:
+                    operand_expected = True
+                elif not operand_expected and keyword in _SQLITE_EXPRESSION_POSTFIX_KEYWORDS:
+                    operand_expected = False
+                else:
+                    operand_expected = False
+                    next_parentheses_required = True
+            qualified_identifier_expected = False
+        elif token.kind in ("number", "string"):
+            operand_expected = False
+            qualified_identifier_expected = False
+        elif token == _SQLiteToken("symbol", ".") and not operand_expected:
+            operand_expected = True
+            qualified_identifier_expected = True
+        elif token == _SQLiteToken("symbol", ","):
+            operand_expected = True
+            qualified_identifier_expected = False
+        elif token == _SQLiteToken("symbol", "*") and operand_expected:
+            operand_expected = False
+            qualified_identifier_expected = False
+        elif (
+            token
+            in (
+                _SQLiteToken("symbol", "+"),
+                _SQLiteToken("symbol", "-"),
+                _SQLiteToken("symbol", "~"),
+            )
+            and operand_expected
+        ):
+            qualified_identifier_expected = False
         else:
-            normalized.append(_SQLiteToken("symbol", "("))
-            normalized.extend(normalized_inner)
-            normalized.append(_SQLiteToken("symbol", ")"))
-        cursor = after_group
+            operand_expected = True
+            qualified_identifier_expected = False
+        cursor += 1
     return tuple(normalized)
 
 
