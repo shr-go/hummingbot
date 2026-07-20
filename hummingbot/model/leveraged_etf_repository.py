@@ -1278,6 +1278,20 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         return all(cls._intent_terminal(tuple(intent_events)) for intent_events in by_intent.values())
 
     @classmethod
+    def _action_intents_terminal_after(
+        cls,
+        decoded: Tuple[_DecodedJournalMutation, ...],
+        event: JournalEventV1,
+        action: JournalSideEffect,
+    ) -> bool:
+        by_intent: dict[str, list[JournalEventV1]] = {}
+        for candidate in cls._events_with_candidate(decoded, event):
+            identity = getattr(candidate.payload, "identity", None)
+            if candidate.intent_id is not None and identity is not None and identity.action == action:
+                by_intent.setdefault(candidate.intent_id, []).append(candidate)
+        return all(cls._intent_terminal(tuple(intent_events)) for intent_events in by_intent.values())
+
+    @classmethod
     def _exposure_totals(
         cls,
         decoded: Tuple[_DecodedJournalMutation, ...],
@@ -1567,6 +1581,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         payload = event.payload
         identity = getattr(payload, "identity", None)
         action = None if identity is None else identity.action
+        if late_after_fill:
+            return source
 
         prepared_sources = {
             JournalSideEffect.ETF_MAKER: {
@@ -1695,8 +1711,6 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 JournalSideEffect.ETF_ROLLBACK: LeveragedEtfPairState.RECOVERY_REQUIRED,
             }[action]
         if event.event_type in {JournalEventType.ACKNOWLEDGED, JournalEventType.ORDER_CREATED}:
-            if late_after_fill:
-                return source
             return (
                 LeveragedEtfPairState.MAKER_WORKING if action == JournalSideEffect.ETF_MAKER else pending_state[action]
             )
@@ -1709,6 +1723,11 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
 
         balanced = cls._exposure_is_balanced(current, decoded, event)
         all_terminal = cls._all_intents_terminal_after(decoded, event)
+        hedge_intents_terminal = cls._action_intents_terminal_after(
+            decoded,
+            event,
+            JournalSideEffect.STOCK_HEDGE,
+        )
         maker_filled, stock_filled, rollback_filled = cls._exposure_totals(decoded, event)
         completely_filled = (
             maker_filled == current.etf_target_quantity
@@ -1718,7 +1737,9 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         if event.event_type == JournalEventType.HEDGE_CONFIRMED:
             if balanced and all_terminal and completely_filled:
                 return LeveragedEtfPairState.COMPLETED
-            return LeveragedEtfPairState.MAKER_WORKING if balanced else LeveragedEtfPairState.STOCK_HEDGE_PENDING
+            if balanced and hedge_intents_terminal:
+                return LeveragedEtfPairState.MAKER_WORKING
+            return LeveragedEtfPairState.STOCK_HEDGE_PENDING
         if event.event_type == JournalEventType.ROLLBACK_CONFIRMED:
             return (
                 LeveragedEtfPairState.FAILED_SAFE
@@ -1741,7 +1762,9 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             if action == JournalSideEffect.STOCK_HEDGE:
                 if balanced and all_terminal and completely_filled:
                     return LeveragedEtfPairState.COMPLETED
-                return LeveragedEtfPairState.MAKER_WORKING if balanced else LeveragedEtfPairState.STOCK_HEDGE_PENDING
+                if balanced and hedge_intents_terminal:
+                    return LeveragedEtfPairState.MAKER_WORKING
+                return LeveragedEtfPairState.STOCK_HEDGE_PENDING
             if action == JournalSideEffect.ETF_ROLLBACK:
                 return (
                     LeveragedEtfPairState.FAILED_SAFE
