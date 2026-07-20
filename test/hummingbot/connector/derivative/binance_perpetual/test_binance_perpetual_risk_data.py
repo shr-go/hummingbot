@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError, replace
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, localcontext
 from typing import Any, Dict, Tuple
 from unittest.mock import AsyncMock
 
@@ -298,6 +298,166 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         position = result[2]
         mark_price = abs(notional / position.position_amount)
         return result[0], result[1], replace(position, mark_price=mark_price), *result[3:]
+
+    @staticmethod
+    def _decimal_context_state(context: Any) -> Tuple[Any, ...]:
+        return (
+            context.prec,
+            context.rounding,
+            context.Emin,
+            context.Emax,
+            context.capitals,
+            context.clamp,
+            tuple(sorted((signal.__name__, enabled) for signal, enabled in context.flags.items())),
+            tuple(sorted((signal.__name__, enabled) for signal, enabled in context.traps.items())),
+        )
+
+    def _bundle_with_reconciliation_observation(
+            self,
+            case: str,
+            observed: Decimal,
+    ) -> Tuple[Any, ...]:
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, brackets) = self._typed_bundle()
+        account_position = account.positions[0]
+        asset = account.assets[0]
+
+        if case == "signed_notional":
+            account_position = replace(
+                account_position,
+                position_amount=Decimal("-2"),
+                notional=observed,
+            )
+            position = replace(
+                position,
+                position_amount=Decimal("-2"),
+                notional=Decimal("-50"),
+            )
+        elif case == "quantity":
+            account_position = replace(account_position, position_amount=observed)
+        elif case == "position_pnl":
+            account_position = replace(account_position, unrealized_profit=observed)
+        elif case == "position_initial_margin":
+            account_position = replace(account_position, initial_margin=observed)
+        elif case == "position_maint_margin":
+            account_position = replace(account_position, maint_margin=observed)
+        elif case == "position_margin_components":
+            position = replace(position, position_initial_margin=observed)
+        elif case == "aggregate_position_initial_margin":
+            account = replace(account, total_position_initial_margin=observed)
+            asset = replace(asset, position_initial_margin=observed)
+        elif case == "aggregate_open_order_initial_margin":
+            account = replace(account, total_open_order_initial_margin=observed)
+            asset = replace(asset, open_order_initial_margin=observed)
+        elif case == "aggregate_initial_margin":
+            account = replace(account, total_initial_margin=observed)
+            asset = replace(asset, initial_margin=observed)
+        elif case == "aggregate_maint_margin":
+            account = replace(account, total_maint_margin=observed)
+            asset = replace(asset, maint_margin=observed)
+        elif case == "aggregate_pnl":
+            account = replace(
+                account,
+                total_unrealized_profit=observed,
+                total_cross_unrealized_profit=observed,
+            )
+            asset = replace(
+                asset,
+                unrealized_profit=observed,
+                cross_unrealized_profit=observed,
+            )
+        elif case == "aggregate_margin_balance":
+            account = replace(account, total_margin_balance=observed)
+            asset = replace(asset, margin_balance=observed)
+        else:
+            raise AssertionError(f"unsupported reconciliation case {case}")
+
+        account = replace(
+            account,
+            assets=(asset,),
+            positions=(account_position,),
+        )
+        return (
+            instrument,
+            account,
+            position,
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
+
+    def _bundle_with_available_balance(self, available_balance: Decimal) -> Tuple[Any, ...]:
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, brackets) = self._typed_bundle()
+        total_margin_balance = Decimal("1000000000000000000000000000")
+        total_wallet_balance = Decimal("999999999999999999999999998")
+        asset = replace(
+            account.assets[0],
+            wallet_balance=total_wallet_balance,
+            margin_balance=total_margin_balance,
+            cross_wallet_balance=total_wallet_balance,
+            available_balance=available_balance,
+            max_withdraw_amount=available_balance,
+        )
+        account = replace(
+            account,
+            total_wallet_balance=total_wallet_balance,
+            total_margin_balance=total_margin_balance,
+            total_cross_wallet_balance=total_wallet_balance,
+            available_balance=available_balance,
+            max_withdraw_amount=available_balance,
+            assets=(asset,),
+        )
+        return (
+            instrument,
+            account,
+            position,
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
+
+    def _bundle_with_uniform_pnl(
+            self,
+            pnl: Decimal,
+            wallet_balance: Decimal,
+            margin_balance: Decimal,
+    ) -> Tuple[Any, ...]:
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, brackets) = self._typed_bundle()
+        asset = replace(
+            account.assets[0],
+            wallet_balance=wallet_balance,
+            unrealized_profit=pnl,
+            margin_balance=margin_balance,
+            cross_wallet_balance=wallet_balance,
+            cross_unrealized_profit=pnl,
+        )
+        account = replace(
+            account,
+            total_wallet_balance=wallet_balance,
+            total_unrealized_profit=pnl,
+            total_margin_balance=margin_balance,
+            total_cross_wallet_balance=wallet_balance,
+            total_cross_unrealized_profit=pnl,
+            assets=(asset,),
+            positions=(replace(account.positions[0], unrealized_profit=pnl),),
+        )
+        position = replace(position, unrealized_profit=pnl)
+        return (
+            instrument,
+            account,
+            position,
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
 
     def _configure_preflight_sources(
             self,
@@ -1250,6 +1410,217 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
                 max_age_seconds=5,
                 consistency_tolerance=Decimal("0.01"),
             )
+
+    async def test_strict_preflight_reconciliation_is_exact_in_every_decimal_context(self):
+        exact_above_suffix = "9899999999999999999999999999999999999999"
+        reconciliation_cases = (
+            ("signed notional", "signed_notional", "-50", "-49.99", f"-49.{exact_above_suffix}"),
+            ("quantity", "quantity", "2", "1.99", f"1.{exact_above_suffix}"),
+            ("position PnL", "position_pnl", "2", "1.99", f"1.{exact_above_suffix}"),
+            ("position initial margin", "position_initial_margin", "13", "12.99", f"12.{exact_above_suffix}"),
+            (
+                "position maintenance margin",
+                "position_maint_margin",
+                "1.2",
+                "1.19",
+                f"1.1{exact_above_suffix[1:]}",
+            ),
+            ("position margin components", "position_margin_components", "10", "9.99", f"9.{exact_above_suffix}"),
+            (
+                "asset and aggregate position initial margin",
+                "aggregate_position_initial_margin",
+                "10",
+                "9.99",
+                f"9.{exact_above_suffix}",
+            ),
+            (
+                "asset and aggregate open-order initial margin",
+                "aggregate_open_order_initial_margin",
+                "3",
+                "2.99",
+                f"2.{exact_above_suffix}",
+            ),
+            (
+                "asset and aggregate initial margin",
+                "aggregate_initial_margin",
+                "13",
+                "12.99",
+                f"12.{exact_above_suffix}",
+            ),
+            (
+                "asset and aggregate maintenance margin",
+                "aggregate_maint_margin",
+                "1.2",
+                "1.19",
+                f"1.1{exact_above_suffix[1:]}",
+            ),
+            ("asset and aggregate PnL", "aggregate_pnl", "2", "1.99", f"1.{exact_above_suffix}"),
+            (
+                "asset and aggregate margin balance",
+                "aggregate_margin_balance",
+                "102",
+                "101.99",
+                f"101.{exact_above_suffix}",
+            ),
+        )
+        context_cases = (
+            ("low precision round down", 8, ROUND_DOWN),
+            ("low precision round up", 8, ROUND_UP),
+            ("default precision half even", 28, ROUND_HALF_EVEN),
+            ("high precision round down", 80, ROUND_DOWN),
+        )
+        boundary_cases = (
+            ("exact equality", 0, True),
+            ("inclusive exact tolerance", 1, True),
+            ("exactly representable above tolerance", 2, False),
+        )
+
+        for context_name, precision, rounding in context_cases:
+            for fact_name, case, *observations in reconciliation_cases:
+                for boundary_name, observation_index, accepted in boundary_cases:
+                    with self.subTest(
+                            context=context_name,
+                            fact=fact_name,
+                            boundary=boundary_name,
+                    ):
+                        exchange = self._new_exchange()
+                        bundle = self._bundle_with_reconciliation_observation(
+                            case,
+                            Decimal(observations[observation_index]),
+                        )
+                        self._configure_preflight_sources(exchange, bundle)
+
+                        with localcontext() as caller_context:
+                            caller_context.prec = precision
+                            caller_context.rounding = rounding
+                            caller_context.clear_flags()
+                            context_before = self._decimal_context_state(caller_context)
+                            if accepted:
+                                await exchange.strict_account_preflight(
+                                    trading_pairs=[self.trading_pair],
+                                    related_trading_pairs=[self.trading_pair],
+                                    known_position_trading_pairs=[self.trading_pair],
+                                    max_age_seconds=5,
+                                    consistency_tolerance=Decimal("0.01"),
+                                )
+                            else:
+                                with self.assertRaises(BinancePerpetualPreflightError):
+                                    await exchange.strict_account_preflight(
+                                        trading_pairs=[self.trading_pair],
+                                        related_trading_pairs=[self.trading_pair],
+                                        known_position_trading_pairs=[self.trading_pair],
+                                        max_age_seconds=5,
+                                        consistency_tolerance=Decimal("0.01"),
+                                    )
+                            self.assertEqual(
+                                context_before,
+                                self._decimal_context_state(caller_context),
+                            )
+                        exchange._api_post.assert_not_awaited()
+
+    async def test_strict_preflight_available_balance_tolerance_uses_an_exact_aggregate(self):
+        available_balances = (
+            ("exact equality", Decimal("1000000000000000000000000000"), True),
+            ("inclusive exact tolerance", Decimal("1000000000000000000000000000.01"), True),
+            (
+                "exactly representable above tolerance",
+                Decimal("1000000000000000000000000000.0100000000000000000000000000000000000001"),
+                False,
+            ),
+        )
+        context_cases = (
+            ("low precision round down", 8, ROUND_DOWN),
+            ("low precision round up", 8, ROUND_UP),
+            ("default precision half even", 28, ROUND_HALF_EVEN),
+            ("high precision round down", 80, ROUND_DOWN),
+        )
+
+        for context_name, precision, rounding in context_cases:
+            for boundary_name, available_balance, accepted in available_balances:
+                with self.subTest(context=context_name, boundary=boundary_name):
+                    exchange = self._new_exchange()
+                    self._configure_preflight_sources(
+                        exchange,
+                        self._bundle_with_available_balance(available_balance),
+                    )
+
+                    with localcontext() as caller_context:
+                        caller_context.prec = precision
+                        caller_context.rounding = rounding
+                        caller_context.clear_flags()
+                        context_before = self._decimal_context_state(caller_context)
+                        if accepted:
+                            await exchange.strict_account_preflight(
+                                trading_pairs=[self.trading_pair],
+                                related_trading_pairs=[self.trading_pair],
+                                known_position_trading_pairs=[self.trading_pair],
+                                max_age_seconds=5,
+                                consistency_tolerance=Decimal("0.01"),
+                            )
+                        else:
+                            with self.assertRaisesRegex(
+                                    BinancePerpetualPreflightError,
+                                    "availableBalance",
+                            ):
+                                await exchange.strict_account_preflight(
+                                    trading_pairs=[self.trading_pair],
+                                    related_trading_pairs=[self.trading_pair],
+                                    known_position_trading_pairs=[self.trading_pair],
+                                    max_age_seconds=5,
+                                    consistency_tolerance=Decimal("0.01"),
+                                )
+                        self.assertEqual(
+                            context_before,
+                            self._decimal_context_state(caller_context),
+                        )
+                    exchange._api_post.assert_not_awaited()
+
+    async def test_strict_preflight_rejects_unbounded_exact_reconciliation_operands(self):
+        oversized_coefficient = Decimal("1" * 129)
+        cases = (
+            (
+                "exponent",
+                self._bundle_with_uniform_pnl(
+                    pnl=Decimal("1E-129"),
+                    wallet_balance=Decimal("100"),
+                    margin_balance=Decimal("100"),
+                ),
+            ),
+            (
+                "coefficient",
+                self._bundle_with_uniform_pnl(
+                    pnl=oversized_coefficient,
+                    wallet_balance=Decimal("0"),
+                    margin_balance=oversized_coefficient,
+                ),
+            ),
+        )
+
+        for name, bundle in cases:
+            with self.subTest(component=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+                with localcontext() as caller_context:
+                    caller_context.prec = 256
+                    caller_context.rounding = ROUND_UP
+                    caller_context.clear_flags()
+                    context_before = self._decimal_context_state(caller_context)
+                    with self.assertRaisesRegex(
+                            BinancePerpetualPreflightError,
+                            "supported exact decimal precision",
+                    ):
+                        await exchange.strict_account_preflight(
+                            trading_pairs=[self.trading_pair],
+                            related_trading_pairs=[self.trading_pair],
+                            known_position_trading_pairs=[self.trading_pair],
+                            max_age_seconds=5,
+                            consistency_tolerance=Decimal("0.01"),
+                        )
+                    self.assertEqual(
+                        context_before,
+                        self._decimal_context_state(caller_context),
+                    )
+                exchange._api_post.assert_not_awaited()
 
     async def test_risk_preflight_validates_signed_position_notional_magnitude(self):
         base = self._typed_bundle()
