@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
@@ -266,6 +267,10 @@ class SessionConfig(StrictFrozenModel):
     historical_max_bp: NonNegativeDecimal
     position_tiers: Mapping[NonNegativeDecimal, PositiveDecimal]
     reduce_bp_by_current_target: Mapping[PositiveDecimal, NonNegativeDecimal]
+    divergence_cancel_bp: NonNegativeDecimal | None = None
+    divergence_confirmations: PositiveInt | None = None
+    entry_confirmations: PositiveInt | None = None
+    entry_confirmation_interval_ms: PositiveInt | None = None
 
     @field_validator("position_tiers", "reduce_bp_by_current_target", mode="before")
     @classmethod
@@ -312,6 +317,19 @@ class SessionConfig(StrictFrozenModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedSessionConfig:
+    session_name: SessionName
+    p99_bp: Decimal
+    historical_max_bp: Decimal
+    position_tiers: Mapping[Decimal, Decimal]
+    reduce_bp_by_current_target: Mapping[Decimal, Decimal]
+    divergence_cancel_bp: Decimal
+    divergence_confirmations: int
+    entry_confirmations: int
+    entry_confirmation_interval_ms: int
+
+
 class PairConfig(StrictFrozenModel):
     id: str
     enabled: bool
@@ -322,6 +340,8 @@ class PairConfig(StrictFrozenModel):
     etf_daily_multiplier: PositiveDecimal
     execution: PairExecutionConfig
     sessions: Mapping[SessionName, SessionConfig]
+    divergence_cancel_bp: NonNegativeDecimal | None = None
+    divergence_confirmations: PositiveInt | None = None
 
     @field_validator("id", "stock_trading_pair", "etf_trading_pair", "stock_nav_symbol", "etf_nav_symbol")
     @classmethod
@@ -356,7 +376,50 @@ class PairConfig(StrictFrozenModel):
         return self
 
     def session(self, session_name: SessionName) -> SessionConfig:
-        return self.sessions.get(session_name, self.sessions[SessionName.REGULAR])
+        return self.select_session(session_name)[1]
+
+    def select_session(self, session_name: SessionName) -> tuple[SessionName, SessionConfig]:
+        if not isinstance(session_name, SessionName):
+            raise TypeError("session name must be a SessionName")
+        if session_name in self.sessions:
+            return session_name, self.sessions[session_name]
+        return SessionName.REGULAR, self.sessions[SessionName.REGULAR]
+
+    def resolve_session(
+        self,
+        session_name: SessionName,
+        strategy: StrategyConfig,
+    ) -> ResolvedSessionConfig:
+        if not isinstance(strategy, StrategyConfig):
+            raise TypeError("strategy must be a StrategyConfig")
+        selected_name, selected_session = self.select_session(session_name)
+        divergence_cancel_bp = selected_session.divergence_cancel_bp
+        if divergence_cancel_bp is None:
+            divergence_cancel_bp = self.divergence_cancel_bp
+        if divergence_cancel_bp is None:
+            divergence_cancel_bp = strategy.divergence_cancel_bp
+        divergence_confirmations = selected_session.divergence_confirmations
+        if divergence_confirmations is None:
+            divergence_confirmations = self.divergence_confirmations
+        if divergence_confirmations is None:
+            divergence_confirmations = strategy.divergence_confirmations
+        entry_confirmations = selected_session.entry_confirmations
+        if entry_confirmations is None:
+            entry_confirmations = strategy.entry_confirmations
+        entry_confirmation_interval_ms = selected_session.entry_confirmation_interval_ms
+        if entry_confirmation_interval_ms is None:
+            entry_confirmation_interval_ms = strategy.entry_confirmation_interval_ms
+        return ResolvedSessionConfig(
+            session_name=selected_name,
+            p99_bp=selected_session.p99_bp,
+            historical_max_bp=selected_session.historical_max_bp,
+            position_tiers=selected_session.position_tiers,
+            reduce_bp_by_current_target=selected_session.reduce_bp_by_current_target,
+            divergence_cancel_bp=divergence_cancel_bp,
+            divergence_confirmations=divergence_confirmations,
+            entry_confirmations=entry_confirmations,
+            entry_confirmation_interval_ms=entry_confirmation_interval_ms,
+        )
 
 
 _PAIR_WHITELIST = {
@@ -427,3 +490,12 @@ class EquityLeveragedEtfArbitrageConfig(StrictFrozenModel):
     @property
     def enabled_pairs(self) -> tuple[PairConfig, ...]:
         return tuple(pair for pair in self.pairs if pair.enabled)
+
+    def resolve_session(self, pair_id: str, session_name: SessionName) -> ResolvedSessionConfig:
+        if not isinstance(pair_id, str):
+            raise TypeError("pair id must be a str")
+        try:
+            pair = next(pair for pair in self.pairs if pair.id == pair_id)
+        except StopIteration as exception:
+            raise ValueError(f"unknown configured pair id: {pair_id}") from exception
+        return pair.resolve_session(session_name, self.strategy)

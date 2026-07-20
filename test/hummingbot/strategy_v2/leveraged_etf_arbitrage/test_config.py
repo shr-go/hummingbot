@@ -2,6 +2,7 @@ import copy
 import json
 import tomllib
 from collections.abc import Mapping
+from dataclasses import FrozenInstanceError
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -11,6 +12,8 @@ from pydantic import BaseModel, ValidationError
 
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import (
     EquityLeveragedEtfArbitrageConfig,
+    PairConfig,
+    SessionConfig,
     SessionName,
 )
 
@@ -42,8 +45,12 @@ def _raw_mapping_value(raw: Mapping, key: object) -> object:
 
 
 def _assert_model_fields_come_from_input(model: BaseModel, raw: Mapping) -> None:
-    assert set(type(model).model_fields) == set(raw)
-    for field_name in type(model).model_fields:
+    model_fields = type(model).model_fields
+    assert set(raw) <= set(model_fields)
+    for missing_field in set(model_fields) - set(raw):
+        assert not model_fields[missing_field].is_required()
+        assert model_fields[missing_field].default is None
+    for field_name in raw:
         value = getattr(model, field_name)
         raw_value = raw[field_name]
         if isinstance(value, BaseModel):
@@ -79,8 +86,148 @@ def test_committed_example_parses_with_tomllib_and_full_pydantic_validation(exam
     assert config.strategy.maker_fee_bp == Decimal("0")
     assert config.risk.normal_initial_margin_budget_ratio == Decimal("0.80")
     assert config.pairs[0].etf_daily_multiplier == Decimal("2")
+    assert config.pairs[0].divergence_cancel_bp == Decimal("3")
+    assert config.pairs[0].divergence_confirmations == 3
+    regular = config.pairs[0].sessions[SessionName.REGULAR]
+    assert regular.divergence_cancel_bp == Decimal("3")
+    assert regular.divergence_confirmations == 3
+    assert regular.entry_confirmations == 3
+    assert regular.entry_confirmation_interval_ms == 1000
     assert config.pairs[0].sessions[SessionName.REGULAR].position_tiers[Decimal("140.99")] == Decimal("32")
+    assert set(PairConfig.model_fields) == set().union(*(pair.keys() for pair in example_data["pairs"]))
+    assert set(SessionConfig.model_fields) == set().union(
+        *(session.keys() for pair in example_data["pairs"] for session in pair["sessions"].values())
+    )
     _assert_model_fields_come_from_input(config, example_data)
+
+
+def test_selected_session_overrides_pair_and_strategy_values(example_data: dict):
+    strategy = example_data["strategy"]
+    pair = example_data["pairs"][0]
+    regular = pair["sessions"]["regular"]
+    strategy["divergence_cancel_bp"] = "1"
+    strategy["divergence_confirmations"] = 2
+    strategy["entry_confirmations"] = 2
+    strategy["entry_confirmation_interval_ms"] = 500
+    pair["divergence_cancel_bp"] = "5"
+    pair["divergence_confirmations"] = 4
+    regular["divergence_cancel_bp"] = "7"
+    regular["divergence_confirmations"] = 6
+    regular["entry_confirmations"] = 8
+    regular["entry_confirmation_interval_ms"] = 1500
+
+    config = EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+    resolved = config.resolve_session("sndk_snxx", SessionName.REGULAR)
+
+    assert resolved.session_name is SessionName.REGULAR
+    assert resolved.divergence_cancel_bp == Decimal("7")
+    assert resolved.divergence_confirmations == 6
+    assert resolved.entry_confirmations == 8
+    assert resolved.entry_confirmation_interval_ms == 1500
+
+
+def test_pair_override_wins_when_selected_session_has_no_divergence_override(example_data: dict):
+    pair = example_data["pairs"][0]
+    extended = copy.deepcopy(pair["sessions"]["regular"])
+    for field_name in (
+        "divergence_cancel_bp",
+        "divergence_confirmations",
+        "entry_confirmations",
+        "entry_confirmation_interval_ms",
+    ):
+        extended.pop(field_name)
+    pair["sessions"]["extended"] = extended
+    pair["divergence_cancel_bp"] = "9"
+    pair["divergence_confirmations"] = 7
+    example_data["strategy"]["entry_confirmations"] = 5
+    example_data["strategy"]["entry_confirmation_interval_ms"] = 750
+
+    config = EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+    resolved = config.resolve_session("sndk_snxx", SessionName.EXTENDED)
+
+    assert resolved.session_name is SessionName.EXTENDED
+    assert resolved.divergence_cancel_bp == Decimal("9")
+    assert resolved.divergence_confirmations == 7
+    assert resolved.entry_confirmations == 5
+    assert resolved.entry_confirmation_interval_ms == 750
+
+
+def test_strategy_globals_win_when_pair_and_selected_session_omit_overrides(example_data: dict):
+    config = EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+    resolved = config.resolve_session("intc_intw", SessionName.REGULAR)
+
+    assert resolved.session_name is SessionName.REGULAR
+    assert resolved.divergence_cancel_bp == config.strategy.divergence_cancel_bp
+    assert resolved.divergence_confirmations == config.strategy.divergence_confirmations
+    assert resolved.entry_confirmations == config.strategy.entry_confirmations
+    assert resolved.entry_confirmation_interval_ms == config.strategy.entry_confirmation_interval_ms
+
+
+def test_missing_optional_session_selects_complete_regular_before_precedence(example_data: dict):
+    pair_data = example_data["pairs"][0]
+    pair_data["divergence_cancel_bp"] = "11"
+    pair_data["divergence_confirmations"] = 9
+    config = EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+    pair = config.pairs[0]
+    regular = pair.sessions[SessionName.REGULAR]
+
+    resolved = config.resolve_session(pair.id, SessionName.WEEKEND_HOLIDAY)
+
+    assert resolved.session_name is SessionName.REGULAR
+    assert resolved.p99_bp == regular.p99_bp
+    assert resolved.historical_max_bp == regular.historical_max_bp
+    assert resolved.position_tiers is regular.position_tiers
+    assert resolved.reduce_bp_by_current_target is regular.reduce_bp_by_current_target
+    assert resolved.divergence_cancel_bp == regular.divergence_cancel_bp
+    assert resolved.divergence_confirmations == regular.divergence_confirmations
+    assert resolved.entry_confirmations == regular.entry_confirmations
+    assert resolved.entry_confirmation_interval_ms == regular.entry_confirmation_interval_ms
+    with pytest.raises(FrozenInstanceError):
+        resolved.divergence_confirmations = 99
+
+
+def test_zero_divergence_bp_override_is_valid(example_data: dict):
+    example_data["pairs"][0]["divergence_cancel_bp"] = "0"
+    example_data["pairs"][0]["sessions"]["regular"]["divergence_cancel_bp"] = "0"
+
+    config = EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+
+    assert config.resolve_session("sndk_snxx", SessionName.REGULAR).divergence_cancel_bp == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("pairs", 0, "divergence_cancel_bp"), "-0.01"),
+        (("pairs", 0, "divergence_cancel_bp"), "NaN"),
+        (("pairs", 0, "divergence_cancel_bp"), 1.0),
+        (("pairs", 0, "divergence_confirmations"), 0),
+        (("pairs", 0, "divergence_confirmations"), True),
+        (("pairs", 0, "divergence_confirmations"), 3.0),
+        (("pairs", 0, "sessions", "regular", "divergence_cancel_bp"), "-1"),
+        (("pairs", 0, "sessions", "regular", "divergence_cancel_bp"), "Infinity"),
+        (("pairs", 0, "sessions", "regular", "divergence_cancel_bp"), 1.0),
+        (("pairs", 0, "sessions", "regular", "divergence_confirmations"), 0),
+        (("pairs", 0, "sessions", "regular", "divergence_confirmations"), 3.0),
+        (("pairs", 0, "sessions", "regular", "entry_confirmations"), 0),
+        (("pairs", 0, "sessions", "regular", "entry_confirmations"), True),
+        (("pairs", 0, "sessions", "regular", "entry_confirmations"), 3.0),
+        (("pairs", 0, "sessions", "regular", "entry_confirmation_interval_ms"), 0),
+        (("pairs", 0, "sessions", "regular", "entry_confirmation_interval_ms"), 1000.0),
+    ],
+)
+def test_pair_and_session_override_values_are_strict(
+    example_data: dict,
+    path: tuple[object, ...],
+    value: object,
+):
+    _set_path(example_data, path, value)
+
+    with pytest.raises(ValidationError) as error_info:
+        EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+    matching_errors = [error for error in error_info.value.errors() if tuple(error["loc"]) == path]
+    assert matching_errors
+    assert all(error["type"] != "extra_forbidden" for error in matching_errors)
 
 
 def test_optional_sessions_use_complete_regular_fallback(example_data: dict):
