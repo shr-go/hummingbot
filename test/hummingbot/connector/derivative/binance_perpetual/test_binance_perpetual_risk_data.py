@@ -1,5 +1,14 @@
 from dataclasses import FrozenInstanceError, replace
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, localcontext
+from decimal import (
+    Decimal,
+    DivisionByZero,
+    InvalidOperation,
+    ROUND_DOWN,
+    ROUND_HALF_EVEN,
+    ROUND_UP,
+    Underflow,
+    localcontext,
+)
 from typing import Any, Dict, Tuple
 from unittest.mock import AsyncMock
 
@@ -312,6 +321,102 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
             tuple(sorted((signal.__name__, enabled) for signal, enabled in context.traps.items())),
         )
 
+    @staticmethod
+    def _decimal_context_matrix() -> Tuple[Tuple[str, int, str], ...]:
+        return tuple(
+            (
+                f"precision {precision} {rounding}",
+                precision,
+                rounding,
+            )
+            for precision in (8, 28, 80)
+            for rounding in (ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP)
+        )
+
+    @staticmethod
+    def _prime_decimal_context(context: Any, precision: int, rounding: str) -> None:
+        context.prec = precision
+        context.rounding = rounding
+        context.traps[InvalidOperation] = False
+        context.traps[DivisionByZero] = False
+        context.clear_flags()
+        context.flags[DivisionByZero] = True
+        context.flags[Underflow] = True
+
+    def _large_leverage_brackets(
+            self,
+            *,
+            notional_coef: str = "1",
+            first_cap: str = "100000000",
+    ) -> BinancePerpetualLeverageBrackets:
+        payload = self._brackets(
+            notionalCoef=notional_coef,
+            brackets=[
+                {
+                    "bracket": 1,
+                    "initialLeverage": 20,
+                    "notionalCap": first_cap,
+                    "notionalFloor": "0",
+                    "maintMarginRatio": "0.01",
+                    "cum": "0",
+                },
+                {
+                    "bracket": 2,
+                    "initialLeverage": 10,
+                    "notionalCap": "1000000000",
+                    "notionalFloor": first_cap,
+                    "maintMarginRatio": "0.02",
+                    "cum": "0",
+                },
+            ],
+        )
+        return BinancePerpetualLeverageBrackets.from_payload(
+            payload,
+            self.symbol,
+            self.data_time,
+            self.data_time,
+        )
+
+    def _bundle_with_leverage_state(
+            self,
+            *,
+            brackets: BinancePerpetualLeverageBrackets,
+            notional: Decimal,
+            max_notional_value: Decimal,
+    ) -> Tuple[Any, ...]:
+        (instrument, account, position, account_config, symbol_config,
+         multi_assets, position_mode, _) = self._typed_bundle()
+        position_amount = Decimal("-1") if notional.is_signed() else Decimal("1")
+        account = replace(
+            account,
+            positions=(replace(
+                account.positions[0],
+                position_amount=position_amount,
+                notional=notional,
+            ),),
+        )
+        position = replace(
+            position,
+            position_amount=position_amount,
+            mark_price=notional.copy_abs(),
+            notional=notional,
+        )
+        symbol_config = replace(
+            symbol_config,
+            leverage=20,
+            max_notional_value=max_notional_value,
+        )
+        return (
+            instrument,
+            account,
+            position,
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
+
     def _bundle_with_reconciliation_observation(
             self,
             case: str,
@@ -578,6 +683,192 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(2, brackets.bracket_for_notional(Decimal("1500")).bracket)
         self.assertEqual(Decimal("15.0"), brackets.brackets[1].adjusted_cum)
         self.assertEqual(Decimal("15.00"), brackets.maintenance_margin(Decimal("1500")))
+
+    async def test_leverage_bracket_membership_is_exact_in_every_decimal_context(self):
+        brackets = self._large_leverage_brackets()
+        boundary_cases = (
+            (
+                "strictly below cap",
+                Decimal("99999999.99"),
+                1,
+                Decimal("999999.9999"),
+                True,
+            ),
+            (
+                "exact boundary",
+                Decimal("100000000"),
+                2,
+                Decimal("2000000.00"),
+                False,
+            ),
+        )
+
+        for context_name, precision, rounding in self._decimal_context_matrix():
+            for boundary_name, magnitude, expected_bracket, expected_margin, accepted in boundary_cases:
+                for sign in (Decimal("1"), Decimal("-1")):
+                    signed_notional = magnitude.copy_negate() if sign.is_signed() else magnitude
+                    with self.subTest(
+                            context=context_name,
+                            boundary=boundary_name,
+                            sign="negative" if signed_notional.is_signed() else "positive",
+                    ):
+                        exchange = self._new_exchange()
+                        bundle = self._bundle_with_leverage_state(
+                            brackets=brackets,
+                            notional=signed_notional,
+                            max_notional_value=Decimal("100000000"),
+                        )
+                        self._configure_preflight_sources(exchange, bundle)
+
+                        with localcontext() as caller_context:
+                            self._prime_decimal_context(caller_context, precision, rounding)
+                            context_before = self._decimal_context_state(caller_context)
+                            self.assertEqual(
+                                expected_bracket,
+                                brackets.bracket_for_notional(signed_notional).bracket,
+                            )
+                            self.assertEqual(
+                                expected_margin,
+                                brackets.maintenance_margin(signed_notional),
+                            )
+                            if accepted:
+                                await exchange.strict_account_preflight(
+                                    trading_pairs=[self.trading_pair],
+                                    related_trading_pairs=[self.trading_pair],
+                                    known_position_trading_pairs=[self.trading_pair],
+                                    max_age_seconds=5,
+                                    consistency_tolerance=Decimal("0.01"),
+                                )
+                            else:
+                                with self.assertRaisesRegex(
+                                        BinancePerpetualPreflightError,
+                                        "configured leverage",
+                                ):
+                                    await exchange.strict_account_preflight(
+                                        trading_pairs=[self.trading_pair],
+                                        related_trading_pairs=[self.trading_pair],
+                                        known_position_trading_pairs=[self.trading_pair],
+                                        max_age_seconds=5,
+                                        consistency_tolerance=Decimal("0.01"),
+                                    )
+                            self.assertEqual(
+                                context_before,
+                                self._decimal_context_state(caller_context),
+                            )
+                        exchange._api_post.assert_not_awaited()
+
+    async def test_adjusted_leverage_cap_is_exact_in_every_decimal_context(self):
+        above_coefficient = f"1.{'0' * 39}1"
+        exact_above_cap = Decimal(f"100000000.{'0' * 31}1")
+        below_coefficient = f"0.{'9' * 40}"
+        exact_below_cap = Decimal(f"99999999.{'9' * 32}")
+        above_brackets = self._large_leverage_brackets(notional_coef=above_coefficient)
+        below_brackets = self._large_leverage_brackets(notional_coef=below_coefficient)
+        cap_cases = (
+            (
+                "exact authoritative adjusted cap",
+                above_brackets,
+                exact_above_cap,
+                exact_above_cap,
+                True,
+            ),
+            (
+                "minimally lower configured cap",
+                above_brackets,
+                exact_above_cap,
+                Decimal("100000000"),
+                False,
+            ),
+            (
+                "minimally higher configured cap",
+                below_brackets,
+                exact_below_cap,
+                Decimal("100000000"),
+                False,
+            ),
+        )
+
+        for context_name, precision, rounding in self._decimal_context_matrix():
+            for case_name, brackets, authoritative_cap, configured_cap, accepted in cap_cases:
+                with self.subTest(context=context_name, cap=case_name):
+                    exchange = self._new_exchange()
+                    bundle = self._bundle_with_leverage_state(
+                        brackets=brackets,
+                        notional=Decimal("50"),
+                        max_notional_value=configured_cap,
+                    )
+                    self._configure_preflight_sources(exchange, bundle)
+
+                    with localcontext() as caller_context:
+                        self._prime_decimal_context(caller_context, precision, rounding)
+                        context_before = self._decimal_context_state(caller_context)
+                        self.assertEqual(
+                            authoritative_cap,
+                            brackets.brackets[0].adjusted_notional_cap,
+                        )
+                        self.assertEqual(
+                            authoritative_cap,
+                            brackets.brackets[1].adjusted_notional_floor,
+                        )
+                        self.assertEqual(
+                            authoritative_cap,
+                            brackets.max_notional_for_leverage(20),
+                        )
+                        if accepted:
+                            await exchange.strict_account_preflight(
+                                trading_pairs=[self.trading_pair],
+                                related_trading_pairs=[self.trading_pair],
+                                known_position_trading_pairs=[self.trading_pair],
+                                max_age_seconds=5,
+                                consistency_tolerance=Decimal("0.01"),
+                            )
+                        else:
+                            with self.assertRaisesRegex(
+                                    BinancePerpetualPreflightError,
+                                    "maxNotionalValue",
+                            ):
+                                await exchange.strict_account_preflight(
+                                    trading_pairs=[self.trading_pair],
+                                    related_trading_pairs=[self.trading_pair],
+                                    known_position_trading_pairs=[self.trading_pair],
+                                    max_age_seconds=5,
+                                    consistency_tolerance=Decimal("0.01"),
+                                )
+                        self.assertEqual(
+                            context_before,
+                            self._decimal_context_state(caller_context),
+                        )
+                    exchange._api_post.assert_not_awaited()
+
+    def test_leverage_bracket_exact_arithmetic_rejects_unbounded_operands_without_context_mutation(self):
+        brackets = self._large_leverage_brackets()
+        oversized = Decimal("1" * 129)
+        oversized_cap_bracket = replace(brackets.brackets[0], notional_cap=oversized)
+        cases = (
+            (
+                "membership notional",
+                lambda: brackets.bracket_for_notional(oversized),
+            ),
+            (
+                "adjusted cap",
+                lambda: oversized_cap_bracket.adjusted_notional_cap,
+            ),
+        )
+
+        for case_name, operation in cases:
+            with self.subTest(case=case_name):
+                with localcontext() as caller_context:
+                    self._prime_decimal_context(caller_context, 8, ROUND_UP)
+                    context_before = self._decimal_context_state(caller_context)
+                    with self.assertRaisesRegex(
+                            BinancePerpetualRiskDataError,
+                            "supported exact decimal precision",
+                    ):
+                        operation()
+                    self.assertEqual(
+                        context_before,
+                        self._decimal_context_state(caller_context),
+                    )
 
     def test_leverage_brackets_reject_missing_or_inconsistent_data(self):
         payload = self._brackets()
