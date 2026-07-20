@@ -2254,7 +2254,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertTrue("OID1" in self.exchange._order_tracker._in_flight_orders)
 
     @aioresponses()
-    async def test_create_order_exception(self, req_mock):
+    async def test_create_order_transport_exception_remains_submission_unknown(self, req_mock):
         url = web_utils.private_rest_url(
             CONSTANTS.ORDER_URL, domain=self.domain
         )
@@ -2271,14 +2271,14 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             price=Decimal("1010"))
         await asyncio.sleep(0.001)
 
-        self.assertTrue("OID1" not in self.exchange._order_tracker._in_flight_orders)
+        tracked_order = self.exchange._order_tracker._in_flight_orders["OID1"]
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertTrue(self.exchange.is_order_submission_unknown("OID1"))
 
-        # The order amount is quantizied
-        # "Error submitting buy LIMIT order to Binance_perpetual for 9999 COINALPHA-HBOT 1010."
         self.assertTrue(self._is_logged(
-            "NETWORK",
-            f"Error submitting {TradeType.BUY.name.lower()} {OrderType.LIMIT.name.upper()} order to {self.exchange.name_cap} for "
-            f"{Decimal('9999')} {self.trading_pair} {Decimal('1010')}.",
+            "WARNING",
+            "Submission outcome is unknown for order OID1; reconcile it before any retry.",
         ))
 
     async def test_create_order_min_order_size_failure(self):
