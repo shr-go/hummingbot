@@ -188,6 +188,24 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             raise BinancePerpetualOrderDataError(f"{field} must be a finite decimal")
         return parsed
 
+    def _unknown_stream_average_quote_tolerance(
+            self,
+            tracked_order: InFlightOrder,
+            average_fill_price: Decimal,
+            cumulative_fill_base_amount: Decimal,
+    ) -> Decimal:
+        # Binance can round or truncate `ap`. One reported least-significant
+        # price unit is therefore the conservative bound, capped by the symbol
+        # tick when that authoritative precision is finer than the report.
+        reported_price_quantum = Decimal(1).scaleb(average_fill_price.as_tuple().exponent)
+        price_tolerance = reported_price_quantum
+        trading_rule = self._trading_rules.get(tracked_order.trading_pair)
+        if trading_rule is not None:
+            symbol_price_quantum = trading_rule.min_price_increment
+            if symbol_price_quantum.is_finite() and symbol_price_quantum > 0:
+                price_tolerance = min(price_tolerance, symbol_price_quantum)
+        return price_tolerance * cumulative_fill_base_amount
+
     def _validate_snapshot_matches_tracked_order(
             self,
             snapshot: BinancePerpetualOrderSnapshot,
@@ -1366,19 +1384,23 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             order_message.get("L"),
             "user stream last fill price",
         )
-        cumulative_fill_quote_amount = self._validated_finite_decimal(
-            order_message.get("Z"),
-            "user stream cumulative fill quote amount",
-        )
+        cumulative_fill_quote_amount = None
+        if "Z" in order_message:
+            cumulative_fill_quote_amount = self._validated_finite_decimal(
+                order_message.get("Z"),
+                "user stream cumulative fill quote amount",
+            )
+        non_negative_fill_values = [
+            last_fill_base_amount,
+            cumulative_fill_base_amount,
+            average_fill_price,
+            last_fill_price,
+        ]
+        if cumulative_fill_quote_amount is not None:
+            non_negative_fill_values.append(cumulative_fill_quote_amount)
         if any(
             value < 0
-            for value in (
-                last_fill_base_amount,
-                cumulative_fill_base_amount,
-                average_fill_price,
-                last_fill_price,
-                cumulative_fill_quote_amount,
-            )
+            for value in non_negative_fill_values
         ):
             raise BinancePerpetualOrderDataError(
                 "user stream fill quantities and prices must be non-negative"
@@ -1387,24 +1409,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             raise BinancePerpetualOrderDataError(
                 "user stream cumulative fill quantity exceeds the order quantity"
             )
-        if (
-            cumulative_fill_base_amount < tracked_order.executed_amount_base
-            or cumulative_fill_quote_amount < tracked_order.executed_amount_quote
-        ):
+        if cumulative_fill_base_amount < tracked_order.executed_amount_base:
             raise BinancePerpetualOrderDataError("user stream cumulative fill rolled back")
-        if cumulative_fill_base_amount == 0:
-            if average_fill_price != 0 or cumulative_fill_quote_amount != 0:
-                raise BinancePerpetualOrderDataError(
-                    "user stream zero cumulative fill has contradictory price facts"
-                )
-        elif (
-            average_fill_price <= 0
-            or cumulative_fill_quote_amount <= 0
-            or average_fill_price * cumulative_fill_base_amount != cumulative_fill_quote_amount
-        ):
-            raise BinancePerpetualOrderDataError(
-                "user stream cumulative fill price facts are contradictory"
-            )
 
         trade_update = None
         if execution_type == "NEW":
@@ -1419,6 +1425,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 raise BinancePerpetualOrderDataError(
                     "user stream new order contains contradictory fill facts"
                 )
+            expected_cumulative_fill_quote_amount = Decimal("0")
         elif execution_type == "TRADE":
             if trade_id == "0" or last_fill_price <= 0 or last_fill_base_amount <= 0:
                 raise BinancePerpetualOrderDataError(
@@ -1480,21 +1487,22 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 if (
                     candidate_trade_update != existing_fill
                     or cumulative_fill_base_amount != tracked_order.executed_amount_base
-                    or cumulative_fill_quote_amount != tracked_order.executed_amount_quote
                 ):
                     raise BinancePerpetualOrderDataError(
                         "user stream duplicate trade facts are contradictory"
                     )
+                expected_cumulative_fill_quote_amount = tracked_order.executed_amount_quote
             else:
                 if (
                     cumulative_fill_base_amount
                     != tracked_order.executed_amount_base + last_fill_base_amount
-                    or cumulative_fill_quote_amount
-                    != tracked_order.executed_amount_quote + candidate_trade_update.fill_quote_amount
                 ):
                     raise BinancePerpetualOrderDataError(
                         "user stream cumulative and last fill facts are contradictory"
                     )
+                expected_cumulative_fill_quote_amount = (
+                    tracked_order.executed_amount_quote + candidate_trade_update.fill_quote_amount
+                )
                 trade_update = candidate_trade_update
         else:
             if (
@@ -1502,10 +1510,41 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 or last_fill_base_amount != 0
                 or last_fill_price != 0
                 or cumulative_fill_base_amount != tracked_order.executed_amount_base
-                or cumulative_fill_quote_amount != tracked_order.executed_amount_quote
             ):
                 raise BinancePerpetualOrderDataError(
                     "user stream terminal order contains contradictory fill facts"
+                )
+            expected_cumulative_fill_quote_amount = tracked_order.executed_amount_quote
+
+        if (
+            cumulative_fill_quote_amount is not None
+            and cumulative_fill_quote_amount != expected_cumulative_fill_quote_amount
+        ):
+            raise BinancePerpetualOrderDataError(
+                "user stream cumulative fill quote amount is contradictory"
+            )
+        if cumulative_fill_base_amount == 0:
+            if average_fill_price != 0 or expected_cumulative_fill_quote_amount != 0:
+                raise BinancePerpetualOrderDataError(
+                    "user stream zero cumulative fill has contradictory price facts"
+                )
+        elif average_fill_price <= 0 or expected_cumulative_fill_quote_amount <= 0:
+            raise BinancePerpetualOrderDataError(
+                "user stream cumulative fill price facts are contradictory"
+            )
+        else:
+            average_quote_difference = (
+                average_fill_price * cumulative_fill_base_amount
+                - expected_cumulative_fill_quote_amount
+            ).copy_abs()
+            average_quote_tolerance = self._unknown_stream_average_quote_tolerance(
+                tracked_order=tracked_order,
+                average_fill_price=average_fill_price,
+                cumulative_fill_base_amount=cumulative_fill_base_amount,
+            )
+            if average_quote_difference > average_quote_tolerance:
+                raise BinancePerpetualOrderDataError(
+                    "user stream cumulative fill price facts are contradictory"
                 )
 
         order_update = OrderUpdate(
