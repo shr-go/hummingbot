@@ -145,6 +145,136 @@ class RaisingSubmissionResponseMapping(dict):
         return super().get(key, default)
 
 
+ROUND_3_SUBMISSION_FIELDS = (
+    "response",
+    "code",
+    "status",
+    "status_code",
+    "http_status",
+    "statusCode",
+    "httpStatus",
+    "msg",
+    "message",
+    "error_message",
+    "errorMessage",
+)
+
+
+class CountedSubmissionProxyTarget:
+    def __init__(self):
+        object.__setattr__(self, "field_accesses", {})
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in ROUND_3_SUBMISSION_FIELDS:
+            accesses = object.__getattribute__(self, "field_accesses")
+            accesses[name] = accesses.get(name, 0) + 1
+        return object.__getattribute__(self, name)
+
+    def __str__(self) -> str:
+        return "neutral delegated submission target"
+
+
+class FailingSubmissionProxyTarget(CountedSubmissionProxyTarget):
+    @property
+    def response(self) -> Any:
+        raise AttributeError("delegated response accessor failed")
+
+
+class MissingSubmissionProxyTarget(CountedSubmissionProxyTarget):
+    pass
+
+
+class TransparentSubmissionProxy:
+    def __init__(self, target: Any):
+        self._target = target
+        self.field_accesses = {}
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ROUND_3_SUBMISSION_FIELDS:
+            self.field_accesses[name] = self.field_accesses.get(name, 0) + 1
+        return getattr(self._target, name)
+
+    def __str__(self) -> str:
+        return str(self._target)
+
+
+class ChangingStructuredSubmissionFacts:
+    def __init__(self):
+        object.__setattr__(self, "response", None)
+        object.__setattr__(self, "code", -2010)
+        object.__setattr__(self, "msg", "NEW_ORDER_REJECTED")
+        object.__setattr__(self, "status_values", [400, 503])
+        object.__setattr__(self, "status_accesses", 0)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "status":
+            accesses = object.__getattribute__(self, "status_accesses")
+            values = object.__getattribute__(self, "status_values")
+            object.__setattr__(self, "status_accesses", accesses + 1)
+            return values[min(accesses, len(values) - 1)]
+        return object.__getattribute__(self, name)
+
+    def __str__(self) -> str:
+        return "HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED"
+
+
+def submission_facts_with_raising_field(field: str, exception_type: type[Exception]) -> Any:
+    class RaisingStructuredSubmissionFacts:
+        response = None
+        status = 400
+        code = -2010
+        msg = "NEW_ORDER_REJECTED"
+
+        def __init__(self):
+            self.field_accesses = 0
+
+        def __str__(self) -> str:
+            return "HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED"
+
+    def raising_field(candidate: Any) -> Any:
+        candidate.field_accesses += 1
+        raise exception_type(f"{field} accessor failed")
+
+    setattr(RaisingStructuredSubmissionFacts, field, property(raising_field))
+    return RaisingStructuredSubmissionFacts()
+
+
+def round_3_submission_proxy_cases() -> List[tuple[str, IOError, Any, Any]]:
+    cases = []
+    for proxy_kind in ("transparent", "weakref"):
+        for position in ("outer", "bounded"):
+            target = FailingSubmissionProxyTarget()
+            proxy = (
+                TransparentSubmissionProxy(target)
+                if proxy_kind == "transparent"
+                else weakref.proxy(target)
+            )
+            failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+            failure.status = 400
+            failure.code = -2010
+            failure.msg = "NEW_ORDER_REJECTED"
+            failure.response = (
+                proxy
+                if position == "outer"
+                else SubmissionResponseNode(response=proxy)
+            )
+            cases.append((f"{position}-{proxy_kind}-failing", failure, target, proxy))
+
+        target = MissingSubmissionProxyTarget()
+        proxy = (
+            TransparentSubmissionProxy(target)
+            if proxy_kind == "transparent"
+            else weakref.proxy(target)
+        )
+        failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+        failure.status = 400
+        failure.code = -2010
+        failure.msg = "NEW_ORDER_REJECTED"
+        failure.response = proxy
+        cases.append((f"outer-{proxy_kind}-genuinely-missing", failure, target, proxy))
+    return cases
+
+
 class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
     # the level is required to receive logs from the data source logger
     level = 0
@@ -4860,6 +4990,194 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(1, outer_accessor.response_accesses)
         self.assertEqual(1, nested_accessor.response_accesses)
+
+    def test_round_3_submission_evidence_proxy_boundaries_fail_closed_once(self):
+        for label, failure, target, proxy in round_3_submission_proxy_cases():
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+                    classify_binance_order_submission_failure(failure),
+                )
+                self.assertEqual(
+                    {field: 1 for field in ROUND_3_SUBMISSION_FIELDS},
+                    target.field_accesses,
+                )
+                if isinstance(proxy, TransparentSubmissionProxy):
+                    self.assertEqual(
+                        {field: 1 for field in ROUND_3_SUBMISSION_FIELDS},
+                        proxy.field_accesses,
+                    )
+
+    def test_round_3_submission_evidence_structured_field_failures_are_indeterminate_once(self):
+        structured_fields = tuple(
+            field for field in ROUND_3_SUBMISSION_FIELDS if field != "response"
+        )
+        for field in structured_fields:
+            for exception_type in (AttributeError, RuntimeError):
+                with self.subTest(field=field, exception=exception_type.__name__):
+                    failure = submission_facts_with_raising_field(field, exception_type)
+                    self.assertIs(
+                        BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+                        classify_binance_order_submission_failure(failure),
+                    )
+                    self.assertEqual(1, failure.field_accesses)
+
+        changing_failure = ChangingStructuredSubmissionFacts()
+        self.assertIs(
+            BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+            classify_binance_order_submission_failure(changing_failure),
+        )
+        self.assertEqual(1, changing_failure.status_accesses)
+
+    async def test_round_3_submission_evidence_indeterminate_public_lifecycle_stays_unknown(self):
+        self._simulate_trading_rules_initialized()
+        cases = [
+            (label, failure, target, proxy)
+            for label, failure, target, proxy in round_3_submission_proxy_cases()
+        ]
+        for field, exception_type in (
+            ("status", AttributeError),
+            ("code", RuntimeError),
+            ("errorMessage", AttributeError),
+        ):
+            structured_failure = submission_facts_with_raising_field(field, exception_type)
+            failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+            failure.status = 400
+            failure.code = -2010
+            failure.msg = "NEW_ORDER_REJECTED"
+            failure.response = structured_failure
+            cases.append((f"structured-{field}-{exception_type.__name__}", failure, structured_failure, None))
+
+        for index, (label, failure, target, proxy) in enumerate(cases):
+            with self.subTest(boundary=label):
+                client_order_id = f"t007-r3-public-{index}"
+                failure_logger = EventLogger()
+                self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+                try:
+                    self.exchange._api_post = AsyncMock(side_effect=failure)
+                    submitted_id = self.exchange.buy(
+                        trading_pair=self.trading_pair,
+                        amount=Decimal("3"),
+                        order_type=OrderType.MARKET,
+                        price=Decimal("10000"),
+                        client_order_id=client_order_id,
+                        position_action=PositionAction.OPEN,
+                    )
+                    await asyncio.sleep(0.01)
+
+                    tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+                    intent = self.exchange._unknown_submission_order_intents.get(client_order_id)
+                    self.assertEqual(
+                        {
+                            "submitted_id": client_order_id,
+                            "client_order_id": client_order_id,
+                            "state": OrderState.PENDING_CREATE,
+                            "exchange_order_id": None,
+                            "in_flight": True,
+                            "reserved": True,
+                            "intent": (CONSTANTS.TIME_IN_FORCE_GTC, False, False, "BOTH"),
+                            "submission_unknown": True,
+                            "failure_events": 0,
+                        },
+                        {
+                            "submitted_id": submitted_id,
+                            "client_order_id": tracked_order.client_order_id,
+                            "state": tracked_order.current_state,
+                            "exchange_order_id": tracked_order.exchange_order_id,
+                            "in_flight": client_order_id in self.exchange.in_flight_orders,
+                            "reserved": client_order_id in self.exchange._reserved_client_order_ids,
+                            "intent": None if intent is None else (
+                                intent.time_in_force,
+                                intent.reduce_only,
+                                intent.close_position,
+                                intent.position_side,
+                            ),
+                            "submission_unknown": self.exchange.is_order_submission_unknown(
+                                client_order_id
+                            ),
+                            "failure_events": len(failure_logger.event_log),
+                        },
+                    )
+                finally:
+                    self.exchange.remove_listener(MarketEvent.OrderFailure, failure_logger)
+
+                if proxy is None:
+                    self.assertEqual(1, target.field_accesses)
+                else:
+                    self.assertEqual(
+                        {field: 1 for field in ROUND_3_SUBMISSION_FIELDS},
+                        target.field_accesses,
+                    )
+                    if isinstance(proxy, TransparentSubmissionProxy):
+                        self.assertEqual(
+                            {field: 1 for field in ROUND_3_SUBMISSION_FIELDS},
+                            proxy.field_accesses,
+                        )
+
+    def test_round_3_submission_evidence_trusted_carrier_controls_remain_authoritative(self):
+        native_rest_failure = IOError(
+            "Error executing request POST /fapi/v1/order. HTTP status is 400. "
+            "Error: {'code': -2010, 'msg': 'NEW_ORDER_REJECTED'}"
+        )
+        null_response_failure = IOError(
+            "HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED"
+        )
+        null_response_failure.response = None
+        finite_missing_failure = IOError(
+            "HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED"
+        )
+        finite_missing_failure.response = SubmissionResponseNode(
+            response=SubmissionResponseText("neutral final response")
+        )
+        cases = (
+            ("native-rest-oserror", native_rest_failure),
+            ("exact-builtin-dict", {
+                "status": 400,
+                "code": -2010,
+                "msg": "NEW_ORDER_REJECTED",
+            }),
+            ("ordinary-missing-response", IOError(
+                "HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED"
+            )),
+            ("ordinary-null-response", null_response_failure),
+            ("finite-ordinary-missing-chain", finite_missing_failure),
+        )
+
+        for label, failure in cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION,
+                    classify_binance_order_submission_failure(failure),
+                )
+
+    async def test_round_3_submission_evidence_native_rejection_public_lifecycle_fails(self):
+        client_order_id = "t007-r3-native-reject-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(side_effect=IOError(
+            "Error executing request POST /fapi/v1/order. HTTP status is 400. "
+            "Error: {'code': -2010, 'msg': 'NEW_ORDER_REJECTED'}"
+        ))
+        failure_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+
+        submitted_id = self.exchange.buy(
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.MARKET,
+            price=Decimal("10000"),
+            client_order_id=client_order_id,
+            position_action=PositionAction.OPEN,
+        )
+        await asyncio.sleep(0.01)
+
+        tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+        self.assertEqual(client_order_id, submitted_id)
+        self.assertEqual(OrderState.FAILED, tracked_order.current_state)
+        self.assertNotIn(client_order_id, self.exchange.in_flight_orders)
+        self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+        self.assertNotIn(client_order_id, self.exchange._unknown_submission_order_intents)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+        self.assertEqual(1, len(failure_logger.event_log))
 
     def test_review_bounded_response_chain_completeness_fact_matrix(self):
         def authoritative_failure() -> IOError:
