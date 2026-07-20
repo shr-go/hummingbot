@@ -375,54 +375,6 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     @staticmethod
-    def _unknown_stream_order_mutation_snapshot(tracked_order: InFlightOrder) -> Tuple[Any, ...]:
-        return (
-            tracked_order.exchange_order_id,
-            tracked_order.current_state,
-            tracked_order.executed_amount_base,
-            tracked_order.executed_amount_quote,
-            dict(tracked_order.order_fills),
-            tracked_order.last_update_timestamp,
-            tracked_order.exchange_order_id_update_event.is_set(),
-            tracked_order.processed_by_exchange_event.is_set(),
-            tracked_order.completely_filled_event.is_set(),
-        )
-
-    @staticmethod
-    def _restore_unknown_stream_order_mutation(
-            tracked_order: InFlightOrder,
-            snapshot: Tuple[Any, ...],
-    ) -> None:
-        (
-            exchange_order_id,
-            current_state,
-            executed_amount_base,
-            executed_amount_quote,
-            order_fills,
-            last_update_timestamp,
-            exchange_order_id_event_is_set,
-            processed_event_is_set,
-            completely_filled_event_is_set,
-        ) = snapshot
-        tracked_order.exchange_order_id = exchange_order_id
-        tracked_order.current_state = current_state
-        tracked_order.executed_amount_base = executed_amount_base
-        tracked_order.executed_amount_quote = executed_amount_quote
-        tracked_order.order_fills.clear()
-        tracked_order.order_fills.update(order_fills)
-        tracked_order.last_update_timestamp = last_update_timestamp
-        event_states = (
-            (tracked_order.exchange_order_id_update_event, exchange_order_id_event_is_set),
-            (tracked_order.processed_by_exchange_event, processed_event_is_set),
-            (tracked_order.completely_filled_event, completely_filled_event_is_set),
-        )
-        for event, should_be_set in event_states:
-            if should_be_set:
-                event.set()
-            else:
-                event.clear()
-
-    @staticmethod
     def _unknown_stream_tracked_totals_are_exact(
             tracked_order: InFlightOrder,
             expected_base: Decimal,
@@ -1857,14 +1809,15 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                         trade_update.fill_quote_amount,
                         "user stream tracked cumulative fill quote amount",
                     )
-                    mutation_snapshot = self._unknown_stream_order_mutation_snapshot(tracked_order)
-                    try:
-                        with localcontext(self._unknown_stream_tracker_decimal_context()):
-                            self._order_tracker.process_trade_update(trade_update)
+                    with localcontext(self._unknown_stream_tracker_decimal_context()):
+                        staged_update = self._order_tracker.stage_trade_update(trade_update)
                         if (
-                            tracked_order.order_fills.get(trade_update.trade_id) != trade_update
+                            staged_update is None
+                            or not staged_update.updated
+                            or staged_update.staged_order.order_fills.get(trade_update.trade_id)
+                            != trade_update
                             or not self._unknown_stream_tracked_totals_are_exact(
-                                tracked_order=tracked_order,
+                                tracked_order=staged_update.staged_order,
                                 expected_base=expected_base,
                                 expected_quote=expected_quote,
                             )
@@ -1872,18 +1825,10 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                             raise BinancePerpetualOrderDataError(
                                 "user stream trade update was not applied exactly"
                             )
-                    except asyncio.CancelledError:
-                        self._restore_unknown_stream_order_mutation(
-                            tracked_order=tracked_order,
-                            snapshot=mutation_snapshot,
-                        )
-                        raise
-                    except Exception:
-                        self._restore_unknown_stream_order_mutation(
-                            tracked_order=tracked_order,
-                            snapshot=mutation_snapshot,
-                        )
-                        raise
+                        if not self._order_tracker.commit_trade_update(staged_update):
+                            raise BinancePerpetualOrderDataError(
+                                "user stream trade update was not committed"
+                            )
                 elif not self._unknown_stream_tracked_totals_are_exact(
                     tracked_order=tracked_order,
                     expected_base=tracked_order.executed_amount_base,

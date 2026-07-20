@@ -792,7 +792,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             fill_timestamp=1,
         )
         self.tracker.process_trade_update(first_update)
-        self.order_filled_logger.event_log.clear()
+        self.order_filled_logger.clear()
         second_update = first_update._replace(
             trade_id=2,
             fill_timestamp=2,

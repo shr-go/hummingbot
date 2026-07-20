@@ -614,6 +614,13 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
                 expected_trade_update.fill_price,
                 expected_trade_update.fill_base_amount,
                 expected_trade_update.fill_quote_amount,
+                type(expected_trade_update.fee).__name__,
+                expected_trade_update.fee.percent,
+                expected_trade_update.fee.percent_token,
+                tuple(
+                    (flat_fee.token, flat_fee.amount)
+                    for flat_fee in expected_trade_update.fee.flat_fees
+                ),
             ),),
             False,
             expected_order_update.update_timestamp,
