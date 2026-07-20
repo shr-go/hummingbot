@@ -43,10 +43,10 @@ CREATE TABLE LeveragedEtfExecutorSnapshot (
     CONSTRAINT ck_lepf_snapshot_sequence CHECK (last_journal_sequence >= 0),
     CONSTRAINT ck_lepf_snapshot_hash CHECK (
         typeof(snapshot_hash) = 'text'
+        AND instr(snapshot_hash, char(0)) = 0
         AND length(snapshot_hash) = 64
-        AND length(CAST(snapshot_hash AS BLOB)) = 64
         AND snapshot_hash = lower(snapshot_hash)
-        AND snapshot_hash NOT GLOB '*[^0-9a-f]*'
+        AND snapshot_hash NOT GLOB '*[^0123456789abcdef]*'
     )
 );
 
