@@ -795,6 +795,213 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
                 max_age_seconds=5,
             )
 
+    def test_risk_dtos_reject_economically_impossible_values_and_duplicate_identities(self):
+        for field in (
+            "totalInitialMargin",
+            "totalMaintMargin",
+            "totalPositionInitialMargin",
+            "totalOpenOrderInitialMargin",
+        ):
+            with self.subTest(endpoint="account", field=field):
+                with self.assertRaises(BinancePerpetualRiskDataError):
+                    BinancePerpetualAccountRiskSnapshot.from_payload(
+                        self._account_v3(**{field: "-1"}),
+                        self.data_time,
+                    )
+
+        for field in (
+            "maintMargin",
+            "initialMargin",
+            "positionInitialMargin",
+            "openOrderInitialMargin",
+        ):
+            with self.subTest(endpoint="account asset", field=field):
+                payload = self._account_v3()
+                payload["assets"][0][field] = "-1"
+                with self.assertRaises(BinancePerpetualRiskDataError):
+                    BinancePerpetualAccountRiskSnapshot.from_payload(payload, self.data_time)
+
+        for field in ("isolatedMargin", "isolatedWallet", "initialMargin", "maintMargin"):
+            with self.subTest(endpoint="account position", field=field):
+                payload = self._account_v3()
+                payload["positions"][0][field] = "-1"
+                with self.assertRaises(BinancePerpetualRiskDataError):
+                    BinancePerpetualAccountRiskSnapshot.from_payload(payload, self.data_time)
+
+        for field in (
+            "isolatedMargin",
+            "isolatedWallet",
+            "initialMargin",
+            "maintMargin",
+            "positionInitialMargin",
+            "openOrderInitialMargin",
+            "bidNotional",
+            "askNotional",
+        ):
+            with self.subTest(endpoint="position", field=field):
+                with self.assertRaises(BinancePerpetualRiskDataError):
+                    BinancePerpetualPositionRiskSnapshot.from_payload(
+                        self._position_v3(**{field: "-1"}),
+                        self.data_time,
+                    )
+
+        for field in ("entryPrice", "breakEvenPrice", "markPrice"):
+            with self.subTest(endpoint="active position price", field=field):
+                with self.assertRaises(BinancePerpetualRiskDataError):
+                    BinancePerpetualPositionRiskSnapshot.from_payload(
+                        self._position_v3(**{field: "0"}),
+                        self.data_time,
+                    )
+
+        sign_cases = (
+            (self._account_v3, {"positionAmt": "2", "notional": "-50"}),
+            (self._account_v3, {"positionAmt": "0", "notional": "1"}),
+            (self._position_v3, {"positionAmt": "2", "notional": "-50"}),
+            (self._position_v3, {"positionAmt": "0", "notional": "1"}),
+        )
+        for index, (factory, updates) in enumerate(sign_cases):
+            with self.subTest(endpoint="signed notional", case=index):
+                if factory == self._account_v3:
+                    payload = factory()
+                    payload["positions"][0].update(updates)
+                    with self.assertRaises(BinancePerpetualRiskDataError):
+                        BinancePerpetualAccountRiskSnapshot.from_payload(payload, self.data_time)
+                else:
+                    with self.assertRaises(BinancePerpetualRiskDataError):
+                        BinancePerpetualPositionRiskSnapshot.from_payload(
+                            factory(**updates),
+                            self.data_time,
+                        )
+
+        duplicate_assets = self._account_v3()
+        duplicate_assets["assets"].append(duplicate_assets["assets"][0].copy())
+        with self.assertRaisesRegex(BinancePerpetualRiskDataError, "duplicate.*asset"):
+            BinancePerpetualAccountRiskSnapshot.from_payload(duplicate_assets, self.data_time)
+
+        duplicate_positions = self._account_v3()
+        duplicate_positions["positions"].append(duplicate_positions["positions"][0].copy())
+        with self.assertRaisesRegex(BinancePerpetualRiskDataError, "duplicate.*position"):
+            BinancePerpetualAccountRiskSnapshot.from_payload(duplicate_positions, self.data_time)
+
+        inactive = BinancePerpetualPositionRiskSnapshot.from_payload(
+            self._position_v3(
+                positionAmt="0",
+                notional="0",
+                entryPrice="0",
+                breakEvenPrice="0",
+                markPrice="0",
+            ),
+            self.data_time,
+        )
+        self.assertFalse(inactive.has_activity)
+
+    async def test_risk_preflight_revalidates_typed_domains_and_signed_notional_views(self):
+        base = self._typed_bundle()
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = base
+        negative = Decimal("-1")
+
+        negative_account_position = replace(account.positions[0], maint_margin=negative)
+        negative_asset = replace(account.assets[0], maint_margin=negative)
+        negative_margin_bundle = (
+            instrument,
+            replace(
+                account,
+                total_maint_margin=negative,
+                assets=(negative_asset,),
+                positions=(negative_account_position,),
+            ),
+            replace(position, maint_margin=negative),
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
+        impossible_bundles = (
+            ("negative reconciled maintenance margin", negative_margin_bundle),
+            (
+                "negative bid notional",
+                (instrument, account, replace(position, bid_notional=negative), account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "zero active mark price",
+                (instrument, account, replace(position, mark_price=Decimal("0")), account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "signed notional contradicts quantity",
+                (instrument,
+                 replace(account, positions=(replace(account.positions[0], notional=Decimal("-50")),)),
+                 replace(position, notional=Decimal("-50")), account_config,
+                 symbol_config, multi_assets, position_mode, brackets),
+            ),
+            (
+                "duplicate asset identity",
+                (instrument, replace(account, assets=(account.assets[0], account.assets[0])), position,
+                 account_config, symbol_config, multi_assets, position_mode, brackets),
+            ),
+        )
+
+        for name, bundle in impossible_bundles:
+            with self.subTest(name=name):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, bundle)
+                with self.assertRaises(BinancePerpetualPreflightError):
+                    await exchange.strict_account_preflight(
+                        trading_pairs=[self.trading_pair],
+                        related_trading_pairs=[self.trading_pair],
+                        known_position_trading_pairs=[self.trading_pair],
+                        max_age_seconds=5,
+                        consistency_tolerance=Decimal("0.01"),
+                    )
+                exchange._api_post.assert_not_awaited()
+
+    async def test_risk_preflight_reconciles_account_and_position_notional_at_exact_tolerance(self):
+        base = self._typed_bundle()
+        instrument, account, position, account_config, symbol_config, multi_assets, position_mode, brackets = base
+
+        exact_boundary = (
+            instrument,
+            account,
+            replace(position, notional=Decimal("50.01")),
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, exact_boundary)
+        await exchange.strict_account_preflight(
+            trading_pairs=[self.trading_pair],
+            related_trading_pairs=[self.trading_pair],
+            known_position_trading_pairs=[self.trading_pair],
+            max_age_seconds=5,
+            consistency_tolerance=Decimal("0.01"),
+        )
+
+        outside_boundary = (
+            instrument,
+            account,
+            replace(position, notional=Decimal("50.0100001")),
+            account_config,
+            symbol_config,
+            multi_assets,
+            position_mode,
+            brackets,
+        )
+        exchange = self._new_exchange()
+        self._configure_preflight_sources(exchange, outside_boundary)
+        with self.assertRaisesRegex(BinancePerpetualPreflightError, "notional|reconcile"):
+            await exchange.strict_account_preflight(
+                trading_pairs=[self.trading_pair],
+                related_trading_pairs=[self.trading_pair],
+                known_position_trading_pairs=[self.trading_pair],
+                max_age_seconds=5,
+                consistency_tolerance=Decimal("0.01"),
+            )
+
     async def test_strict_preflight_identifies_each_authoritative_fetch_failure(self):
         fetches = {
             "get_account_risk_snapshot": "Account Information V3",
