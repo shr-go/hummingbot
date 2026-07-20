@@ -1346,9 +1346,9 @@ def test_recovery_discovery_rejects_gap_extra_and_orphan_rows(
     reopened = _open_manager(db_path)
     try:
         recovery_repository = LeveragedEtfJournalRepository(reopened)
-        with pytest.raises(JournalIntegrityError, match="sequence|orphan|snapshot|journal|replay"):
+        with pytest.raises(JournalIntegrityError, match="sequence|orphan|snapshot|journal|replay|intent"):
             recovery_repository.incomplete_executors()
-        with pytest.raises(JournalIntegrityError, match="sequence|orphan|snapshot|journal|replay"):
+        with pytest.raises(JournalIntegrityError, match="sequence|orphan|snapshot|journal|replay|intent"):
             recovery_repository.incomplete_intents(initial.executor_id)
     finally:
         reopened.engine.dispose()
