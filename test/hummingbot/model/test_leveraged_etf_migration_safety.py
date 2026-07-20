@@ -124,6 +124,154 @@ def _append_compiled_constraint(create_sql: str, constraint_sql: str) -> str:
     return f"{create_sql[:closing_index]}, \n\t{constraint_sql}{create_sql[closing_index:]}"
 
 
+def _install_round5_sqlite_syntax_variant(connection: sqlite3.Connection, variant: str) -> str:
+    table_name = LeveragedEtfExecutorSnapshot.__tablename__
+    if variant == "check_operand_parentheses":
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "CHECK (schema_version = 1)",
+                "CHECK (([schema_version]) == ((1)))",
+                1,
+            ),
+        )
+        return "([schema_version]) == ((1))"
+
+    _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+    if variant == "trigger_for_each_added":
+        trigger_sql = SQLITE_GUARD_DDL["lepf_snapshot_executor_id_no_update"].replace(
+            f"ON {table_name}",
+            f"ON {table_name}\n        FOR EACH ROW",
+            1,
+        )
+        connection.execute(trigger_sql)
+        return "FOR EACH ROW"
+    if variant == "trigger_for_each_omitted":
+        trigger_sql = SQLITE_GUARD_DDL["lepf_snapshot_identity_insert"].replace(
+            "FOR EACH ROW",
+            "",
+            1,
+        )
+        connection.execute(trigger_sql)
+        return "BEFORE INSERT"
+    if variant == "trigger_main_schema":
+        trigger_sql = SQLITE_GUARD_DDL["lepf_snapshot_identity_insert"].replace(
+            f"ON {table_name}",
+            f"ON main.{table_name}",
+            1,
+        )
+        trigger_sql = trigger_sql.replace(
+            f"FROM {table_name}",
+            f"FROM main.{table_name}",
+            1,
+        )
+        connection.execute(trigger_sql)
+        return f"ON main.{table_name}"
+    if variant == "index_explicit_asc":
+        connection.execute(f"CREATE INDEX lepf_snapshot_updated ON {table_name} (updated_at_utc ASC)")
+        return "updated_at_utc ASC"
+    if variant == "index_explicit_binary":
+        connection.execute(f"CREATE INDEX lepf_snapshot_updated ON {table_name} (updated_at_utc COLLATE BINARY)")
+        return "updated_at_utc COLLATE BINARY"
+    if variant == "index_explicit_binary_asc":
+        connection.execute(f"CREATE INDEX lepf_snapshot_updated ON {table_name} " "(updated_at_utc COLLATE BINARY ASC)")
+        return "updated_at_utc COLLATE BINARY ASC"
+    raise AssertionError(f"unknown round-five SQLite syntax variant: {variant}")
+
+
+def _round5_variant_sql(db_path: Path, variant: str) -> str:
+    object_type = (
+        "table"
+        if variant == "check_operand_parentheses"
+        else ("trigger" if variant.startswith("trigger_") else "index")
+    )
+    object_name = {
+        "table": LeveragedEtfExecutorSnapshot.__tablename__,
+        "trigger": (
+            "lepf_snapshot_executor_id_no_update"
+            if variant == "trigger_for_each_added"
+            else "lepf_snapshot_identity_insert"
+        ),
+        "index": "lepf_snapshot_updated",
+    }[object_type]
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type, object_name),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _install_round5_meaningful_drift(connection: sqlite3.Connection, drift: str) -> None:
+    table_name = LeveragedEtfExecutorSnapshot.__tablename__
+    if drift == "check_value":
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "CHECK (schema_version = 1)",
+                "CHECK ((schema_version) = (2))",
+                1,
+            ),
+        )
+        return
+    if drift == "index_auxiliary_rows":
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=lambda create_sql: f"{create_sql.rstrip()} WITHOUT ROWID",
+        )
+        connection.execute(f"CREATE INDEX lepf_snapshot_updated ON {table_name} (updated_at_utc COLLATE BINARY ASC)")
+        auxiliary_rows = [
+            row for row in connection.execute('PRAGMA index_xinfo("lepf_snapshot_updated")') if not row[5]
+        ]
+        assert auxiliary_rows and auxiliary_rows[0][2] == "executor_id"
+        return
+
+    _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+    if drift.startswith("trigger_"):
+        trigger_sql = SQLITE_GUARD_DDL["lepf_snapshot_identity_insert"]
+        if drift == "trigger_target":
+            connection.execute("CREATE TABLE SnapshotShadow (executor_id TEXT)")
+            trigger_sql = trigger_sql.replace(table_name, "SnapshotShadow", 1)
+        elif drift == "trigger_body":
+            trigger_sql = trigger_sql.replace("identity already exists", "different body")
+        elif drift == "trigger_for_each_literal":
+            trigger_sql = trigger_sql.replace("identity already exists", "FOR EACH ROW")
+        elif drift == "trigger_main_literal":
+            trigger_sql = trigger_sql.replace("identity already exists", f"main.{table_name}")
+        else:
+            raise AssertionError(f"unknown round-five trigger drift: {drift}")
+        connection.execute(trigger_sql)
+        return
+
+    index_keys = {
+        "index_desc": ("lepf_snapshot_updated", "updated_at_utc DESC", ""),
+        "index_nocase": ("lepf_snapshot_updated", "updated_at_utc COLLATE NOCASE", ""),
+        "index_expression": ("lepf_snapshot_updated", "lower(updated_at_utc)", ""),
+        "index_predicate": (
+            "lepf_snapshot_updated",
+            "updated_at_utc",
+            " WHERE updated_at_utc IS NOT NULL",
+        ),
+        "index_key_order": (
+            "lepf_snapshot_controller_state",
+            "state, controller_id",
+            "",
+        ),
+    }
+    if drift == "index_target_table":
+        connection.execute("CREATE TABLE SnapshotIndexShadow (updated_at_utc TEXT)")
+        connection.execute("CREATE INDEX lepf_snapshot_updated ON SnapshotIndexShadow (updated_at_utc)")
+        return
+    if drift not in index_keys:
+        raise AssertionError(f"unknown round-five index drift: {drift}")
+    index_name, key_sql, predicate_sql = index_keys[drift]
+    connection.execute(f"CREATE INDEX {index_name} ON {table_name} ({key_sql}){predicate_sql}")
+
+
 def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "original") -> None:
     connection.execute(
         text("""
@@ -913,6 +1061,72 @@ def test_schema_validation_accepts_equivalent_expressions_and_sqlite_autoindexes
 
     reopened = _open_manager(db_path)
     reopened.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "check_operand_parentheses",
+        "trigger_for_each_added",
+        "trigger_for_each_omitted",
+        "trigger_main_schema",
+        "index_explicit_asc",
+        "index_explicit_binary",
+        "index_explicit_binary_asc",
+    ],
+)
+def test_round5_sqlite_noop_syntax_survives_legacy_migration_and_current_reopen(
+    tmp_path: Path,
+    variant: str,
+):
+    db_path = _materialize_legacy_database(tmp_path, f"round5-equivalent-{variant}.sqlite")
+    with sqlite3.connect(db_path) as connection:
+        marker = _install_round5_sqlite_syntax_variant(connection, variant)
+
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+    assert _version(db_path) == TARGET_VERSION
+
+    persisted_sql = _round5_variant_sql(db_path, variant)
+    assert marker in persisted_sql
+    if variant == "trigger_for_each_omitted":
+        assert "FOR EACH ROW" not in persisted_sql
+
+    reopened = _open_manager(db_path)
+    reopened.engine.dispose()
+    assert _round5_variant_sql(db_path, variant) == persisted_sql
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "check_value",
+        "trigger_target",
+        "trigger_body",
+        "trigger_for_each_literal",
+        "trigger_main_literal",
+        "index_desc",
+        "index_nocase",
+        "index_expression",
+        "index_predicate",
+        "index_target_table",
+        "index_key_order",
+        "index_auxiliary_rows",
+    ],
+)
+def test_round5_meaningful_schema_drift_remains_rejected_before_version_stamp(
+    tmp_path: Path,
+    drift: str,
+):
+    db_path = _materialize_legacy_database(tmp_path, f"round5-drift-{drift}.sqlite")
+    with sqlite3.connect(db_path) as connection:
+        _install_round5_meaningful_drift(connection, drift)
+
+    with pytest.raises(DatabaseMigrationError, match="schema|CHECK|trigger|index"):
+        unexpected = _open_manager(db_path)
+        unexpected.engine.dispose()
+
+    _assert_legacy_data_unchanged(db_path)
 
 
 OR_REPLACE_CASES = [
