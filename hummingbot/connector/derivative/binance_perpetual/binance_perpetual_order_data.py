@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from inspect import getattr_static
 from typing import Any, Mapping, Optional
 
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -91,7 +92,14 @@ def _submission_response(candidate: Any) -> tuple[Any, bool]:
     try:
         if isinstance(candidate, Mapping):
             return candidate.get("response", _MISSING_SUBMISSION_FACT), False
-        return getattr(candidate, "response", _MISSING_SUBMISSION_FACT), False
+        response = getattr(candidate, "response", _MISSING_SUBMISSION_FACT)
+        if (
+            response is _MISSING_SUBMISSION_FACT
+            and getattr_static(candidate, "response", _MISSING_SUBMISSION_FACT)
+            is not _MISSING_SUBMISSION_FACT
+        ):
+            return _MISSING_SUBMISSION_FACT, True
+        return response, False
     except Exception:
         return _MISSING_SUBMISSION_FACT, True
 
