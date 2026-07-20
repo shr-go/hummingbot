@@ -1,7 +1,15 @@
 import asyncio
 import math
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import (
+    Context,
+    Decimal,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow,
+    ROUND_HALF_EVEN,
+    localcontext,
+)
 from typing import Any, AsyncIterable, Collection, Dict, List, Mapping, Optional, Tuple
 
 from bidict import bidict
@@ -66,6 +74,9 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     LONG_POLL_INTERVAL = 120.0
     MAX_ACCOUNT_DATA_AGE_SECONDS = 5
     MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS = 128
+    # The tracker also quantizes remaining base to 1e-8 after applying an exact fill.
+    UNKNOWN_STREAM_TRACKER_DECIMAL_PRECISION = 3 * MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
+    UNKNOWN_STREAM_TRACKER_DECIMAL_EXPONENT_LIMIT = 2 * MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
 
     def __init__(
             self,
@@ -347,6 +358,85 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             half_tick,
             cumulative_fill_base_amount,
             "user stream average price tolerance",
+        )
+
+    @classmethod
+    def _unknown_stream_tracker_decimal_context(cls) -> Context:
+        exponent_limit = cls.UNKNOWN_STREAM_TRACKER_DECIMAL_EXPONENT_LIMIT
+        return Context(
+            prec=cls.UNKNOWN_STREAM_TRACKER_DECIMAL_PRECISION,
+            rounding=ROUND_HALF_EVEN,
+            Emin=-exponent_limit,
+            Emax=exponent_limit,
+            capitals=1,
+            clamp=0,
+            flags=[],
+            traps=[InvalidOperation, DivisionByZero, Overflow],
+        )
+
+    @staticmethod
+    def _unknown_stream_order_mutation_snapshot(tracked_order: InFlightOrder) -> Tuple[Any, ...]:
+        return (
+            tracked_order.exchange_order_id,
+            tracked_order.current_state,
+            tracked_order.executed_amount_base,
+            tracked_order.executed_amount_quote,
+            dict(tracked_order.order_fills),
+            tracked_order.last_update_timestamp,
+            tracked_order.exchange_order_id_update_event.is_set(),
+            tracked_order.processed_by_exchange_event.is_set(),
+            tracked_order.completely_filled_event.is_set(),
+        )
+
+    @staticmethod
+    def _restore_unknown_stream_order_mutation(
+            tracked_order: InFlightOrder,
+            snapshot: Tuple[Any, ...],
+    ) -> None:
+        (
+            exchange_order_id,
+            current_state,
+            executed_amount_base,
+            executed_amount_quote,
+            order_fills,
+            last_update_timestamp,
+            exchange_order_id_event_is_set,
+            processed_event_is_set,
+            completely_filled_event_is_set,
+        ) = snapshot
+        tracked_order.exchange_order_id = exchange_order_id
+        tracked_order.current_state = current_state
+        tracked_order.executed_amount_base = executed_amount_base
+        tracked_order.executed_amount_quote = executed_amount_quote
+        tracked_order.order_fills.clear()
+        tracked_order.order_fills.update(order_fills)
+        tracked_order.last_update_timestamp = last_update_timestamp
+        event_states = (
+            (tracked_order.exchange_order_id_update_event, exchange_order_id_event_is_set),
+            (tracked_order.processed_by_exchange_event, processed_event_is_set),
+            (tracked_order.completely_filled_event, completely_filled_event_is_set),
+        )
+        for event, should_be_set in event_states:
+            if should_be_set:
+                event.set()
+            else:
+                event.clear()
+
+    @staticmethod
+    def _unknown_stream_tracked_totals_are_exact(
+            tracked_order: InFlightOrder,
+            expected_base: Decimal,
+            expected_quote: Decimal,
+    ) -> bool:
+        tracked_base = tracked_order.executed_amount_base
+        tracked_quote = tracked_order.executed_amount_quote
+        return (
+            isinstance(tracked_base, Decimal)
+            and tracked_base.is_finite()
+            and tracked_base == expected_base
+            and isinstance(tracked_quote, Decimal)
+            and tracked_quote.is_finite()
+            and tracked_quote == expected_quote
         )
 
     def _validate_snapshot_matches_tracked_order(
@@ -1757,13 +1847,51 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                     tracked_order=tracked_order,
                 )
                 if trade_update is not None:
-                    with localcontext() as tracker_decimal_context:
-                        tracker_decimal_context.prec = self.MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
-                        self._order_tracker.process_trade_update(trade_update)
-                    if tracked_order.order_fills.get(trade_update.trade_id) != trade_update:
-                        raise BinancePerpetualOrderDataError(
-                            "user stream trade update was not applied"
+                    expected_base = self._unknown_stream_exact_decimal_add(
+                        tracked_order.executed_amount_base,
+                        trade_update.fill_base_amount,
+                        "user stream tracked cumulative fill quantity",
+                    )
+                    expected_quote = self._unknown_stream_exact_decimal_add(
+                        tracked_order.executed_amount_quote,
+                        trade_update.fill_quote_amount,
+                        "user stream tracked cumulative fill quote amount",
+                    )
+                    mutation_snapshot = self._unknown_stream_order_mutation_snapshot(tracked_order)
+                    try:
+                        with localcontext(self._unknown_stream_tracker_decimal_context()):
+                            self._order_tracker.process_trade_update(trade_update)
+                        if (
+                            tracked_order.order_fills.get(trade_update.trade_id) != trade_update
+                            or not self._unknown_stream_tracked_totals_are_exact(
+                                tracked_order=tracked_order,
+                                expected_base=expected_base,
+                                expected_quote=expected_quote,
+                            )
+                        ):
+                            raise BinancePerpetualOrderDataError(
+                                "user stream trade update was not applied exactly"
+                            )
+                    except asyncio.CancelledError:
+                        self._restore_unknown_stream_order_mutation(
+                            tracked_order=tracked_order,
+                            snapshot=mutation_snapshot,
                         )
+                        raise
+                    except Exception:
+                        self._restore_unknown_stream_order_mutation(
+                            tracked_order=tracked_order,
+                            snapshot=mutation_snapshot,
+                        )
+                        raise
+                elif not self._unknown_stream_tracked_totals_are_exact(
+                    tracked_order=tracked_order,
+                    expected_base=tracked_order.executed_amount_base,
+                    expected_quote=tracked_order.executed_amount_quote,
+                ):
+                    raise BinancePerpetualOrderDataError(
+                        "user stream tracked cumulative fill state is not finite"
+                    )
                 await self._order_tracker.process_order_update(order_update)
                 if (
                     tracked_order.exchange_order_id != order_update.exchange_order_id
