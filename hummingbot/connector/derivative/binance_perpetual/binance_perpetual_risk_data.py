@@ -19,6 +19,14 @@ _MAX_EXACT_DECIMAL_DIGITS = 128
 # Endpoint payload size and aligned integer width stay finite even for adversarial account rows.
 _MAX_EXACT_DECIMAL_AGGREGATE_TERMS = 4096
 _MAX_EXACT_DECIMAL_AGGREGATE_DIGITS = 4 * _MAX_EXACT_DECIMAL_DIGITS + 8
+_MAX_EXACT_DECIMAL_PRODUCT_TERMS = 3
+_MAX_EXACT_DECIMAL_PRODUCT_DIGITS = (
+    _MAX_EXACT_DECIMAL_PRODUCT_TERMS * _MAX_EXACT_DECIMAL_DIGITS
+)
+_MAX_EXACT_DECIMAL_PRODUCT_EXPONENT = (
+    2 * _MAX_EXACT_DECIMAL_PRODUCT_TERMS * _MAX_EXACT_DECIMAL_DIGITS
+)
+_MAX_EXACT_DECIMAL_ARITHMETIC_DIGITS = 2 * _MAX_EXACT_DECIMAL_AGGREGATE_DIGITS
 
 
 def _mapping(value: Any, context: str) -> Mapping[str, Any]:
@@ -185,6 +193,10 @@ def _exact_decimal_sum_components(
 def _exact_decimal_product_components(
         values: Sequence[Tuple[Decimal, str]],
 ) -> Tuple[int, int]:
+    if len(values) > _MAX_EXACT_DECIMAL_PRODUCT_TERMS:
+        raise BinancePerpetualRiskDataError(
+            "exact decimal product exceeds supported operand count"
+        )
     components = tuple(
         _exact_decimal_components(value, field)
         for value, field in values
@@ -196,7 +208,64 @@ def _exact_decimal_product_components(
     for value_coefficient, value_exponent in components:
         coefficient *= value_coefficient
         exponent += value_exponent
+    if (
+            len(str(abs(coefficient))) > _MAX_EXACT_DECIMAL_PRODUCT_DIGITS
+            or abs(exponent) > _MAX_EXACT_DECIMAL_PRODUCT_EXPONENT
+    ):
+        raise BinancePerpetualRiskDataError(
+            "exact decimal product exceeds supported exact decimal precision"
+        )
     return coefficient, exponent
+
+
+def _exact_decimal_component_sum(
+        components: Sequence[Tuple[int, int]],
+        context: str,
+) -> Tuple[int, int]:
+    if len(components) > _MAX_EXACT_DECIMAL_AGGREGATE_TERMS:
+        raise BinancePerpetualRiskDataError(
+            f"{context} exceeds supported exact decimal aggregate size"
+        )
+    if not components:
+        return 0, 0
+    common_exponent = min(exponent for _, exponent in components)
+    coefficient = sum(
+        value_coefficient * 10 ** (value_exponent - common_exponent)
+        for value_coefficient, value_exponent in components
+    )
+    if coefficient == 0:
+        return 0, 0
+    while coefficient % 10 == 0:
+        coefficient //= 10
+        common_exponent += 1
+    if (
+            len(str(abs(coefficient))) > _MAX_EXACT_DECIMAL_ARITHMETIC_DIGITS
+            or abs(common_exponent) > _MAX_EXACT_DECIMAL_ARITHMETIC_DIGITS
+    ):
+        raise BinancePerpetualRiskDataError(
+            f"{context} exceeds supported exact decimal arithmetic precision"
+        )
+    return coefficient, common_exponent
+
+
+def _decimal_from_exact_components(
+        components: Tuple[int, int],
+        context: str,
+) -> Decimal:
+    coefficient, exponent = components
+    digits_text = str(abs(coefficient))
+    if (
+            len(digits_text) > _MAX_EXACT_DECIMAL_ARITHMETIC_DIGITS
+            or abs(exponent) > _MAX_EXACT_DECIMAL_ARITHMETIC_DIGITS
+    ):
+        raise BinancePerpetualRiskDataError(
+            f"{context} exceeds supported exact decimal arithmetic precision"
+        )
+    return Decimal((
+        int(coefficient < 0),
+        tuple(ord(digit) - ord("0") for digit in digits_text),
+        exponent,
+    ))
 
 
 def _exact_decimal_components_compare(
@@ -979,21 +1048,71 @@ class BinancePerpetualLeverageBracket:
     cum: Decimal
     notional_coef: Decimal
 
+    def _adjusted_components(
+            self,
+            value: Decimal,
+            field: str,
+    ) -> Tuple[int, int]:
+        return _exact_decimal_product_components((
+            (value, field),
+            (self.notional_coef, "leverage brackets.notionalCoef"),
+        ))
+
+    def _adjusted_notional_cap_components(self) -> Tuple[int, int]:
+        return self._adjusted_components(
+            self.notional_cap,
+            f"leverage bracket {self.bracket}.notionalCap",
+        )
+
+    def _adjusted_notional_floor_components(self) -> Tuple[int, int]:
+        return self._adjusted_components(
+            self.notional_floor,
+            f"leverage bracket {self.bracket}.notionalFloor",
+        )
+
+    def _adjusted_cum_components(self) -> Tuple[int, int]:
+        return self._adjusted_components(
+            self.cum,
+            f"leverage bracket {self.bracket}.cum",
+        )
+
     @property
     def adjusted_notional_cap(self) -> Decimal:
-        return self.notional_cap * self.notional_coef
+        return _decimal_from_exact_components(
+            self._adjusted_notional_cap_components(),
+            f"leverage bracket {self.bracket} adjusted notional cap",
+        )
 
     @property
     def adjusted_notional_floor(self) -> Decimal:
-        return self.notional_floor * self.notional_coef
+        return _decimal_from_exact_components(
+            self._adjusted_notional_floor_components(),
+            f"leverage bracket {self.bracket} adjusted notional floor",
+        )
 
     @property
     def adjusted_cum(self) -> Decimal:
-        return self.cum * self.notional_coef
+        return _decimal_from_exact_components(
+            self._adjusted_cum_components(),
+            f"leverage bracket {self.bracket} adjusted cumulative margin",
+        )
 
     def contains(self, notional: Decimal) -> bool:
-        absolute_notional = abs(notional)
-        return self.adjusted_notional_floor <= absolute_notional < self.adjusted_notional_cap
+        coefficient, exponent = _exact_decimal_components(
+            notional,
+            "leverage bracket notional",
+        )
+        absolute_notional_components = abs(coefficient), exponent
+        return (
+            _exact_decimal_components_compare(
+                self._adjusted_notional_floor_components(),
+                absolute_notional_components,
+            ) <= 0
+            and _exact_decimal_components_compare(
+                absolute_notional_components,
+                self._adjusted_notional_cap_components(),
+            ) < 0
+        )
 
 
 @dataclass(frozen=True)
@@ -1089,7 +1208,7 @@ class BinancePerpetualLeverageBrackets:
             if bracket.contains(notional):
                 return bracket
         raise BinancePerpetualRiskDataError(
-            f"absolute notional {abs(notional)} is outside the returned leverage brackets for {self.symbol}"
+            f"absolute notional {notional.copy_abs()} is outside the returned leverage brackets for {self.symbol}"
         )
 
     def max_notional_for_leverage(self, leverage: int) -> Decimal:
@@ -1106,9 +1225,28 @@ class BinancePerpetualLeverageBrackets:
         return eligible[-1].adjusted_notional_cap
 
     def maintenance_margin(self, notional: Decimal) -> Decimal:
-        absolute_notional = abs(notional)
-        bracket = self.bracket_for_notional(absolute_notional)
-        return max(Decimal("0"), absolute_notional * bracket.maint_margin_ratio - bracket.adjusted_cum)
+        bracket = self.bracket_for_notional(notional)
+        margin_components = _exact_decimal_product_components((
+            (notional.copy_abs(), "leverage bracket maintenance notional"),
+            (
+                bracket.maint_margin_ratio,
+                f"leverage bracket {bracket.bracket}.maintMarginRatio",
+            ),
+        ))
+        cumulative_coefficient, cumulative_exponent = bracket._adjusted_cum_components()
+        maintenance_components = _exact_decimal_component_sum(
+            (
+                margin_components,
+                (-cumulative_coefficient, cumulative_exponent),
+            ),
+            f"leverage bracket {bracket.bracket} maintenance margin",
+        )
+        if _exact_decimal_components_compare(maintenance_components, (0, 0)) <= 0:
+            return Decimal("0")
+        return _decimal_from_exact_components(
+            maintenance_components,
+            f"leverage bracket {bracket.bracket} maintenance margin",
+        )
 
 
 @dataclass(frozen=True)
