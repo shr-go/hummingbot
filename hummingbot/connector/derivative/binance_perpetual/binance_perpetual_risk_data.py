@@ -94,6 +94,50 @@ def _data_time(value: Any) -> float:
     return parsed
 
 
+def _validate_decimal_value(
+        value: Any,
+        field: str,
+        *,
+        non_negative: bool = False,
+        positive: bool = False,
+) -> None:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise BinancePerpetualRiskDataError(f"{field} must be a finite Decimal")
+    if positive and value <= 0:
+        raise BinancePerpetualRiskDataError(f"{field} must be positive")
+    if non_negative and value < 0:
+        raise BinancePerpetualRiskDataError(f"{field} must be non-negative")
+
+
+def _validate_position_identity_and_notional(
+        position_side: Any,
+        position_amount: Any,
+        notional: Any,
+        context: str,
+) -> None:
+    if not isinstance(position_side, str) or position_side not in {"BOTH", "LONG", "SHORT"}:
+        raise BinancePerpetualRiskDataError(f"{context}.positionSide is unsupported")
+    _validate_decimal_value(position_amount, f"{context}.positionAmt")
+    _validate_decimal_value(notional, f"{context}.notional")
+    if (position_amount == 0) != (notional == 0):
+        raise BinancePerpetualRiskDataError(
+            f"{context} position amount and signed notional zero state is contradictory"
+        )
+    if position_amount != 0 and position_amount.is_signed() != notional.is_signed():
+        raise BinancePerpetualRiskDataError(
+            f"{context} signed notional direction contradicts position amount"
+        )
+    if position_side == "LONG" and position_amount < 0:
+        raise BinancePerpetualRiskDataError(f"{context} LONG position amount must be non-negative")
+    if position_side == "SHORT" and position_amount > 0:
+        raise BinancePerpetualRiskDataError(f"{context} SHORT position amount must be non-positive")
+
+
+def _validate_non_negative_integer_value(value: Any, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BinancePerpetualRiskDataError(f"{field} must be a non-negative integer")
+
+
 @dataclass(frozen=True)
 class BinancePerpetualInstrumentInfo:
     symbol: str
@@ -244,10 +288,40 @@ class BinancePerpetualAccountAsset:
             self.max_withdraw_amount,
         ))
 
+    def validate(self, context: str = "Account Information V3 asset") -> None:
+        if not isinstance(self.asset, str) or self.asset == "":
+            raise BinancePerpetualRiskDataError(f"{context}.asset must be a non-empty string")
+        decimal_fields = (
+            ("walletBalance", self.wallet_balance),
+            ("unrealizedProfit", self.unrealized_profit),
+            ("marginBalance", self.margin_balance),
+            ("maintMargin", self.maint_margin),
+            ("initialMargin", self.initial_margin),
+            ("positionInitialMargin", self.position_initial_margin),
+            ("openOrderInitialMargin", self.open_order_initial_margin),
+            ("crossWalletBalance", self.cross_wallet_balance),
+            ("crossUnPnl", self.cross_unrealized_profit),
+            ("availableBalance", self.available_balance),
+            ("maxWithdrawAmount", self.max_withdraw_amount),
+        )
+        non_negative_fields = {
+            "maintMargin",
+            "initialMargin",
+            "positionInitialMargin",
+            "openOrderInitialMargin",
+        }
+        for field, value in decimal_fields:
+            _validate_decimal_value(
+                value,
+                f"{context}.{field}",
+                non_negative=field in non_negative_fields,
+            )
+        _validate_non_negative_integer_value(self.update_time_ms, f"{context}.updateTime")
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any], context: str) -> "BinancePerpetualAccountAsset":
         payload = _mapping(payload, context)
-        return cls(
+        fact = cls(
             asset=_string(payload, "asset", context),
             wallet_balance=_decimal(payload, "walletBalance", context),
             unrealized_profit=_decimal(payload, "unrealizedProfit", context),
@@ -262,6 +336,8 @@ class BinancePerpetualAccountAsset:
             max_withdraw_amount=_decimal(payload, "maxWithdrawAmount", context),
             update_time_ms=_timestamp_ms(payload, "updateTime", context),
         )
+        fact.validate(context)
+        return fact
 
 
 @dataclass(frozen=True)
@@ -289,10 +365,34 @@ class BinancePerpetualAccountPosition:
             self.maint_margin,
         ))
 
+    def validate(self, context: str = "Account Information V3 position") -> None:
+        if not isinstance(self.symbol, str) or self.symbol == "":
+            raise BinancePerpetualRiskDataError(f"{context}.symbol must be a non-empty string")
+        _validate_position_identity_and_notional(
+            position_side=self.position_side,
+            position_amount=self.position_amount,
+            notional=self.notional,
+            context=context,
+        )
+        decimal_fields = (
+            ("unrealizedProfit", self.unrealized_profit, False),
+            ("isolatedMargin", self.isolated_margin, True),
+            ("isolatedWallet", self.isolated_wallet, True),
+            ("initialMargin", self.initial_margin, True),
+            ("maintMargin", self.maint_margin, True),
+        )
+        for field, value, non_negative in decimal_fields:
+            _validate_decimal_value(
+                value,
+                f"{context}.{field}",
+                non_negative=non_negative,
+            )
+        _validate_non_negative_integer_value(self.update_time_ms, f"{context}.updateTime")
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any], context: str) -> "BinancePerpetualAccountPosition":
         payload = _mapping(payload, context)
-        return cls(
+        fact = cls(
             symbol=_string(payload, "symbol", context),
             position_side=_string(payload, "positionSide", context),
             position_amount=_decimal(payload, "positionAmt", context),
@@ -304,6 +404,8 @@ class BinancePerpetualAccountPosition:
             maint_margin=_decimal(payload, "maintMargin", context),
             update_time_ms=_timestamp_ms(payload, "updateTime", context),
         )
+        fact.validate(context)
+        return fact
 
 
 @dataclass(frozen=True)
@@ -322,6 +424,57 @@ class BinancePerpetualAccountRiskSnapshot:
     assets: Tuple[BinancePerpetualAccountAsset, ...]
     positions: Tuple[BinancePerpetualAccountPosition, ...]
     data_time: float
+
+    def validate(self, context: str = "Account Information V3") -> None:
+        decimal_fields = (
+            ("totalInitialMargin", self.total_initial_margin),
+            ("totalMaintMargin", self.total_maint_margin),
+            ("totalWalletBalance", self.total_wallet_balance),
+            ("totalUnrealizedProfit", self.total_unrealized_profit),
+            ("totalMarginBalance", self.total_margin_balance),
+            ("totalPositionInitialMargin", self.total_position_initial_margin),
+            ("totalOpenOrderInitialMargin", self.total_open_order_initial_margin),
+            ("totalCrossWalletBalance", self.total_cross_wallet_balance),
+            ("totalCrossUnPnl", self.total_cross_unrealized_profit),
+            ("availableBalance", self.available_balance),
+            ("maxWithdrawAmount", self.max_withdraw_amount),
+        )
+        non_negative_fields = {
+            "totalInitialMargin",
+            "totalMaintMargin",
+            "totalPositionInitialMargin",
+            "totalOpenOrderInitialMargin",
+        }
+        for field, value in decimal_fields:
+            _validate_decimal_value(
+                value,
+                f"{context}.{field}",
+                non_negative=field in non_negative_fields,
+            )
+
+        asset_identities = set()
+        for index, asset in enumerate(self.assets):
+            if not isinstance(asset, BinancePerpetualAccountAsset):
+                raise BinancePerpetualRiskDataError(f"{context}.assets[{index}] has an invalid type")
+            asset.validate(f"{context}.assets[{index}]")
+            if asset.asset in asset_identities:
+                raise BinancePerpetualRiskDataError(
+                    f"{context} contains duplicate asset identity {asset.asset}"
+                )
+            asset_identities.add(asset.asset)
+
+        position_identities = set()
+        for index, position in enumerate(self.positions):
+            if not isinstance(position, BinancePerpetualAccountPosition):
+                raise BinancePerpetualRiskDataError(f"{context}.positions[{index}] has an invalid type")
+            position.validate(f"{context}.positions[{index}]")
+            identity = (position.symbol, position.position_side)
+            if identity in position_identities:
+                raise BinancePerpetualRiskDataError(
+                    f"{context} contains duplicate position identity {identity}"
+                )
+            position_identities.add(identity)
+        _data_time(self.data_time)
 
     @classmethod
     def from_payload(
@@ -343,7 +496,7 @@ class BinancePerpetualAccountRiskSnapshot:
                 _sequence(_required(payload, "positions", context), f"{context}.positions")
             )
         )
-        return cls(
+        fact = cls(
             total_initial_margin=_decimal(payload, "totalInitialMargin", context),
             total_maint_margin=_decimal(payload, "totalMaintMargin", context),
             total_wallet_balance=_decimal(payload, "totalWalletBalance", context),
@@ -359,6 +512,8 @@ class BinancePerpetualAccountRiskSnapshot:
             positions=positions,
             data_time=_data_time(data_time),
         )
+        fact.validate(context)
+        return fact
 
 
 @dataclass(frozen=True)
@@ -401,6 +556,54 @@ class BinancePerpetualPositionRiskSnapshot:
             self.ask_notional,
         ))
 
+    def validate(self, context: str = "Position Information V3") -> None:
+        if not isinstance(self.symbol, str) or self.symbol == "":
+            raise BinancePerpetualRiskDataError(f"{context}.symbol must be a non-empty string")
+        if not isinstance(self.margin_asset, str) or self.margin_asset == "":
+            raise BinancePerpetualRiskDataError(f"{context}.marginAsset must be a non-empty string")
+        _validate_position_identity_and_notional(
+            position_side=self.position_side,
+            position_amount=self.position_amount,
+            notional=self.notional,
+            context=context,
+        )
+        decimal_fields = (
+            ("entryPrice", self.entry_price, True),
+            ("breakEvenPrice", self.break_even_price, True),
+            ("markPrice", self.mark_price, True),
+            ("unRealizedProfit", self.unrealized_profit, False),
+            ("liquidationPrice", self.liquidation_price, True),
+            ("isolatedMargin", self.isolated_margin, True),
+            ("isolatedWallet", self.isolated_wallet, True),
+            ("initialMargin", self.initial_margin, True),
+            ("maintMargin", self.maint_margin, True),
+            ("positionInitialMargin", self.position_initial_margin, True),
+            ("openOrderInitialMargin", self.open_order_initial_margin, True),
+            ("bidNotional", self.bid_notional, True),
+            ("askNotional", self.ask_notional, True),
+        )
+        for field, value, non_negative in decimal_fields:
+            _validate_decimal_value(
+                value,
+                f"{context}.{field}",
+                non_negative=non_negative,
+            )
+        if self.position_amount != 0:
+            for field, value in (
+                ("entryPrice", self.entry_price),
+                ("breakEvenPrice", self.break_even_price),
+                ("markPrice", self.mark_price),
+            ):
+                if value <= 0:
+                    raise BinancePerpetualRiskDataError(
+                        f"{context}.{field} must be positive for an active position"
+                    )
+        _validate_non_negative_integer_value(self.adl, f"{context}.adl")
+        if self.adl > 4:
+            raise BinancePerpetualRiskDataError(f"{context}.adl must be between 0 and 4")
+        _validate_non_negative_integer_value(self.update_time_ms, f"{context}.updateTime")
+        _data_time(self.data_time)
+
     @classmethod
     def from_payload(
             cls,
@@ -409,7 +612,7 @@ class BinancePerpetualPositionRiskSnapshot:
     ) -> "BinancePerpetualPositionRiskSnapshot":
         context = "Position Information V3"
         payload = _mapping(payload, context)
-        return cls(
+        fact = cls(
             symbol=_string(payload, "symbol", context),
             position_side=_string(payload, "positionSide", context),
             position_amount=_decimal(payload, "positionAmt", context),
@@ -432,6 +635,8 @@ class BinancePerpetualPositionRiskSnapshot:
             update_time_ms=_timestamp_ms(payload, "updateTime", context),
             data_time=_data_time(data_time),
         )
+        fact.validate(context)
+        return fact
 
 
 @dataclass(frozen=True)

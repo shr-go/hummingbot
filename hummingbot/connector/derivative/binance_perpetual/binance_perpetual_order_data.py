@@ -18,12 +18,74 @@ class BinancePerpetualOrderDataError(ValueError):
     """Raised when a signed Binance reconciliation response is malformed or contradictory."""
 
 
+class BinancePerpetualOrderSubmissionFailureKind(str, Enum):
+    AUTHORITATIVE_REJECTION = "AUTHORITATIVE_REJECTION"
+    AMBIGUOUS_AFTER_DISPATCH = "AMBIGUOUS_AFTER_DISPATCH"
+
+
+class BinancePerpetualOrderSubmissionRejected(IOError):
+    """Signals that Binance authoritatively rejected a dispatched order request."""
+
+    def __init__(self):
+        self.failure_kind = BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+        super().__init__("Binance authoritatively rejected the order submission")
+
+
 class BinancePerpetualOrderSubmissionUnknown(IOError):
     """Signals that an order request may have reached Binance but did not receive an outcome."""
 
     def __init__(self, client_order_id: str):
         self.client_order_id = client_order_id
+        self.failure_kind = BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
         super().__init__(f"submission outcome is unknown for client order ID {client_order_id}")
+
+
+_HTTP_STATUS_PATTERN = re.compile(
+    r"\b(?:HTTP\s+)?status(?:\s+code)?(?:\s+is|\s*[:=])?\s*(?P<status>[1-5][0-9]{2})\b",
+    re.IGNORECASE,
+)
+
+
+def classify_binance_order_submission_failure(
+        exception: BaseException,
+) -> BinancePerpetualOrderSubmissionFailureKind:
+    """Classifies only authoritative HTTP rejection responses as a definitive submission failure."""
+    if isinstance(exception, BinancePerpetualOrderSubmissionRejected):
+        return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+
+    status = None
+    candidates = [exception, getattr(exception, "response", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for attribute in ("status", "status_code", "http_status"):
+            raw_status = getattr(candidate, attribute, None)
+            if isinstance(raw_status, bool):
+                continue
+            if isinstance(raw_status, int):
+                status = raw_status
+                break
+            if isinstance(raw_status, str) and raw_status.isascii() and raw_status.isdigit():
+                status = int(raw_status)
+                break
+        if status is not None:
+            break
+    if status is None:
+        match = _HTTP_STATUS_PATTERN.search(str(exception))
+        if match is not None:
+            status = int(match.group("status"))
+
+    if status is not None and 400 <= status < 500 and status != 408:
+        return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+    return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
+
+
+@dataclass(frozen=True)
+class BinancePerpetualOrderIntent:
+    time_in_force: str
+    reduce_only: bool
+    close_position: bool
+    position_side: str
 
 
 def validate_binance_client_order_id(

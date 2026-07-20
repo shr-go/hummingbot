@@ -25,10 +25,14 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_api_ord
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_auth import BinancePerpetualAuth
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_order_data import (
     BinancePerpetualOrderDataError,
+    BinancePerpetualOrderIntent,
     BinancePerpetualOrderSnapshot,
+    BinancePerpetualOrderSubmissionFailureKind,
+    BinancePerpetualOrderSubmissionRejected,
     BinancePerpetualOrderSubmissionUnknown,
     BinancePerpetualOrderStatus,
     BinancePerpetualTrade,
+    classify_binance_order_submission_failure,
     validate_binance_client_order_id,
     validate_binance_exchange_order_id,
 )
@@ -97,6 +101,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         self._leverage_bracket_cache: Dict[str, BinancePerpetualLeverageBrackets] = {}
         self._last_trade_history_timestamp = None
         self._unknown_submission_order_ids = set()
+        self._unknown_submission_order_intents: Dict[str, BinancePerpetualOrderIntent] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -169,6 +174,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
 
     def _resolve_order_submission_unknown(self, client_order_id: str) -> None:
         self._unknown_submission_order_ids.discard(client_order_id)
+        self._unknown_submission_order_intents.pop(client_order_id, None)
         self._order_tracker._order_not_found_records.pop(client_order_id, None)
 
     @staticmethod
@@ -199,6 +205,68 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         if parsed is None or not parsed.is_finite():
             raise BinancePerpetualOrderDataError(f"{field} must be a finite decimal")
         return parsed
+
+    def _execution_intent(
+            self,
+            trade_type: TradeType,
+            order_type: OrderType,
+            position_action: PositionAction,
+    ) -> BinancePerpetualOrderIntent:
+        time_in_force = (
+            CONSTANTS.TIME_IN_FORCE_GTX
+            if order_type is OrderType.LIMIT_MAKER
+            else CONSTANTS.TIME_IN_FORCE_GTC
+        )
+        if self.position_mode is PositionMode.ONEWAY:
+            position_side = "BOTH"
+            reduce_only = position_action is PositionAction.CLOSE
+        elif self.position_mode is PositionMode.HEDGE:
+            reduce_only = False
+            if position_action is PositionAction.OPEN:
+                position_side = "LONG" if trade_type is TradeType.BUY else "SHORT"
+            else:
+                position_side = "SHORT" if trade_type is TradeType.BUY else "LONG"
+        else:
+            raise BinancePerpetualOrderDataError("order position mode is unsupported")
+        return BinancePerpetualOrderIntent(
+            time_in_force=time_in_force,
+            reduce_only=reduce_only,
+            close_position=False,
+            position_side=position_side,
+        )
+
+    def _tracked_order_execution_intent(
+            self,
+            tracked_order: InFlightOrder,
+    ) -> BinancePerpetualOrderIntent:
+        intent = self._unknown_submission_order_intents.get(tracked_order.client_order_id)
+        if intent is None:
+            intent = self._execution_intent(
+                trade_type=tracked_order.trade_type,
+                order_type=tracked_order.order_type,
+                position_action=tracked_order.position,
+            )
+        return intent
+
+    def _validate_execution_intent_fields(
+            self,
+            tracked_order: InFlightOrder,
+            time_in_force: Any,
+            reduce_only: Any,
+            close_position: Any,
+            position_side: Any,
+            context: str,
+    ) -> None:
+        expected = self._tracked_order_execution_intent(tracked_order)
+        facts = (
+            ("time in force", time_in_force, expected.time_in_force),
+            ("reduce only", reduce_only, expected.reduce_only),
+            ("close position", close_position, expected.close_position),
+            ("position side", position_side, expected.position_side),
+        )
+        for field, actual, expected_value in facts:
+            if actual != expected_value or type(actual) is not type(expected_value):
+                raise BinancePerpetualOrderDataError(f"{context} {field} is contradictory")
 
     @classmethod
     def _unknown_stream_exact_decimal_components(
@@ -418,6 +486,179 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             raise BinancePerpetualOrderDataError("order snapshot quantity is contradictory")
         if tracked_order.order_type.is_limit_type() and snapshot.price != tracked_order.price:
             raise BinancePerpetualOrderDataError("order snapshot price is contradictory")
+        self._validate_execution_intent_fields(
+            tracked_order=tracked_order,
+            time_in_force=snapshot.time_in_force,
+            reduce_only=snapshot.reduce_only,
+            close_position=snapshot.close_position,
+            position_side=snapshot.position_side,
+            context="order snapshot",
+        )
+
+    def _authoritative_trade_update(
+            self,
+            trade: BinancePerpetualTrade,
+            tracked_order: InFlightOrder,
+            exchange_order_id: str,
+    ) -> TradeUpdate:
+        if trade.exchange_order_id != exchange_order_id:
+            raise BinancePerpetualOrderDataError("account trade exchange order ID is contradictory")
+        if trade.trading_pair != tracked_order.trading_pair:
+            raise BinancePerpetualOrderDataError("account trade trading pair is contradictory")
+        if trade.side is not tracked_order.trade_type:
+            raise BinancePerpetualOrderDataError("account trade side is contradictory")
+        expected_intent = self._tracked_order_execution_intent(tracked_order)
+        if trade.position_side != expected_intent.position_side:
+            raise BinancePerpetualOrderDataError("account trade position side is contradictory")
+        exact_quote_quantity = self._unknown_stream_exact_decimal_multiply(
+            trade.price,
+            trade.quantity,
+            "account trade quote quantity",
+        )
+        if trade.quote_quantity != exact_quote_quantity:
+            raise BinancePerpetualOrderDataError("account trade quote quantity is contradictory")
+
+        position_action = tracked_order.position
+        if position_action is PositionAction.NIL:
+            position_action = (
+                PositionAction.CLOSE if expected_intent.reduce_only else PositionAction.OPEN
+            )
+        flat_fees = [] if trade.commission == 0 else [
+            TokenAmount(amount=trade.commission, token=trade.commission_asset)
+        ]
+        fee = TradeFeeBase.new_perpetual_fee(
+            fee_schema=self.trade_fee_schema(),
+            position_action=position_action,
+            percent_token=trade.commission_asset,
+            flat_fees=flat_fees,
+        )
+        return TradeUpdate(
+            trade_id=trade.trade_id,
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            fill_timestamp=trade.timestamp_ms * 1e-3,
+            fill_price=trade.price,
+            fill_base_amount=trade.quantity,
+            fill_quote_amount=trade.quote_quantity,
+            fee=fee,
+        )
+
+    async def _reconcile_authoritative_order_fills(
+            self,
+            snapshot: BinancePerpetualOrderSnapshot,
+            tracked_order: InFlightOrder,
+    ) -> bool:
+        expected_base = snapshot.executed_quantity
+        expected_quote = snapshot.cumulative_quote_quantity
+        exchange_order_id = snapshot.exchange_order_id
+        if expected_base is None or expected_quote is None or exchange_order_id is None:
+            return False
+
+        try:
+            trades = await self.get_account_trades(
+                trading_pair=tracked_order.trading_pair,
+                exchange_order_id=exchange_order_id,
+            )
+            trade_updates = []
+            authoritative_base = Decimal("0")
+            authoritative_quote = Decimal("0")
+            authoritative_trade_ids = set()
+            for trade in trades:
+                trade_update = self._authoritative_trade_update(
+                    trade=trade,
+                    tracked_order=tracked_order,
+                    exchange_order_id=exchange_order_id,
+                )
+                authoritative_trade_ids.add(trade_update.trade_id)
+                authoritative_base = self._unknown_stream_exact_decimal_add(
+                    authoritative_base,
+                    trade_update.fill_base_amount,
+                    "account trade cumulative quantity",
+                )
+                authoritative_quote = self._unknown_stream_exact_decimal_add(
+                    authoritative_quote,
+                    trade_update.fill_quote_amount,
+                    "account trade cumulative quote quantity",
+                )
+                existing_fill = tracked_order.order_fills.get(trade_update.trade_id)
+                if existing_fill is not None and existing_fill != trade_update:
+                    raise BinancePerpetualOrderDataError(
+                        "account trade facts contradict an existing tracked fill"
+                    )
+                trade_updates.append(trade_update)
+
+            if authoritative_base != expected_base or authoritative_quote != expected_quote:
+                return False
+            if not set(tracked_order.order_fills).issubset(authoritative_trade_ids):
+                return False
+
+            existing_base = Decimal("0")
+            existing_quote = Decimal("0")
+            for trade_update in trade_updates:
+                if trade_update.trade_id in tracked_order.order_fills:
+                    existing_base = self._unknown_stream_exact_decimal_add(
+                        existing_base,
+                        trade_update.fill_base_amount,
+                        "tracked account trade cumulative quantity",
+                    )
+                    existing_quote = self._unknown_stream_exact_decimal_add(
+                        existing_quote,
+                        trade_update.fill_quote_amount,
+                        "tracked account trade cumulative quote quantity",
+                    )
+            if not self._unknown_stream_tracked_totals_are_exact(
+                    tracked_order=tracked_order,
+                    expected_base=existing_base,
+                    expected_quote=existing_quote,
+            ):
+                return False
+        except asyncio.CancelledError:
+            raise
+        except BinancePerpetualOrderDataError:
+            self.logger().debug(
+                f"Authoritative account trades are not yet consistent for order "
+                f"{tracked_order.client_order_id}."
+            )
+            return False
+
+        for trade_update in trade_updates:
+            if trade_update.trade_id in tracked_order.order_fills:
+                continue
+            next_base = self._unknown_stream_exact_decimal_add(
+                tracked_order.executed_amount_base,
+                trade_update.fill_base_amount,
+                "tracked account trade cumulative quantity",
+            )
+            next_quote = self._unknown_stream_exact_decimal_add(
+                tracked_order.executed_amount_quote,
+                trade_update.fill_quote_amount,
+                "tracked account trade cumulative quote quantity",
+            )
+            with localcontext(self._unknown_stream_tracker_decimal_context()):
+                staged_update = self._order_tracker.stage_trade_update(trade_update)
+                if (
+                    staged_update is None
+                    or not self._order_tracker.staged_trade_update_matches(
+                        staged_update=staged_update,
+                        expected_trade_update=trade_update,
+                        expected_executed_amount_base=next_base,
+                        expected_executed_amount_quote=next_quote,
+                    )
+                ):
+                    raise BinancePerpetualOrderDataError(
+                        "authoritative account trade was not applied exactly"
+                    )
+                if not self._order_tracker.commit_trade_update(staged_update):
+                    raise BinancePerpetualOrderDataError(
+                        "authoritative account trade was not committed"
+                    )
+
+        return self._unknown_stream_tracked_totals_are_exact(
+            tracked_order=tracked_order,
+            expected_base=expected_base,
+            expected_quote=expected_quote,
+        )
 
     async def _apply_authoritative_order_snapshot(
             self,
@@ -429,6 +670,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         if tracked_order is None:
             return False
         self._validate_snapshot_matches_tracked_order(snapshot, tracked_order)
+        if not await self._reconcile_authoritative_order_fills(snapshot, tracked_order):
+            return False
         order_update = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
             update_timestamp=snapshot.update_time_ms * 1e-3,
@@ -437,6 +680,18 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             exchange_order_id=snapshot.exchange_order_id,
         )
         await self._order_tracker.process_order_update(order_update)
+        if (
+            tracked_order.exchange_order_id != snapshot.exchange_order_id
+            or tracked_order.current_state != order_update.new_state
+            or not self._unknown_stream_tracked_totals_are_exact(
+                tracked_order=tracked_order,
+                expected_base=snapshot.executed_quantity,
+                expected_quote=snapshot.cumulative_quote_quantity,
+            )
+        ):
+            raise BinancePerpetualOrderDataError(
+                "authoritative order snapshot was not applied exactly"
+            )
         self._resolve_order_submission_unknown(snapshot.client_order_id)
         return True
 
@@ -639,7 +894,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             if existing_fact is not None:
                 if existing_fact != fact:
                     raise BinancePerpetualRiskDataError("conflicting position in Position Information V3 response")
-                continue
+                raise BinancePerpetualRiskDataError("duplicate position in Position Information V3 response")
             facts_by_key[key] = fact
         return tuple(
             facts_by_key[key]
@@ -814,6 +1069,14 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         positions = await authoritative_fetch(
             "Position Information V3", self.get_position_risk_snapshots()
         )
+        try:
+            account.validate()
+            for position in positions:
+                position.validate()
+        except BinancePerpetualRiskDataError as exc:
+            raise BinancePerpetualPreflightError(
+                "authoritative account or position facts violate economic domains"
+            ) from exc
         account_config = await authoritative_fetch(
             "account configuration", self.get_account_config()
         )
@@ -1024,6 +1287,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             position = position_by_key[key]
             comparisons = (
                 (account_position.position_amount, position.position_amount),
+                (account_position.notional, position.notional),
                 (account_position.unrealized_profit, position.unrealized_profit),
                 (account_position.initial_margin, position.initial_margin),
                 (account_position.maint_margin, position.maint_margin),
@@ -1230,21 +1494,18 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             return False
         if cancel_result.get("status") == "CANCELED":
             if self.is_order_submission_unknown(order_id):
-                if cancel_result.get("clientOrderId") != order_id:
-                    raise BinancePerpetualOrderDataError(
-                        "cancel confirmation client order ID is contradictory"
-                    )
-                exchange_order_id = self._validated_non_negative_integer_string(
-                    cancel_result.get("orderId"),
-                    "cancel confirmation exchange order ID",
+                snapshot = BinancePerpetualOrderSnapshot.from_payload(
+                    payload=cancel_result,
+                    expected_symbol=symbol,
+                    trading_pair=tracked_order.trading_pair,
+                    expected_client_order_id=order_id,
+                    data_time=self.current_timestamp,
                 )
-                if (
-                    tracked_order.exchange_order_id is not None
-                    and exchange_order_id != tracked_order.exchange_order_id
-                ):
+                if snapshot.status is not BinancePerpetualOrderStatus.CANCELED:
                     raise BinancePerpetualOrderDataError(
-                        "cancel confirmation exchange order ID is contradictory"
+                        "cancel confirmation status is contradictory"
                     )
+                return await self._apply_authoritative_order_snapshot(snapshot)
             return True
         return False
 
@@ -1253,19 +1514,10 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             return await super()._execute_order_cancel(order)
         try:
             cancelled = await self._place_cancel(order.client_order_id, order)
-            if not cancelled:
+            if cancelled and not self.is_order_submission_unknown(order.client_order_id):
+                return order.client_order_id
+            else:
                 return None
-            update_timestamp = self.current_timestamp
-            if update_timestamp is None or math.isnan(update_timestamp):
-                update_timestamp = self._time()
-            await self._order_tracker.process_order_update(OrderUpdate(
-                client_order_id=order.client_order_id,
-                trading_pair=order.trading_pair,
-                update_timestamp=update_timestamp,
-                new_state=CONSTANTS.ORDER_STATE["CANCELED"],
-            ))
-            self._resolve_order_submission_unknown(order.client_order_id)
-            return order.client_order_id
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1297,6 +1549,11 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         amount_str = f"{amount:f}"
         price_str = f"{price:f}"
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        execution_intent = self._execution_intent(
+            trade_type=trade_type,
+            order_type=order_type,
+            position_action=position_action,
+        )
         api_params = {"symbol": symbol,
                       "side": "BUY" if trade_type is TradeType.BUY else "SELL",
                       "quantity": amount_str,
@@ -1310,35 +1567,50 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         if order_type == OrderType.LIMIT_MAKER:
             api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTX
         if self.position_mode == PositionMode.HEDGE:
-            if position_action == PositionAction.OPEN:
-                api_params["positionSide"] = "LONG" if trade_type is TradeType.BUY else "SHORT"
-            else:
-                api_params["positionSide"] = "SHORT" if trade_type is TradeType.BUY else "LONG"
-        elif position_action == PositionAction.CLOSE:
+            api_params["positionSide"] = execution_intent.position_side
+        elif execution_intent.reduce_only:
             # In ONEWAY mode, reduceOnly ensures the order can only reduce the position,
             # never open a new one or flip direction. This prevents over-selling.
             api_params["reduceOnly"] = "true"
+        self._unknown_submission_order_intents[order_id] = execution_intent
+        request_dispatched = False
         try:
+            request_dispatched = True
             order_result = await self._api_post(
                 path_url=CONSTANTS.ORDER_URL,
                 data=api_params,
                 is_auth_required=True)
-            o_id = str(order_result["orderId"])
-            transact_time = order_result["updateTime"] * 1e-3
+            if not isinstance(order_result, Mapping):
+                raise BinancePerpetualOrderDataError("order submission response must be an object")
+            if "code" in order_result:
+                raise BinancePerpetualOrderSubmissionRejected()
+            o_id = self._validated_non_negative_integer_string(
+                order_result.get("orderId"),
+                "order submission exchange order ID",
+            )
+            transact_time_ms = int(self._validated_non_negative_integer_string(
+                order_result.get("updateTime"),
+                "order submission update time",
+            ))
+            transact_time = transact_time_ms * 1e-3
             self._unknown_submission_order_ids.discard(order_id)
+            self._unknown_submission_order_intents.pop(order_id, None)
         except asyncio.CancelledError:
+            if request_dispatched:
+                self._unknown_submission_order_ids.add(order_id)
             raise
-        except asyncio.TimeoutError:
-            self._unknown_submission_order_ids.add(order_id)
-            raise BinancePerpetualOrderSubmissionUnknown(order_id) from None
-        except IOError as e:
-            error_description = str(e)
-            is_server_overloaded = ("status is 503" in error_description
-                                    and "Unknown error, please check your request or try again later." in error_description)
-            if is_server_overloaded:
+        except Exception as exception:
+            failure_kind = classify_binance_order_submission_failure(exception)
+            if (
+                request_dispatched
+                and failure_kind
+                is BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
+            ):
                 self._unknown_submission_order_ids.add(order_id)
                 raise BinancePerpetualOrderSubmissionUnknown(order_id) from None
-            raise
+            self._unknown_submission_order_ids.discard(order_id)
+            self._unknown_submission_order_intents.pop(order_id, None)
+            raise BinancePerpetualOrderSubmissionRejected() from None
         return o_id, transact_time
 
     def _on_order_failure(
@@ -1509,6 +1781,14 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         expected_order_type = "MARKET" if tracked_order.order_type is OrderType.MARKET else "LIMIT"
         if order_message.get("o") != expected_order_type:
             raise BinancePerpetualOrderDataError("user stream order type is contradictory")
+        self._validate_execution_intent_fields(
+            tracked_order=tracked_order,
+            time_in_force=order_message.get("f"),
+            reduce_only=order_message.get("R"),
+            close_position=order_message.get("cp"),
+            position_side=order_message.get("ps"),
+            context="user stream order",
+        )
 
         original_quantity = self._validated_finite_decimal(
             order_message.get("q"),
@@ -1660,17 +1940,12 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             fee_asset = order_message.get("N") or tracked_order.quote_asset
             if not isinstance(fee_asset, str) or fee_asset == "":
                 raise BinancePerpetualOrderDataError("user stream fee asset must be a string")
-            position_side = order_message.get("ps", "LONG")
-            if position_side not in {"BOTH", "LONG", "SHORT"}:
-                raise BinancePerpetualOrderDataError("user stream position side is unsupported")
-            position_action = (
-                PositionAction.OPEN
-                if (
-                    tracked_order.trade_type is TradeType.BUY and position_side == "LONG"
-                    or tracked_order.trade_type is TradeType.SELL and position_side == "SHORT"
+            expected_intent = self._tracked_order_execution_intent(tracked_order)
+            position_action = tracked_order.position
+            if position_action is PositionAction.NIL:
+                position_action = (
+                    PositionAction.CLOSE if expected_intent.reduce_only else PositionAction.OPEN
                 )
-                else PositionAction.CLOSE
-            )
             flat_fees = [] if fee_amount == Decimal("0") else [
                 TokenAmount(amount=fee_amount, token=fee_asset)
             ]
