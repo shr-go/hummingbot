@@ -303,6 +303,43 @@ def _install_round6_keyword_parentheses_variant(connection: sqlite3.Connection, 
     raise AssertionError(f"unknown round-six keyword-parentheses variant: {variant}")
 
 
+ROUND7_KEYWORD_FUNCTIONS = ("glob", "like", "match", "regexp")
+ROUND7_OPERAND_CONTEXTS = (
+    ("and", "flag AND {name}(value)"),
+    ("is", "value IS {name}(value)"),
+    ("between_lower", "value BETWEEN {name}(low_value) AND 10"),
+    ("between_upper", "value BETWEEN 0 AND {name}(high_value)"),
+    ("case_base", "CASE {name}(flag) WHEN 1 THEN 2 ELSE 3 END"),
+    ("case_then", "CASE WHEN flag THEN {name}(value) ELSE 0 END"),
+    ("like", "'alpha' LIKE {name}(pattern)"),
+    ("escape", "'a_b' LIKE 'a#_b' ESCAPE {name}(escape_char)"),
+)
+
+
+def _parenthesize_round7_keyword_call(expression: str, function_name: str) -> str:
+    call_at = expression.index(f"{function_name}(")
+    depth = 0
+    for cursor in range(call_at + len(function_name), len(expression)):
+        if expression[cursor] == "(":
+            depth += 1
+        elif expression[cursor] == ")":
+            depth -= 1
+            if depth == 0:
+                return f"{expression[:call_at]}({expression[call_at : cursor + 1]}){expression[cursor + 1 :]}"
+    raise AssertionError(f"unbalanced keyword-shaped function call: {expression}")
+
+
+def _evaluate_round7_sqlite_expression(connection: sqlite3.Connection, expression: str):
+    return connection.execute(f"""
+        WITH vars (
+            flag, value, low_value, high_value, pattern, escape_char
+        ) AS (
+            VALUES (1, 5, 1, 10, 'a%', '#')
+        )
+        SELECT {expression} FROM vars
+        """).fetchone()[0]
+
+
 def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "original") -> None:
     connection.execute(
         text("""
@@ -1246,6 +1283,93 @@ def test_round6_trigger_body_parentheses_remain_token_significant():
 
     assert persistence_module._normalize_trigger_sql(parenthesized_body) != persistence_module._normalize_trigger_sql(
         unparenthesized_body
+    )
+
+
+def test_round7_case_base_atomic_grouping_is_sqlite_equivalent():
+    canonical_sql = "CASE value WHEN 5 THEN 1 ELSE 0 END"
+    equivalent_sql = "CASE (value) WHEN 5 THEN 1 ELSE 0 END"
+    with sqlite3.connect(":memory:") as connection:
+        assert _evaluate_round7_sqlite_expression(
+            connection,
+            equivalent_sql,
+        ) == _evaluate_round7_sqlite_expression(connection, canonical_sql)
+
+    assert persistence_module._normalize_sql(equivalent_sql) == persistence_module._normalize_sql(canonical_sql)
+
+
+@pytest.mark.parametrize("function_name", ROUND7_KEYWORD_FUNCTIONS)
+@pytest.mark.parametrize(
+    ("context_name", "expression_template"),
+    ROUND7_OPERAND_CONTEXTS,
+    ids=[context_name for context_name, _ in ROUND7_OPERAND_CONTEXTS],
+)
+def test_round7_registered_keyword_function_grouping_is_sqlite_equivalent(
+    function_name: str,
+    context_name: str,
+    expression_template: str,
+):
+    canonical_sql = expression_template.format(name=function_name)
+    equivalent_sql = _parenthesize_round7_keyword_call(canonical_sql, function_name)
+    with sqlite3.connect(":memory:") as connection:
+        connection.create_function(function_name, 1, lambda value: value)
+        assert _evaluate_round7_sqlite_expression(
+            connection,
+            equivalent_sql,
+        ) == _evaluate_round7_sqlite_expression(connection, canonical_sql)
+
+    assert persistence_module._normalize_sql(equivalent_sql) == persistence_module._normalize_sql(canonical_sql)
+
+
+@pytest.mark.parametrize("function_name", ROUND7_KEYWORD_FUNCTIONS)
+def test_round7_keyword_function_argument_lists_cannot_collapse_to_invalid_sql(function_name: str):
+    canonical_sql = f"flag AND {function_name}(value)"
+    invalid_sql = f"flag AND {function_name} value"
+    with sqlite3.connect(":memory:") as connection:
+        connection.create_function(function_name, 1, lambda value: value)
+        _evaluate_round7_sqlite_expression(connection, canonical_sql)
+        with pytest.raises(sqlite3.OperationalError):
+            _evaluate_round7_sqlite_expression(connection, invalid_sql)
+
+    assert persistence_module._normalize_sql(canonical_sql) != persistence_module._normalize_sql(invalid_sql)
+
+
+@pytest.mark.parametrize("function_name", ROUND7_KEYWORD_FUNCTIONS)
+def test_round7_keyword_function_calls_at_expression_start_keep_argument_lists(function_name: str):
+    canonical_sql = f"{function_name}(value)"
+    equivalent_sql = f"({canonical_sql})"
+    invalid_sql = f"{function_name} value"
+
+    assert persistence_module._normalize_sql(equivalent_sql) == persistence_module._normalize_sql(canonical_sql)
+    assert persistence_module._normalize_sql(canonical_sql) != persistence_module._normalize_sql(invalid_sql)
+
+
+@pytest.mark.parametrize(
+    ("with_parentheses", "without_parentheses"),
+    [
+        ("value IN ('ETF')", "value IN 'ETF'"),
+        ("EXISTS (SELECT 1)", "EXISTS SELECT 1"),
+        ("value = (SELECT 1)", "value = SELECT 1"),
+        ("left_value + (middle_value * right_value)", "left_value + middle_value * right_value"),
+    ],
+)
+def test_round7_non_grouping_parentheses_remain_distinct(
+    with_parentheses: str,
+    without_parentheses: str,
+):
+    assert persistence_module._normalize_sql(with_parentheses) != persistence_module._normalize_sql(without_parentheses)
+
+
+def test_round7_trigger_body_parentheses_and_literals_remain_token_significant():
+    expected_sql = SQLITE_GUARD_DDL["lepf_snapshot_identity_insert"]
+    changed_parentheses = expected_sql.replace("RAISE(ABORT,", "RAISE ABORT,", 1)
+    changed_literal = expected_sql.replace("identity already exists", "glob(value)", 1)
+
+    assert persistence_module._normalize_trigger_sql(expected_sql) != persistence_module._normalize_trigger_sql(
+        changed_parentheses
+    )
+    assert persistence_module._normalize_trigger_sql(expected_sql) != persistence_module._normalize_trigger_sql(
+        changed_literal
     )
 
 
