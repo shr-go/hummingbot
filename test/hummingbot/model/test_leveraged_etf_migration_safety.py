@@ -98,7 +98,7 @@ def _create_compiled_table(connection: sqlite3.Connection, table, transform=lamb
     connection.execute(transform(_compiled_table_sql(table)))
 
 
-def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "{}") -> None:
+def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "original") -> None:
     connection.execute(
         text("""
             INSERT INTO LeveragedEtfExecutorSnapshot (
