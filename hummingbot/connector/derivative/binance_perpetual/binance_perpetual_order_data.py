@@ -41,97 +41,184 @@ class BinancePerpetualOrderSubmissionUnknown(IOError):
 
 
 _HTTP_STATUS_PATTERN = re.compile(
-    r"\b(?:HTTP\s+)?status(?:\s+code)?(?:\s+is|\s*[:=])?\s*(?P<status>[1-5][0-9]{2})\b",
+    r"\b(?:(?:HTTP\s+)?status(?:\s+code)?|status_code|http_status)"
+    r"[\"']?(?:\s+is|\s*[:=])?\s*[\"']?(?P<status>[1-5][0-9]{2})\b",
     re.IGNORECASE,
 )
 _BINANCE_ERROR_CODE_PATTERN = re.compile(
-    r"(?:\bBinance\s+code\b|[\"']?code[\"']?\s*[:=])\s*(?P<code>-[0-9]+)\b",
+    r"(?:\bBinance\s+code\b|[\"']?code[\"']?\s*[:=])\s*[\"']?(?P<code>-[0-9]+)\b",
     re.IGNORECASE,
 )
 _BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN = re.compile(
     r"\b(?:execution|send)\s+status\s+(?:is\s+)?unknown\b",
     re.IGNORECASE,
 )
+_BINANCE_NEW_ORDER_REJECTED_PATTERN = re.compile(
+    r"\bNEW(?:_|\s+|-)ORDER(?:_|\s+|-)REJECTED\b",
+    re.IGNORECASE,
+)
 _BINANCE_AMBIGUOUS_SUBMISSION_CODES = {-1007, -1006}
 _BINANCE_AUTHORITATIVE_REJECTION_CODES = {-2010}
+_SUBMISSION_CODE_FIELDS = ("code",)
+_SUBMISSION_STATUS_FIELDS = ("status", "status_code", "http_status", "statusCode", "httpStatus")
+_SUBMISSION_MESSAGE_FIELDS = ("msg", "message", "error_message", "errorMessage")
+_MISSING_SUBMISSION_FACT = object()
 
 
-def _binance_error_code(failure: Any) -> Optional[int]:
-    candidates = (failure, getattr(failure, "response", None))
-    for candidate in candidates:
-        if isinstance(candidate, Mapping):
-            raw_code = candidate.get("code")
-        else:
-            raw_code = getattr(candidate, "code", None)
-        if isinstance(raw_code, bool):
-            continue
-        if isinstance(raw_code, int):
-            return raw_code
+@dataclass(frozen=True)
+class _BinanceSubmissionFailureFacts:
+    codes: frozenset[int]
+    statuses: frozenset[int]
+    messages: tuple[str, ...]
+    texts: tuple[str, ...]
+    malformed_code: bool
+    malformed_status: bool
+    malformed_message: bool
+
+
+def _submission_fact(candidate: Any, field: str) -> Any:
+    if isinstance(candidate, Mapping):
+        return candidate.get(field, _MISSING_SUBMISSION_FACT)
+    try:
+        return getattr(candidate, field, _MISSING_SUBMISSION_FACT)
+    except Exception:
+        return _MISSING_SUBMISSION_FACT
+
+
+def _submission_failure_candidates(failure: Any) -> tuple[Any, ...]:
+    candidates = [failure]
+    index = 0
+    while index < len(candidates) and len(candidates) < 3:
+        response = _submission_fact(candidates[index], "response")
         if (
-            isinstance(raw_code, str)
-            and raw_code.isascii()
-            and raw_code.startswith("-")
-            and raw_code[1:].isdigit()
+            response is not _MISSING_SUBMISSION_FACT
+            and response is not None
+            and all(response is not candidate for candidate in candidates)
         ):
-            return int(raw_code)
+            candidates.append(response)
+        index += 1
+    return tuple(candidates)
 
-    match = _BINANCE_ERROR_CODE_PATTERN.search(str(failure))
-    return int(match.group("code")) if match is not None else None
+
+def _submission_integer(value: Any, *, status: bool) -> Optional[int]:
+    parsed = None
+    if isinstance(value, int) and not isinstance(value, bool):
+        parsed = value
+    elif isinstance(value, str) and value.isascii():
+        if status and len(value) == 3 and value.isdigit():
+            parsed = int(value)
+        elif not status and (
+            value.isdigit()
+            or (value.startswith("-") and len(value) > 1 and value[1:].isdigit())
+        ):
+            parsed = int(value)
+    if status and (parsed is None or not 100 <= parsed <= 599):
+        return None
+    return parsed
 
 
-def _has_explicit_unknown_execution_status(failure: Any) -> bool:
-    texts = [str(failure)]
-    candidates = (failure, getattr(failure, "response", None))
+def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
+    candidates = _submission_failure_candidates(failure)
+    codes = set()
+    statuses = set()
+    messages = []
+    texts = []
+    malformed_code = False
+    malformed_status = False
+    malformed_message = False
+
     for candidate in candidates:
-        if isinstance(candidate, Mapping):
-            message = candidate.get("msg")
-            if isinstance(message, str):
-                texts.append(message)
-    return any(_BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN.search(text) is not None for text in texts)
+        for field in _SUBMISSION_CODE_FIELDS:
+            raw_code = _submission_fact(candidate, field)
+            if raw_code is not _MISSING_SUBMISSION_FACT:
+                code = _submission_integer(raw_code, status=False)
+                malformed_code = malformed_code or code is None
+                if code is not None:
+                    codes.add(code)
+        for field in _SUBMISSION_STATUS_FIELDS:
+            raw_status = _submission_fact(candidate, field)
+            if raw_status is not _MISSING_SUBMISSION_FACT:
+                status = _submission_integer(raw_status, status=True)
+                malformed_status = malformed_status or status is None
+                if status is not None:
+                    statuses.add(status)
+        for field in _SUBMISSION_MESSAGE_FIELDS:
+            raw_message = _submission_fact(candidate, field)
+            if raw_message is not _MISSING_SUBMISSION_FACT:
+                if isinstance(raw_message, str) and raw_message != "":
+                    messages.append(raw_message)
+                else:
+                    malformed_message = True
+
+    try:
+        texts.append(str(failure))
+    except Exception:
+        pass
+    texts.extend(messages)
+    for text in texts:
+        codes.update(int(match.group("code")) for match in _BINANCE_ERROR_CODE_PATTERN.finditer(text))
+        statuses.update(int(match.group("status")) for match in _HTTP_STATUS_PATTERN.finditer(text))
+
+    return _BinanceSubmissionFailureFacts(
+        codes=frozenset(codes),
+        statuses=frozenset(statuses),
+        messages=tuple(messages),
+        texts=tuple(texts),
+        malformed_code=malformed_code,
+        malformed_status=malformed_status,
+        malformed_message=malformed_message,
+    )
+
+
+def _has_ambiguous_transport_failure(failure: Any) -> bool:
+    return isinstance(failure, (ConnectionError, EOFError, TimeoutError))
 
 
 def classify_binance_order_submission_failure(
         failure: Any,
 ) -> BinancePerpetualOrderSubmissionFailureKind:
-    """Classifies structured unknown-execution responses before HTTP transport fallbacks."""
+    """Classifies a post-dispatch submission only when every available fact is consistent."""
     if isinstance(failure, BinancePerpetualOrderSubmissionRejected):
         return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
     if isinstance(failure, BinancePerpetualOrderSubmissionUnknown):
         return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
 
-    error_code = _binance_error_code(failure)
-    if error_code in _BINANCE_AMBIGUOUS_SUBMISSION_CODES:
+    facts = _submission_failure_facts(failure)
+    has_explicit_unknown = any(
+        _BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN.search(text) is not None
+        for text in facts.texts
+    )
+    if (
+        _has_ambiguous_transport_failure(failure)
+        or has_explicit_unknown
+        or bool(facts.codes & _BINANCE_AMBIGUOUS_SUBMISSION_CODES)
+        or any(status == 408 or status >= 500 for status in facts.statuses)
+    ):
         return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
-    if error_code in _BINANCE_AUTHORITATIVE_REJECTION_CODES:
-        return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
-    if _has_explicit_unknown_execution_status(failure):
+    if (
+        facts.malformed_code
+        or facts.malformed_status
+        or facts.malformed_message
+        or len(facts.codes) > 1
+        or len(facts.statuses) > 1
+    ):
         return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
 
-    status = None
-    candidates = [failure, getattr(failure, "response", None)]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        for attribute in ("status", "status_code", "http_status"):
-            raw_status = getattr(candidate, attribute, None)
-            if isinstance(raw_status, bool):
-                continue
-            if isinstance(raw_status, int):
-                status = raw_status
-                break
-            if isinstance(raw_status, str) and raw_status.isascii() and raw_status.isdigit():
-                status = int(raw_status)
-                break
-        if status is not None:
-            break
-    if status is None:
-        match = _HTTP_STATUS_PATTERN.search(str(failure))
-        if match is not None:
-            status = int(match.group("status"))
+    if facts.statuses:
+        status = next(iter(facts.statuses))
+        if 400 <= status < 500:
+            return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+        return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
 
-    if status is not None and 400 <= status < 500 and status != 408:
+    has_authoritative_message = any(
+        _BINANCE_NEW_ORDER_REJECTED_PATTERN.search(text) is not None
+        for text in facts.texts
+    )
+    if facts.codes == frozenset(_BINANCE_AUTHORITATIVE_REJECTION_CODES):
+        if facts.messages and not has_authoritative_message:
+            return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
         return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
-    if status is None and isinstance(failure, Mapping) and "code" in failure:
+    if not facts.codes and has_authoritative_message:
         return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
     return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
 
