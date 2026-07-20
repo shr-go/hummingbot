@@ -25,8 +25,16 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import (
 UTC = timezone.utc
 
 
-def _utc(year: int, month: int, day: int, hour: int, minute: int = 0, microsecond: int = 0) -> datetime:
-    return datetime(year, month, day, hour, minute, 0, microsecond, tzinfo=UTC)
+def _utc(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=UTC)
+
+
+_NORMAL_CLOSE = _utc(2026, 1, 15, 21)
+_NORMAL_MAKER_EXIT_START = _NORMAL_CLOSE - timedelta(minutes=30)
+_NORMAL_FORCE_MARKET_START = _NORMAL_CLOSE - timedelta(minutes=1)
+_EARLY_CLOSE = _utc(2026, 11, 27, 18)
+_EARLY_MAKER_EXIT_START = _EARLY_CLOSE - timedelta(minutes=30)
+_EARLY_FORCE_MARKET_START = _EARLY_CLOSE - timedelta(minutes=1)
 
 
 def _example_path() -> Path:
@@ -173,7 +181,7 @@ def test_weekend_and_full_holiday_keep_the_last_closed_cycle_and_next_official_s
     ),
     [
         (
-            _utc(2026, 1, 15, 20, 29, 999999),
+            _NORMAL_MAKER_EXIT_START - timedelta(microseconds=1),
             SessionStage.NORMAL,
             True,
             False,
@@ -181,9 +189,8 @@ def test_weekend_and_full_holiday_keep_the_last_closed_cycle_and_next_official_s
             date(2026, 1, 15),
             date(2026, 1, 14),
         ),
-        (_utc(2026, 1, 15, 20, 30), SessionStage.MAKER_EXIT, False, True, False, date(2026, 1, 15), date(2026, 1, 14)),
         (
-            _utc(2026, 1, 15, 20, 58, 999999),
+            _NORMAL_MAKER_EXIT_START,
             SessionStage.MAKER_EXIT,
             False,
             True,
@@ -192,7 +199,16 @@ def test_weekend_and_full_holiday_keep_the_last_closed_cycle_and_next_official_s
             date(2026, 1, 14),
         ),
         (
-            _utc(2026, 1, 15, 20, 59),
+            _NORMAL_FORCE_MARKET_START - timedelta(microseconds=1),
+            SessionStage.MAKER_EXIT,
+            False,
+            True,
+            False,
+            date(2026, 1, 15),
+            date(2026, 1, 14),
+        ),
+        (
+            _NORMAL_FORCE_MARKET_START,
             SessionStage.FORCED_MARKET_FLATTEN,
             False,
             False,
@@ -201,7 +217,7 @@ def test_weekend_and_full_holiday_keep_the_last_closed_cycle_and_next_official_s
             date(2026, 1, 14),
         ),
         (
-            _utc(2026, 1, 15, 20, 59, 999999),
+            _NORMAL_CLOSE - timedelta(microseconds=1),
             SessionStage.FORCED_MARKET_FLATTEN,
             False,
             False,
@@ -210,8 +226,16 @@ def test_weekend_and_full_holiday_keep_the_last_closed_cycle_and_next_official_s
             date(2026, 1, 14),
         ),
         # Close equality belongs to the new cycle and the next close becomes Friday's.
-        (_utc(2026, 1, 15, 21), SessionStage.NORMAL, True, False, False, date(2026, 1, 16), date(2026, 1, 15)),
-        (_utc(2026, 1, 15, 21, 0, 1), SessionStage.NORMAL, True, False, False, date(2026, 1, 16), date(2026, 1, 15)),
+        (_NORMAL_CLOSE, SessionStage.NORMAL, True, False, False, date(2026, 1, 16), date(2026, 1, 15)),
+        (
+            _NORMAL_CLOSE + timedelta(microseconds=1),
+            SessionStage.NORMAL,
+            True,
+            False,
+            False,
+            date(2026, 1, 16),
+            date(2026, 1, 15),
+        ),
     ],
 )
 def test_close_boundaries_are_microsecond_exact_and_close_equality_rolls_cycle(
@@ -236,14 +260,31 @@ def test_close_boundaries_are_microsecond_exact_and_close_equality_rolls_cycle(
 
 
 def test_early_close_uses_the_same_exact_lead_time_boundaries(config: EquityLeveragedEtfArbitrageConfig):
-    calendar = XnysNavCalendar(config.nav, clock=lambda: _utc(2026, 11, 27, 17, 30))
+    calendar = XnysNavCalendar(config.nav, clock=lambda: _EARLY_MAKER_EXIT_START)
 
-    maker_snapshot = calendar.snapshot()
-    force_snapshot = calendar.snapshot_at(_utc(2026, 11, 27, 17, 59))
+    before_maker = calendar.snapshot_at(_EARLY_MAKER_EXIT_START - timedelta(microseconds=1))
+    at_maker = calendar.snapshot()
+    before_force = calendar.snapshot_at(_EARLY_FORCE_MARKET_START - timedelta(microseconds=1))
+    at_force = calendar.snapshot_at(_EARLY_FORCE_MARKET_START)
+    before_close = calendar.snapshot_at(_EARLY_CLOSE - timedelta(microseconds=1))
+    at_close = calendar.snapshot_at(_EARLY_CLOSE)
+    after_close = calendar.snapshot_at(_EARLY_CLOSE + timedelta(microseconds=1))
 
-    assert maker_snapshot.official_close_utc == _utc(2026, 11, 27, 18)
-    assert maker_snapshot.stage is SessionStage.MAKER_EXIT
-    assert force_snapshot.stage is SessionStage.FORCED_MARKET_FLATTEN
+    assert before_maker.stage is SessionStage.NORMAL
+    assert before_maker.calendar_entry_allowed
+    assert at_maker.official_close_utc == _EARLY_CLOSE
+    assert at_maker.stage is SessionStage.MAKER_EXIT
+    assert not at_maker.calendar_entry_allowed
+    assert at_maker.maker_exit_required
+    assert before_force.stage is SessionStage.MAKER_EXIT
+    assert at_force.stage is SessionStage.FORCED_MARKET_FLATTEN
+    assert at_force.force_market_flatten_required
+    assert before_close.stage is SessionStage.FORCED_MARKET_FLATTEN
+    assert at_close.stage is SessionStage.NORMAL
+    assert at_close.cycle_session_date == date(2026, 11, 27)
+    assert at_close.cycle_started_at_utc == _EARLY_CLOSE
+    assert at_close.cycle_id == "xnys-2026-11-27"
+    assert after_close.cycle_id == at_close.cycle_id
 
 
 def test_configured_entry_cutoff_can_precede_the_maker_exit_stage():
@@ -251,12 +292,23 @@ def test_configured_entry_cutoff_can_precede_the_maker_exit_stage():
         raw_config = tomllib.load(config_file)
     raw_config["nav"]["new_entry_cutoff_minutes"] = 45
     config = EquityLeveragedEtfArbitrageConfig.model_validate(raw_config)
-    snapshot = XnysNavCalendar(config.nav, clock=lambda: _utc(2026, 1, 15, 20, 20)).snapshot()
+    entry_cutoff = _NORMAL_CLOSE - timedelta(minutes=45)
+    calendar = XnysNavCalendar(config.nav, clock=lambda: entry_cutoff)
 
-    assert snapshot.stage is SessionStage.NEW_ENTRY_CUTOFF
-    assert not snapshot.calendar_entry_allowed
-    assert not snapshot.maker_exit_required
-    assert not snapshot.force_market_flatten_required
+    at_entry_cutoff = calendar.snapshot()
+    before_maker = calendar.snapshot_at(_NORMAL_MAKER_EXIT_START - timedelta(microseconds=1))
+    at_maker = calendar.snapshot_at(_NORMAL_MAKER_EXIT_START)
+    at_force = calendar.snapshot_at(_NORMAL_FORCE_MARKET_START)
+
+    assert at_entry_cutoff.stage is SessionStage.NEW_ENTRY_CUTOFF
+    assert not at_entry_cutoff.calendar_entry_allowed
+    assert not at_entry_cutoff.maker_exit_required
+    assert not at_entry_cutoff.force_market_flatten_required
+    assert before_maker.stage is SessionStage.NEW_ENTRY_CUTOFF
+    assert at_maker.stage is SessionStage.MAKER_EXIT
+    assert at_maker.maker_exit_required
+    assert at_force.stage is SessionStage.FORCED_MARKET_FLATTEN
+    assert at_force.force_market_flatten_required
 
 
 def test_injected_clock_and_snapshots_are_deterministic_and_immutable(config: EquityLeveragedEtfArbitrageConfig):
@@ -277,20 +329,39 @@ def test_injected_clock_and_snapshots_are_deterministic_and_immutable(config: Eq
 def test_restart_cycle_ids_are_stable_across_weekend_and_roll_only_at_official_close(
     config: EquityLeveragedEtfArbitrageConfig,
 ):
-    calendar = XnysNavCalendar(config.nav, clock=lambda: _utc(2026, 1, 9, 20, 59, 999999))
+    friday_close = _utc(2026, 1, 9, 21)
+    monday_close = _utc(2026, 1, 12, 21)
+    calendar = XnysNavCalendar(
+        config.nav,
+        clock=lambda: friday_close - timedelta(microseconds=1),
+    )
 
     before_friday_close = calendar.snapshot()
-    friday_close = calendar.snapshot_at(_utc(2026, 1, 9, 21))
+    at_friday_close = calendar.snapshot_at(friday_close)
     sunday_restart = calendar.snapshot_at(_utc(2026, 1, 11, 12))
-    before_monday_close = calendar.snapshot_at(_utc(2026, 1, 12, 20, 59, 999999))
-    monday_close = calendar.snapshot_at(_utc(2026, 1, 12, 21))
+    before_monday_close = calendar.snapshot_at(monday_close - timedelta(microseconds=1))
+    at_monday_close = calendar.snapshot_at(monday_close)
 
     assert before_friday_close.cycle_id == "xnys-2026-01-08"
-    assert friday_close.cycle_id == "xnys-2026-01-09"
-    assert sunday_restart.cycle_id == friday_close.cycle_id
-    assert before_monday_close.cycle_id == friday_close.cycle_id
-    assert monday_close.cycle_id == "xnys-2026-01-12"
-    assert calendar.snapshot_at(_utc(2026, 1, 12, 21)) == monday_close
+    assert at_friday_close.cycle_id == "xnys-2026-01-09"
+    assert sunday_restart.cycle_id == at_friday_close.cycle_id
+    assert before_monday_close.cycle_id == at_friday_close.cycle_id
+    assert at_monday_close.cycle_id == "xnys-2026-01-12"
+    assert calendar.snapshot_at(monday_close) == at_monday_close
+
+
+def test_exact_close_rolls_active_cycle_to_the_f001_vector(config: EquityLeveragedEtfArbitrageConfig):
+    vector_close = _utc(2026, 7, 17, 20)
+    snapshot = XnysNavCalendar(config.nav, clock=lambda: vector_close).snapshot()
+
+    assert snapshot.observed_at_utc == vector_close
+    assert snapshot.cycle_session_date == date(2026, 7, 17)
+    assert snapshot.cycle_started_at_utc == vector_close
+    assert snapshot.cycle_id == "xnys-2026-07-17"
+    assert snapshot.session_date == date(2026, 7, 20)
+    assert snapshot.official_open_utc == _utc(2026, 7, 20, 13, 30)
+    assert snapshot.official_close_utc == _utc(2026, 7, 20, 20)
+    assert snapshot.stage is SessionStage.NORMAL
 
 
 @pytest.mark.parametrize(
@@ -364,6 +435,58 @@ def test_local_wall_clock_conversion_rejects_nonexistent_and_ambiguous_times(
     assert calendar.snapshot_at_local(datetime(2026, 7, 15, 11)) == calendar.snapshot_at(
         _utc(2026, 7, 15, 15)
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "observed_at",
+        "next_session",
+        "next_open",
+        "next_close",
+        "cycle_session",
+        "cycle_started_at",
+        "cycle_id",
+    ),
+    [
+        (
+            _utc(2000, 1, 1, 12),
+            date(2000, 1, 3),
+            _utc(2000, 1, 3, 14, 30),
+            _utc(2000, 1, 3, 21),
+            date(1999, 12, 31),
+            _utc(1999, 12, 31, 18),
+            "xnys-1999-12-31",
+        ),
+        (
+            _utc(2100, 12, 31, 22),
+            date(2101, 1, 3),
+            _utc(2101, 1, 3, 14, 30),
+            _utc(2101, 1, 3, 21),
+            date(2100, 12, 31),
+            _utc(2100, 12, 31, 21),
+            "xnys-2100-12-31",
+        ),
+    ],
+)
+def test_supported_range_edges_are_inclusive_with_buffered_previous_and_next_sessions(
+    config: EquityLeveragedEtfArbitrageConfig,
+    observed_at: datetime,
+    next_session: date,
+    next_open: datetime,
+    next_close: datetime,
+    cycle_session: date,
+    cycle_started_at: datetime,
+    cycle_id: str,
+):
+    snapshot = XnysNavCalendar(config.nav, clock=lambda: observed_at).snapshot()
+
+    assert snapshot.observed_at_utc == observed_at
+    assert snapshot.session_date == next_session
+    assert snapshot.official_open_utc == next_open
+    assert snapshot.official_close_utc == next_close
+    assert snapshot.cycle_session_date == cycle_session
+    assert snapshot.cycle_started_at_utc == cycle_started_at
+    assert snapshot.cycle_id == cycle_id
 
 
 @pytest.mark.parametrize(

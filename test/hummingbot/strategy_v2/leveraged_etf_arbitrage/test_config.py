@@ -493,6 +493,39 @@ def test_nav_polling_and_close_deadlines_are_validated(example_data: dict, mutat
 
 
 @pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("maker_close_lead_minutes", 1),
+        ("maker_close_lead_minutes", 29),
+        ("maker_close_lead_minutes", 31),
+        ("force_market_close_lead_seconds", 59),
+        ("force_market_close_lead_seconds", 61),
+        ("new_entry_cutoff_minutes", 1),
+        ("new_entry_cutoff_minutes", 29),
+    ],
+)
+def test_nav_close_boundaries_cannot_be_weakened(
+    example_data: dict,
+    field_name: str,
+    invalid_value: int,
+):
+    example_data["nav"][field_name] = invalid_value
+
+    with pytest.raises(ValidationError):
+        EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+
+
+def test_new_entry_cutoff_may_be_earlier_than_close_thirty(example_data: dict):
+    example_data["nav"]["new_entry_cutoff_minutes"] = 45
+
+    config = EquityLeveragedEtfArbitrageConfig.model_validate(example_data)
+
+    assert config.nav.new_entry_cutoff_minutes == 45
+    assert config.nav.maker_close_lead_minutes == 30
+    assert config.nav.force_market_close_lead_seconds == 60
+
+
+@pytest.mark.parametrize(
     ("path", "value"),
     [
         (("binance", "connector_name"), "binance"),
