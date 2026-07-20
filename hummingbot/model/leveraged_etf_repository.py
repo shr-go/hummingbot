@@ -5,8 +5,9 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
-from typing import Any, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Annotated, Any, Literal, NamedTuple, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from sqlalchemy import text
@@ -20,6 +21,8 @@ from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types imp
     CanonicalUtcInstant,
     CanonicalWireModel,
     LeveragedEtfPairExecutorSnapshotV1,
+    LeveragedEtfPairExecutorStateV1,
+    LeveragedEtfPairOperation,
     LeveragedEtfPairState,
     SchemaVersionV1,
     Sha256Hex,
@@ -42,7 +45,7 @@ _TERMINAL_EXECUTOR_STATES = frozenset(
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
 def _sha256_text(value: str) -> str:
@@ -60,9 +63,12 @@ def _validate_utc_text(value: str, field_name: str) -> str:
 
 
 def _verify_canonical_json(payload_json: str, payload_hash: str, label: str) -> Any:
+    def reject_non_finite_constant(value: str):
+        raise ValueError(f"{label} contains non-finite JSON constant {value}")
+
     try:
-        value = json.loads(payload_json)
-    except (TypeError, json.JSONDecodeError) as exception:
+        value = json.loads(payload_json, parse_constant=reject_non_finite_constant)
+    except (TypeError, ValueError, json.JSONDecodeError) as exception:
         raise ValueError(f"{label} contains malformed JSON") from exception
     if _canonical_json(value) != payload_json:
         raise ValueError(f"{label} JSON is not canonical")
@@ -99,7 +105,18 @@ class CanonicalOpaquePayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_canonical_payload(self) -> CanonicalOpaquePayload:
-        _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
+        value = _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
+        if not isinstance(value, Mapping):
+            raise ValueError("opaque payload must be a JSON object")
+        embedded_version = value.get("schema_version")
+        if (
+            not isinstance(embedded_version, int)
+            or isinstance(embedded_version, bool)
+            or embedded_version != self.schema_version
+        ):
+            raise ValueError("wrapper and embedded schema_version must match exactly")
+        if "kind" in value and value["kind"] != self.kind:
+            raise ValueError("wrapper and embedded payload kind must match exactly")
         return self
 
     @classmethod
@@ -128,7 +145,7 @@ class CanonicalOpaquePayload(BaseModel):
         )
 
     def value(self) -> Any:
-        return json.loads(self.payload_json)
+        return _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
 
 
 class JournalEventType(str, Enum):
@@ -148,6 +165,204 @@ class JournalEventType(str, Enum):
     STATE_TRANSITION = "STATE_TRANSITION"
 
 
+class JournalSideEffect(str, Enum):
+    ETF_MAKER = "ETF_MAKER"
+    STOCK_HEDGE = "STOCK_HEDGE"
+    ETF_ROLLBACK = "ETF_ROLLBACK"
+    CANCEL = "CANCEL"
+
+
+class ReconciliationOutcome(str, Enum):
+    NEW = "NEW"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    EXPIRED = "EXPIRED"
+    REJECTED = "REJECTED"
+    NOT_FOUND = "NOT_FOUND"
+    UNKNOWN = "UNKNOWN"
+    CONSISTENT_NO_FILL = "CONSISTENT_NO_FILL"
+    CONFLICT = "CONFLICT"
+
+
+def _canonical_decimal_text(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    rendered = format(value, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+class SideEffectIdentityV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    executor_id: StableIdentifier
+    operation: LeveragedEtfPairOperation
+    action: JournalSideEffect
+    leg: Literal["ETF", "STOCK"]
+    logical_quantity: CanonicalPositiveDecimal
+    order_quantity: CanonicalPositiveDecimal
+    attempt: StrictInt = Field(ge=1)
+    intent_id: StableIdentifier
+    idempotency_key: StableIdentifier
+    connector_name: StableIdentifier
+    trading_pair: TradingPair
+    client_order_id: StableIdentifier
+    deadline_utc: CanonicalUtcInstant
+
+    @model_validator(mode="after")
+    def validate_side_effect_identity(self) -> SideEffectIdentityV1:
+        required_leg = {
+            JournalSideEffect.ETF_MAKER: "ETF",
+            JournalSideEffect.STOCK_HEDGE: "STOCK",
+            JournalSideEffect.ETF_ROLLBACK: "ETF",
+            JournalSideEffect.CANCEL: "ETF",
+        }.get(self.action)
+        if required_leg is not None and self.leg != required_leg:
+            raise ValueError(f"{self.action.value} requires the {required_leg} leg")
+        logical_quantity = _canonical_decimal_text(self.logical_quantity)
+        expected_key = f"{self.executor_id}:{self.operation.value}:{self.leg}:" f"{logical_quantity}:{self.attempt}"
+        if self.idempotency_key != expected_key:
+            raise ValueError("idempotency_key does not match the canonical side-effect identity")
+        if self.order_quantity > self.logical_quantity:
+            raise ValueError("order_quantity cannot exceed logical_quantity")
+        return self
+
+    @property
+    def exposure_increasing(self) -> bool:
+        return self.operation in {
+            LeveragedEtfPairOperation.OPEN,
+            LeveragedEtfPairOperation.ADD,
+        } and self.action in {
+            JournalSideEffect.ETF_MAKER,
+            JournalSideEffect.STOCK_HEDGE,
+        }
+
+
+class _IdentityJournalPayloadV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    identity: SideEffectIdentityV1
+    next_state: LeveragedEtfPairExecutorStateV1
+
+
+class PreparedJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["PREPARED"] = "PREPARED"
+
+
+class AcknowledgedJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["ACKNOWLEDGED"] = "ACKNOWLEDGED"
+
+
+class RejectedJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["REJECTED"] = "REJECTED"
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class SubmitUnknownJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["SUBMIT_UNKNOWN"] = "SUBMIT_UNKNOWN"
+    uncertainty_started_at_utc: CanonicalUtcInstant
+
+
+class OrderCreatedJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["ORDER_CREATED"] = "ORDER_CREATED"
+    exchange_order_id: StableIdentifier
+
+
+class FillJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["FILL"] = "FILL"
+    exchange_order_id: Optional[StableIdentifier]
+    exchange_trade_id: StableIdentifier
+    price: CanonicalPositiveDecimal
+    fill_quantity: CanonicalPositiveDecimal
+    cumulative_filled_quantity: CanonicalPositiveDecimal
+    outcome: Literal["PARTIAL", "FILLED"]
+    terminal: bool
+
+    @model_validator(mode="after")
+    def validate_fill_outcome(self) -> FillJournalPayloadV1:
+        if self.fill_quantity > self.cumulative_filled_quantity:
+            raise ValueError("fill_quantity cannot exceed cumulative_filled_quantity")
+        if self.terminal != (self.outcome == "FILLED"):
+            raise ValueError("fill terminal flag must be derived from outcome")
+        return self
+
+
+class CancelJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["CANCEL"] = "CANCEL"
+    phase: Literal["REQUESTED", "CONFIRMED"]
+    final_cumulative_filled_quantity: CanonicalNonNegativeDecimal
+
+    @model_validator(mode="after")
+    def validate_cancel_action(self) -> CancelJournalPayloadV1:
+        if self.identity.action != JournalSideEffect.CANCEL:
+            raise ValueError("cancel payload requires CANCEL side-effect identity")
+        return self
+
+
+class HedgeJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["HEDGE"] = "HEDGE"
+    phase: Literal["REQUESTED", "CONFIRMED"]
+
+    @model_validator(mode="after")
+    def validate_hedge_action(self) -> HedgeJournalPayloadV1:
+        if self.identity.action != JournalSideEffect.STOCK_HEDGE:
+            raise ValueError("hedge payload requires STOCK_HEDGE side-effect identity")
+        return self
+
+
+class RollbackJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["ROLLBACK"] = "ROLLBACK"
+    phase: Literal["REQUESTED", "CONFIRMED"]
+
+    @model_validator(mode="after")
+    def validate_rollback_action(self) -> RollbackJournalPayloadV1:
+        if self.identity.action != JournalSideEffect.ETF_ROLLBACK:
+            raise ValueError("rollback payload requires ETF_ROLLBACK side-effect identity")
+        return self
+
+
+class ReconciliationJournalPayloadV1(_IdentityJournalPayloadV1):
+    kind: Literal["RECONCILIATION"] = "RECONCILIATION"
+    outcome: ReconciliationOutcome
+    terminal: bool
+
+    @model_validator(mode="after")
+    def validate_reconciliation_outcome(self) -> ReconciliationJournalPayloadV1:
+        terminal_outcomes = {
+            ReconciliationOutcome.FILLED,
+            ReconciliationOutcome.CANCELED,
+            ReconciliationOutcome.EXPIRED,
+            ReconciliationOutcome.REJECTED,
+            ReconciliationOutcome.CONSISTENT_NO_FILL,
+        }
+        if self.terminal != (self.outcome in terminal_outcomes):
+            raise ValueError("reconciliation terminal flag must be derived from outcome")
+        return self
+
+
+class StateTransitionJournalPayloadV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    kind: Literal["STATE_TRANSITION"] = "STATE_TRANSITION"
+    reason: str = Field(min_length=1, max_length=1024)
+    next_state: LeveragedEtfPairExecutorStateV1
+
+
+JournalPayloadV1 = Annotated[
+    Union[
+        PreparedJournalPayloadV1,
+        AcknowledgedJournalPayloadV1,
+        RejectedJournalPayloadV1,
+        SubmitUnknownJournalPayloadV1,
+        OrderCreatedJournalPayloadV1,
+        FillJournalPayloadV1,
+        CancelJournalPayloadV1,
+        HedgeJournalPayloadV1,
+        RollbackJournalPayloadV1,
+        ReconciliationJournalPayloadV1,
+        StateTransitionJournalPayloadV1,
+    ],
+    Field(discriminator="kind"),
+]
+
+
 class JournalEventV1(CanonicalWireModel):
     schema_version: SchemaVersionV1 = 1
     event_id: StableIdentifier
@@ -159,16 +374,77 @@ class JournalEventV1(CanonicalWireModel):
     client_order_id: Optional[StableIdentifier] = None
     exchange_order_id: Optional[StableIdentifier] = None
     exchange_trade_id: Optional[StableIdentifier] = None
-    payload: CanonicalOpaquePayload
+    payload: JournalPayloadV1
     created_at_utc: CanonicalUtcInstant
+
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap_canonical_payload(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        payload = value.get("payload")
+        if isinstance(payload, CanonicalOpaquePayload):
+            value = {**value, "payload": payload.value()}
+        elif isinstance(payload, Mapping) and {"payload_json", "payload_hash", "kind"} <= set(payload):
+            value = {**value, "payload": CanonicalOpaquePayload.model_validate(payload).value()}
+        return value
 
     @model_validator(mode="after")
     def validate_identity_fields(self) -> JournalEventV1:
-        if self.event_type == JournalEventType.PREPARED:
-            if self.intent_id is None or self.idempotency_key is None:
-                raise ValueError("PREPARED requires intent_id and idempotency_key")
-        if self.exchange_trade_id is not None and (self.connector_name is None or self.trading_pair is None):
-            raise ValueError("exchange_trade_id requires connector_name and trading_pair")
+        expected_payload_types = {
+            JournalEventType.PREPARED: PreparedJournalPayloadV1,
+            JournalEventType.ACKNOWLEDGED: AcknowledgedJournalPayloadV1,
+            JournalEventType.REJECTED: RejectedJournalPayloadV1,
+            JournalEventType.SUBMIT_UNKNOWN: SubmitUnknownJournalPayloadV1,
+            JournalEventType.ORDER_CREATED: OrderCreatedJournalPayloadV1,
+            JournalEventType.FILL: FillJournalPayloadV1,
+            JournalEventType.CANCEL_REQUESTED: CancelJournalPayloadV1,
+            JournalEventType.CANCEL_CONFIRMED: CancelJournalPayloadV1,
+            JournalEventType.HEDGE_REQUESTED: HedgeJournalPayloadV1,
+            JournalEventType.HEDGE_CONFIRMED: HedgeJournalPayloadV1,
+            JournalEventType.ROLLBACK_REQUESTED: RollbackJournalPayloadV1,
+            JournalEventType.ROLLBACK_CONFIRMED: RollbackJournalPayloadV1,
+            JournalEventType.RECONCILIATION: ReconciliationJournalPayloadV1,
+            JournalEventType.STATE_TRANSITION: StateTransitionJournalPayloadV1,
+        }
+        expected_payload_type = expected_payload_types[self.event_type]
+        if not isinstance(self.payload, expected_payload_type):
+            raise ValueError(f"{self.event_type.value} has a mismatched typed payload")
+
+        identity = getattr(self.payload, "identity", None)
+        if identity is not None:
+            comparisons = {
+                "intent_id": self.intent_id,
+                "idempotency_key": self.idempotency_key,
+                "connector_name": self.connector_name,
+                "trading_pair": self.trading_pair,
+                "client_order_id": self.client_order_id,
+            }
+            for field_name, outer_value in comparisons.items():
+                if outer_value != getattr(identity, field_name):
+                    raise ValueError(f"event {field_name} disagrees with side-effect identity")
+
+        expected_phase = {
+            JournalEventType.CANCEL_REQUESTED: "REQUESTED",
+            JournalEventType.CANCEL_CONFIRMED: "CONFIRMED",
+            JournalEventType.HEDGE_REQUESTED: "REQUESTED",
+            JournalEventType.HEDGE_CONFIRMED: "CONFIRMED",
+            JournalEventType.ROLLBACK_REQUESTED: "REQUESTED",
+            JournalEventType.ROLLBACK_CONFIRMED: "CONFIRMED",
+        }.get(self.event_type)
+        if expected_phase is not None and getattr(self.payload, "phase", None) != expected_phase:
+            raise ValueError(f"{self.event_type.value} payload phase is invalid")
+
+        if isinstance(self.payload, OrderCreatedJournalPayloadV1):
+            if self.exchange_order_id != self.payload.exchange_order_id:
+                raise ValueError("order-created exchange_order_id disagrees with payload")
+        if isinstance(self.payload, FillJournalPayloadV1):
+            if self.exchange_order_id != self.payload.exchange_order_id:
+                raise ValueError("fill exchange_order_id disagrees with payload")
+            if self.exchange_trade_id != self.payload.exchange_trade_id:
+                raise ValueError("fill exchange_trade_id disagrees with payload")
+        elif self.exchange_trade_id is not None:
+            raise ValueError("exchange_trade_id is only valid for typed FILL events")
         return self
 
 
@@ -189,6 +465,17 @@ class IncompleteIntentV1(CanonicalWireModel):
     prepared_event: JournalEventV1
 
 
+class ReservationIdentityPayloadV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    kind: Literal["LEVERAGE_RESERVATION"] = "LEVERAGE_RESERVATION"
+    reservation_key: StableIdentifier
+    executor_id: StableIdentifier
+    connector_name: StableIdentifier
+    trading_pair: TradingPair
+    leg: Literal["ETF", "STOCK"]
+    logical_quantity: CanonicalPositiveDecimal
+
+
 class StrategyReservationV1(CanonicalWireModel):
     schema_version: SchemaVersionV1 = 1
     reservation_id: StableIdentifier
@@ -197,13 +484,47 @@ class StrategyReservationV1(CanonicalWireModel):
     connector_name: StableIdentifier
     trading_pair: TradingPair
     leg: Literal["ETF", "STOCK"]
-    quantity: CanonicalNonNegativeDecimal
+    quantity: CanonicalPositiveDecimal
     leverage: StrictInt = Field(ge=1)
     notional_cap: CanonicalPositiveDecimal
-    payload: CanonicalOpaquePayload
+    payload: ReservationIdentityPayloadV1
     created_at_utc: CanonicalUtcInstant
     updated_at_utc: CanonicalUtcInstant
     released_at_utc: Optional[CanonicalUtcInstant]
+
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap_reservation_payload(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        payload = value.get("payload")
+        if isinstance(payload, CanonicalOpaquePayload):
+            value = {**value, "payload": payload.value()}
+        elif isinstance(payload, Mapping) and {"payload_json", "payload_hash", "kind"} <= set(payload):
+            value = {**value, "payload": CanonicalOpaquePayload.model_validate(payload).value()}
+        return value
+
+    @model_validator(mode="after")
+    def validate_reservation_identity(self) -> StrategyReservationV1:
+        comparisons = {
+            "reservation_key": self.reservation_key,
+            "executor_id": self.executor_id,
+            "connector_name": self.connector_name,
+            "trading_pair": self.trading_pair,
+            "leg": self.leg,
+            "logical_quantity": self.quantity,
+        }
+        for field_name, expected in comparisons.items():
+            if getattr(self.payload, field_name) != expected:
+                raise ValueError(f"reservation payload {field_name} disagrees with row identity")
+        if self.updated_at_utc < self.created_at_utc:
+            raise ValueError("reservation updated_at_utc precedes created_at_utc")
+        if self.released_at_utc is not None:
+            if self.released_at_utc < self.created_at_utc:
+                raise ValueError("reservation released_at_utc precedes created_at_utc")
+            if self.updated_at_utc != self.released_at_utc:
+                raise ValueError("released reservation updated_at_utc must equal released_at_utc")
+        return self
 
 
 class AnchorPollingCheckpointV1(CanonicalWireModel):
@@ -341,9 +662,11 @@ class _TransactionalRepository:
         self,
         sql_manager: SQLConnectionManager,
         before_commit: Optional[Callable[[Connection], None]] = None,
+        recovery_read_hook: Optional[Callable[[Connection], None]] = None,
     ):
         self._sql_manager = sql_manager
         self._before_commit = before_commit
+        self._recovery_read_hook = recovery_read_hook
 
     @property
     def sql_manager(self) -> SQLConnectionManager:
@@ -357,6 +680,21 @@ class _TransactionalRepository:
             result = operation(connection)
             if self._before_commit is not None:
                 self._before_commit(connection)
+            transaction.commit()
+            return result
+        except BaseException:
+            if transaction.is_active:
+                transaction.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _read_transaction(self, operation: Callable[[Connection], Any]) -> Any:
+        connection = self._sql_manager.engine.connect()
+        transaction = connection.begin()
+        try:
+            connection.exec_driver_sql("BEGIN")
+            result = operation(connection)
             transaction.commit()
             return result
         except BaseException:
@@ -470,8 +808,9 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
     def _event_terminal(event: JournalEventV1) -> bool:
         if event.event_type in LeveragedEtfJournalRepository._ALWAYS_TERMINAL_INTENT_EVENTS:
             return True
-        value = event.payload.value()
-        return isinstance(value, Mapping) and value.get("terminal") is True
+        return (
+            isinstance(event.payload, (FillJournalPayloadV1, ReconciliationJournalPayloadV1)) and event.payload.terminal
+        )
 
     @classmethod
     def _decode_event_row(cls, row: Mapping[str, Any]) -> _DecodedJournalMutation:
@@ -538,17 +877,87 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
     ) -> Tuple[_DecodedJournalMutation, ...]:
         return tuple(cls._decode_event_row(row) for row in cls._event_rows(connection, executor_id))
 
+    @classmethod
+    def _replay_decoded(
+        cls,
+        persisted: LeveragedEtfPairExecutorSnapshotV1,
+        decoded: Tuple[_DecodedJournalMutation, ...],
+    ) -> LeveragedEtfPairExecutorSnapshotV1:
+        if not decoded:
+            if persisted.last_journal_sequence != 0:
+                raise JournalIntegrityError("persisted snapshot sequence has no journal history")
+            return persisted
+
+        reduced = decoded[0].snapshot_before
+        if reduced.executor_id != persisted.executor_id:
+            raise JournalIntegrityError("journal replay begins with a foreign executor snapshot")
+        if reduced.last_journal_sequence != 0:
+            raise JournalIntegrityError("journal replay does not begin at sequence zero")
+        prior: list[_DecodedJournalMutation] = []
+        for expected_sequence, mutation in enumerate(decoded, start=1):
+            if mutation.committed.executor_id != persisted.executor_id:
+                raise JournalIntegrityError("journal event has a foreign executor owner")
+            if mutation.committed.sequence != expected_sequence:
+                raise JournalIntegrityError("journal sequence is not contiguous")
+            if mutation.snapshot_before != reduced:
+                raise JournalIntegrityError("journal snapshot hash chain diverges")
+            cls._validate_intent_transition(mutation.committed.event, tuple(prior))
+            cls._validate_snapshot_transition(
+                mutation.snapshot_before,
+                mutation.committed.event,
+                mutation.snapshot_after,
+            )
+            reduced = mutation.snapshot_after
+            prior.append(mutation)
+        if reduced != persisted:
+            raise JournalIntegrityError("persisted snapshot disagrees with journal replay")
+        return reduced
+
+    def _verified_recovery_state(
+        self,
+        connection: Connection,
+        executor_id: Optional[str] = None,
+    ) -> dict[str, Tuple[LeveragedEtfPairExecutorSnapshotV1, Tuple[_DecodedJournalMutation, ...]]]:
+        if executor_id is None:
+            snapshot_statement = self._SNAPSHOT_SELECT.replace(
+                "WHERE executor_id = :executor_id",
+                "ORDER BY executor_id",
+            )
+            snapshot_parameters = {}
+        else:
+            snapshot_statement = self._SNAPSHOT_SELECT
+            snapshot_parameters = {"executor_id": executor_id}
+        snapshot_rows = connection.execute(text(snapshot_statement), snapshot_parameters).mappings().all()
+        snapshots = {row["executor_id"]: self._decode_snapshot_row(row) for row in snapshot_rows}
+
+        if self._recovery_read_hook is not None:
+            self._recovery_read_hook(connection)
+
+        event_rows = self._event_rows(connection, executor_id)
+        by_executor: dict[str, list[_DecodedJournalMutation]] = {}
+        for row in event_rows:
+            mutation = self._decode_event_row(row)
+            by_executor.setdefault(mutation.committed.executor_id, []).append(mutation)
+        orphan_executor_ids = set(by_executor) - set(snapshots)
+        if orphan_executor_ids:
+            owner = sorted(orphan_executor_ids)[0]
+            raise JournalIntegrityError(f"orphan journal events have no executor snapshot: {owner}")
+
+        verified = {}
+        for current_executor_id, snapshot in snapshots.items():
+            decoded = tuple(by_executor.get(current_executor_id, ()))
+            self._replay_decoded(snapshot, decoded)
+            verified[current_executor_id] = (snapshot, decoded)
+        return verified
+
     @staticmethod
     def _logical_exposure_key(event: JournalEventV1) -> Optional[Tuple[str, str, str]]:
-        if event.event_type != JournalEventType.PREPARED:
+        if event.event_type != JournalEventType.PREPARED or not isinstance(event.payload, PreparedJournalPayloadV1):
             return None
-        value = event.payload.value()
-        if not isinstance(value, Mapping) or value.get("exposure_increasing") is not True:
+        identity = event.payload.identity
+        if not identity.exposure_increasing:
             return None
-        required = ("operation", "leg", "logical_quantity")
-        if any(not isinstance(value.get(field), str) or not value[field] for field in required):
-            raise JournalIntegrityError("exposure-increasing PREPARED payload lacks logical identity")
-        return value["operation"], value["leg"], value["logical_quantity"]
+        return identity.operation.value, identity.leg, _canonical_decimal_text(identity.logical_quantity)
 
     @classmethod
     def _incomplete_from_decoded(
@@ -621,12 +1030,18 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         if cls._event_terminal(matching[-1]):
             raise JournalConflictError(f"intent {event.intent_id} is already terminal")
 
+        prepared_identity = getattr(matching[0].payload, "identity", None)
+        event_identity = getattr(event.payload, "identity", None)
+        if prepared_identity is None or event_identity is None or event_identity != prepared_identity:
+            raise JournalConflictError(f"intent {event.intent_id} side-effect identity or action changed")
+
     @classmethod
     def _validate_snapshot_transition(
         cls,
         current: LeveragedEtfPairExecutorSnapshotV1,
+        event: JournalEventV1,
         next_snapshot: LeveragedEtfPairExecutorSnapshotV1,
-    ) -> None:
+    ) -> LeveragedEtfPairExecutorSnapshotV1:
         if next_snapshot.last_journal_sequence != current.last_journal_sequence + 1:
             raise JournalConflictError("next snapshot journal sequence is not current + 1")
         for field_name in cls._IMMUTABLE_SNAPSHOT_FIELDS:
@@ -634,6 +1049,382 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 raise JournalIntegrityError(f"snapshot immutable field {field_name} changed")
         if next_snapshot.updated_at_utc < current.updated_at_utc:
             raise JournalIntegrityError("snapshot updated_at_utc moved backwards")
+        if event.created_at_utc != next_snapshot.updated_at_utc:
+            raise JournalIntegrityError("event timestamp disagrees with reducer state timestamp")
+
+        next_state = event.payload.next_state
+        if next_state.executor_id != current.executor_id:
+            raise JournalIntegrityError("reducer state executor ID disagrees with current executor")
+        if next_state.last_journal_sequence != current.last_journal_sequence + 1:
+            raise JournalConflictError("reducer state journal sequence is not current + 1")
+        if next_state.updated_at_utc != event.created_at_utc:
+            raise JournalIntegrityError("reducer state timestamp disagrees with journal event")
+
+        expected_payload = current.model_dump(mode="json")
+        expected_payload.update(next_state.model_dump(mode="json"))
+        expected = LeveragedEtfPairExecutorSnapshotV1.model_validate(expected_payload)
+        if next_snapshot != expected:
+            raise JournalIntegrityError("caller snapshot disagrees with deterministic journal reducer")
+
+        cls._validate_side_effect_ownership(current, event)
+        cls._validate_quantity_transition(current, event, expected)
+        cls._validate_state_transition(current, event, expected)
+        return expected
+
+    @staticmethod
+    def _validate_side_effect_ownership(
+        current: LeveragedEtfPairExecutorSnapshotV1,
+        event: JournalEventV1,
+    ) -> None:
+        identity = getattr(event.payload, "identity", None)
+        if identity is None:
+            return
+        if identity.executor_id != current.executor_id or identity.operation != current.operation:
+            raise JournalIntegrityError("journal side-effect executor or operation identity changed")
+        connector = current.etf_connector_name if identity.leg == "ETF" else current.stock_connector_name
+        trading_pair = current.etf_trading_pair if identity.leg == "ETF" else current.stock_trading_pair
+        target = current.etf_target_quantity if identity.leg == "ETF" else current.stock_target_quantity
+        if identity.connector_name != connector or identity.trading_pair != trading_pair:
+            raise JournalIntegrityError("journal side-effect connector role identity changed")
+        if identity.logical_quantity > target or identity.order_quantity > target:
+            raise JournalIntegrityError("journal side-effect quantity exceeds the immutable leg target")
+
+    @staticmethod
+    def _validate_quantity_transition(
+        current: LeveragedEtfPairExecutorSnapshotV1,
+        event: JournalEventV1,
+        expected: LeveragedEtfPairExecutorSnapshotV1,
+    ) -> None:
+        if expected.leverage_reservation != current.leverage_reservation:
+            raise JournalIntegrityError("executor leverage reservation changed during journal reduction")
+        for prefix in ("etf", "stock"):
+            target = getattr(expected, f"{prefix}_target_quantity")
+            submitted = getattr(expected, f"{prefix}_submitted_quantity")
+            filled = getattr(expected, f"{prefix}_filled_quantity")
+            remaining = getattr(expected, f"{prefix}_remaining_quantity")
+            if not Decimal("0") <= filled <= submitted <= target:
+                raise JournalIntegrityError(f"{prefix} quantity reducer invariant is invalid")
+            if remaining != target - filled:
+                raise JournalIntegrityError(f"{prefix} remaining quantity is not derived from fills")
+            if submitted < getattr(current, f"{prefix}_submitted_quantity"):
+                raise JournalIntegrityError(f"{prefix} submitted quantity moved backwards")
+            if filled < getattr(current, f"{prefix}_filled_quantity"):
+                raise JournalIntegrityError(f"{prefix} filled quantity moved backwards")
+
+        for field_name in ("maker_order_ids", "stock_order_ids"):
+            before = getattr(current, field_name)
+            after = getattr(expected, field_name)
+            if after[: len(before)] != before:
+                raise JournalIntegrityError(f"{field_name} is not append-only")
+
+        if expected.state in _TERMINAL_EXECUTOR_STATES:
+            if expected.close_reason is None:
+                raise JournalIntegrityError("terminal executor state requires a close reason")
+        elif expected.close_reason != current.close_reason:
+            raise JournalIntegrityError("non-terminal journal event changed the close reason")
+
+        payload = event.payload
+        if isinstance(payload, FillJournalPayloadV1):
+            prefix = "etf" if payload.identity.leg == "ETF" else "stock"
+            other = "stock" if prefix == "etf" else "etf"
+            expected_filled = getattr(current, f"{prefix}_filled_quantity") + payload.fill_quantity
+            if getattr(expected, f"{prefix}_filled_quantity") != expected_filled:
+                raise JournalIntegrityError("fill quantity was not reduced exactly once")
+            if getattr(expected, f"{prefix}_filled_quantity") != payload.cumulative_filled_quantity:
+                raise JournalIntegrityError("fill cumulative quantity disagrees with reducer state")
+            if payload.cumulative_filled_quantity > payload.identity.order_quantity:
+                raise JournalIntegrityError("fill cumulative quantity exceeds the prepared order quantity")
+            if payload.terminal and payload.cumulative_filled_quantity != payload.identity.order_quantity:
+                raise JournalIntegrityError("terminal fill does not equal the prepared order quantity")
+            submitted_delta = getattr(expected, f"{prefix}_submitted_quantity") - getattr(
+                current, f"{prefix}_submitted_quantity"
+            )
+            if submitted_delta > payload.identity.order_quantity:
+                raise JournalIntegrityError("fill increased submitted quantity beyond the prepared order")
+            for suffix in ("submitted_quantity", "filled_quantity", "remaining_quantity"):
+                if getattr(expected, f"{other}_{suffix}") != getattr(current, f"{other}_{suffix}"):
+                    raise JournalIntegrityError("fill event changed the non-filled leg quantities")
+            if (
+                expected.maker_order_ids != current.maker_order_ids
+                or expected.stock_order_ids != current.stock_order_ids
+            ):
+                raise JournalIntegrityError("fill event changed order identity history")
+            return
+
+        if isinstance(payload, OrderCreatedJournalPayloadV1):
+            prefix = "etf" if payload.identity.leg == "ETF" else "stock"
+            other = "stock" if prefix == "etf" else "etf"
+            selected_orders = expected.maker_order_ids if prefix == "etf" else expected.stock_order_ids
+            current_orders = current.maker_order_ids if prefix == "etf" else current.stock_order_ids
+            if len(selected_orders) != len(current_orders) + 1:
+                raise JournalIntegrityError("order-created event must append exactly one order identity")
+            appended = selected_orders[-1]
+            if (
+                appended.client_order_id != payload.identity.client_order_id
+                or appended.exchange_order_id != payload.exchange_order_id
+            ):
+                raise JournalIntegrityError("order-created identity disagrees with appended order history")
+            other_orders = expected.stock_order_ids if prefix == "etf" else expected.maker_order_ids
+            current_other_orders = current.stock_order_ids if prefix == "etf" else current.maker_order_ids
+            if other_orders != current_other_orders:
+                raise JournalIntegrityError("order-created event changed the other leg order history")
+            submitted_delta = getattr(expected, f"{prefix}_submitted_quantity") - getattr(
+                current, f"{prefix}_submitted_quantity"
+            )
+            if submitted_delta > payload.identity.order_quantity:
+                raise JournalIntegrityError("order-created submitted quantity exceeds the prepared order")
+            for suffix in ("filled_quantity", "remaining_quantity"):
+                if getattr(expected, f"{prefix}_{suffix}") != getattr(current, f"{prefix}_{suffix}"):
+                    raise JournalIntegrityError("order-created event changed fill facts")
+            for suffix in ("submitted_quantity", "filled_quantity", "remaining_quantity"):
+                if getattr(expected, f"{other}_{suffix}") != getattr(current, f"{other}_{suffix}"):
+                    raise JournalIntegrityError("order-created event changed the other leg quantities")
+            if expected.hedge_dust_quantity != current.hedge_dust_quantity:
+                raise JournalIntegrityError("order-created event changed hedge dust")
+            return
+
+        quantity_fields = (
+            "etf_submitted_quantity",
+            "etf_filled_quantity",
+            "etf_remaining_quantity",
+            "stock_submitted_quantity",
+            "stock_filled_quantity",
+            "stock_remaining_quantity",
+            "hedge_dust_quantity",
+            "maker_order_ids",
+            "stock_order_ids",
+        )
+        if any(getattr(expected, field_name) != getattr(current, field_name) for field_name in quantity_fields):
+            raise JournalIntegrityError("non-fill event changed reducer-owned quantity or order facts")
+
+    @staticmethod
+    def _validate_state_transition(
+        current: LeveragedEtfPairExecutorSnapshotV1,
+        event: JournalEventV1,
+        expected: LeveragedEtfPairExecutorSnapshotV1,
+    ) -> None:
+        source = current.state
+        target = expected.state
+        identity = getattr(event.payload, "identity", None)
+        action = None if identity is None else identity.action
+
+        if source in _TERMINAL_EXECUTOR_STATES:
+            raise JournalConflictError(f"terminal executor state {source.value} cannot accept new journal events")
+
+        pending_state = {
+            JournalSideEffect.ETF_MAKER: LeveragedEtfPairState.MAKER_SUBMITTING,
+            JournalSideEffect.CANCEL: LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+            JournalSideEffect.STOCK_HEDGE: LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+            JournalSideEffect.ETF_ROLLBACK: LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+        }
+        prepared_sources = {
+            JournalSideEffect.ETF_MAKER: {
+                LeveragedEtfPairState.CREATED,
+                LeveragedEtfPairState.PREFLIGHT,
+                LeveragedEtfPairState.MAKER_WORKING,
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+            },
+            JournalSideEffect.CANCEL: {
+                LeveragedEtfPairState.MAKER_SUBMITTING,
+                LeveragedEtfPairState.MAKER_WORKING,
+            },
+            JournalSideEffect.STOCK_HEDGE: {LeveragedEtfPairState.STOCK_HEDGE_PENDING},
+            JournalSideEffect.ETF_ROLLBACK: {
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+            },
+        }
+        reconciliation_sources = {
+            JournalSideEffect.ETF_MAKER: {
+                LeveragedEtfPairState.MAKER_SUBMITTING,
+                LeveragedEtfPairState.MAKER_WORKING,
+                LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+            },
+            JournalSideEffect.CANCEL: {
+                LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+            },
+            JournalSideEffect.STOCK_HEDGE: {
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+            },
+            JournalSideEffect.ETF_ROLLBACK: {
+                LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+            },
+        }
+        reconciliation_targets = {
+            JournalSideEffect.ETF_MAKER: {
+                LeveragedEtfPairState.MAKER_WORKING,
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+                LeveragedEtfPairState.ABORTED_NO_FILL,
+            },
+            JournalSideEffect.CANCEL: {
+                LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+                LeveragedEtfPairState.ABORTED_NO_FILL,
+            },
+            JournalSideEffect.STOCK_HEDGE: {
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+                LeveragedEtfPairState.COMPLETED,
+                LeveragedEtfPairState.FAILED_SAFE,
+            },
+            JournalSideEffect.ETF_ROLLBACK: {
+                LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+                LeveragedEtfPairState.COMPLETED,
+                LeveragedEtfPairState.FAILED_SAFE,
+            },
+        }
+
+        if event.event_type == JournalEventType.PREPARED:
+            legal_sources = prepared_sources.get(action, set())
+            legal_targets = {pending_state[action]} if action in pending_state else set()
+        elif event.event_type in {JournalEventType.ACKNOWLEDGED, JournalEventType.ORDER_CREATED}:
+            legal_sources = {pending_state[action]} if action in pending_state else set()
+            if action == JournalSideEffect.ETF_MAKER:
+                legal_sources.update(
+                    {
+                        LeveragedEtfPairState.MAKER_WORKING,
+                        LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                        LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                    }
+                )
+                legal_targets = (
+                    {LeveragedEtfPairState.MAKER_WORKING}
+                    if source in {LeveragedEtfPairState.MAKER_SUBMITTING, LeveragedEtfPairState.MAKER_WORKING}
+                    else {source}
+                )
+            else:
+                legal_targets = legal_sources
+        elif event.event_type == JournalEventType.SUBMIT_UNKNOWN:
+            legal_sources = {pending_state[action]} if action in pending_state else set()
+            if action == JournalSideEffect.ETF_MAKER:
+                legal_sources.update(
+                    {
+                        LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                        LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                    }
+                )
+            legal_targets = {
+                LeveragedEtfPairState.RECONCILING,
+                LeveragedEtfPairState.RECOVERY_REQUIRED,
+            }
+            if source in {
+                LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+            }:
+                legal_targets.add(source)
+        elif event.event_type == JournalEventType.FILL:
+            legal_sources = reconciliation_sources.get(action, set())
+            legal_targets = {
+                JournalSideEffect.ETF_MAKER: {LeveragedEtfPairState.STOCK_HEDGE_PENDING},
+                JournalSideEffect.STOCK_HEDGE: {
+                    LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                    LeveragedEtfPairState.COMPLETED,
+                },
+                JournalSideEffect.ETF_ROLLBACK: {
+                    LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+                    LeveragedEtfPairState.COMPLETED,
+                    LeveragedEtfPairState.FAILED_SAFE,
+                },
+            }.get(action, set())
+        elif event.event_type in {JournalEventType.CANCEL_REQUESTED, JournalEventType.CANCEL_CONFIRMED}:
+            legal_sources = {LeveragedEtfPairState.MAKER_CANCEL_PENDING}
+            legal_targets = {
+                LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                LeveragedEtfPairState.ABORTED_NO_FILL,
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+            }
+        elif event.event_type in {JournalEventType.HEDGE_REQUESTED, JournalEventType.HEDGE_CONFIRMED}:
+            legal_sources = {LeveragedEtfPairState.STOCK_HEDGE_PENDING}
+            legal_targets = {LeveragedEtfPairState.STOCK_HEDGE_PENDING, LeveragedEtfPairState.COMPLETED}
+        elif event.event_type in {JournalEventType.ROLLBACK_REQUESTED, JournalEventType.ROLLBACK_CONFIRMED}:
+            legal_sources = {LeveragedEtfPairState.ETF_ROLLBACK_PENDING}
+            legal_targets = {
+                LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+                LeveragedEtfPairState.ABORTED_NO_FILL,
+                LeveragedEtfPairState.COMPLETED,
+                LeveragedEtfPairState.FAILED_SAFE,
+            }
+        elif event.event_type == JournalEventType.RECONCILIATION:
+            legal_sources = reconciliation_sources.get(action, set())
+            legal_targets = reconciliation_targets.get(action, set())
+        elif event.event_type == JournalEventType.REJECTED:
+            legal_sources = {pending_state[action]} if action in pending_state else set()
+            legal_targets = reconciliation_targets.get(action, set())
+        else:
+            transition_targets = {
+                LeveragedEtfPairState.CREATED: {
+                    LeveragedEtfPairState.CREATED,
+                    LeveragedEtfPairState.PREFLIGHT,
+                    LeveragedEtfPairState.ABORTED_NO_FILL,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.PREFLIGHT: {
+                    LeveragedEtfPairState.PREFLIGHT,
+                    LeveragedEtfPairState.ABORTED_NO_FILL,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.MAKER_SUBMITTING: {
+                    LeveragedEtfPairState.MAKER_SUBMITTING,
+                    LeveragedEtfPairState.RECONCILING,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.MAKER_WORKING: {
+                    LeveragedEtfPairState.MAKER_WORKING,
+                    LeveragedEtfPairState.RECONCILING,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.MAKER_CANCEL_PENDING: {
+                    LeveragedEtfPairState.MAKER_CANCEL_PENDING,
+                    LeveragedEtfPairState.RECONCILING,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.STOCK_HEDGE_PENDING: {
+                    LeveragedEtfPairState.STOCK_HEDGE_PENDING,
+                    LeveragedEtfPairState.RECONCILING,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.ETF_ROLLBACK_PENDING: {
+                    LeveragedEtfPairState.ETF_ROLLBACK_PENDING,
+                    LeveragedEtfPairState.RECONCILING,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.RECONCILING: {
+                    LeveragedEtfPairState.RECONCILING,
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                },
+                LeveragedEtfPairState.RECOVERY_REQUIRED: {
+                    LeveragedEtfPairState.RECOVERY_REQUIRED,
+                    LeveragedEtfPairState.RECONCILING,
+                },
+            }
+            legal_sources = {source}
+            legal_targets = transition_targets.get(source, set())
+
+        if source not in legal_sources:
+            raise JournalConflictError(
+                f"illegal {event.event_type.value} source state {source.value} for side-effect action"
+            )
+        if target not in legal_targets:
+            raise JournalConflictError(
+                f"illegal {event.event_type.value} reducer state transition {source.value} -> {target.value}"
+            )
 
     def create_executor(
         self,
@@ -684,8 +1475,12 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             raise JournalConflictError(f"executor {snapshot.executor_id} could not be created") from exception
 
     def load_snapshot(self, executor_id: str) -> Optional[LeveragedEtfPairExecutorSnapshotV1]:
-        with self._sql_manager.engine.connect() as connection:
-            return self._load_snapshot_connection(connection, executor_id)
+        def operation(connection: Connection):
+            verified = self._verified_recovery_state(connection, executor_id)
+            value = verified.get(executor_id)
+            return None if value is None else value[0]
+
+        return self._read_transaction(operation)
 
     def append_and_reduce(
         self,
@@ -694,6 +1489,12 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         next_snapshot: LeveragedEtfPairExecutorSnapshotV1,
     ) -> CommittedJournalEventV1:
         def operation(connection: Connection):
+            current = self._load_snapshot_connection(connection, executor_id)
+            if current is None:
+                raise JournalConflictError(f"executor {executor_id} does not exist")
+            decoded = self._decoded_events(connection, executor_id)
+            self._replay_decoded(current, decoded)
+
             duplicate_row = (
                 connection.execute(
                     text(self._EVENT_SELECT + " WHERE event_id = :event_id"),
@@ -704,11 +1505,15 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             )
             if duplicate_row is not None:
                 duplicate = self._decode_event_row(duplicate_row)
+                if duplicate.committed.executor_id != executor_id:
+                    raise JournalConflictError("event identity is owned by a different executor")
                 if duplicate.committed.event == event and duplicate.snapshot_after == next_snapshot:
                     return duplicate.committed
                 raise JournalIntegrityError("event identity has a conflicting payload")
 
             if event.exchange_trade_id is not None:
+                if not isinstance(event.payload, FillJournalPayloadV1):
+                    raise JournalIntegrityError("only a typed FILL event may own an exchange trade ID")
                 trade_row = (
                     connection.execute(
                         text(
@@ -727,18 +1532,14 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 )
                 if trade_row is not None:
                     duplicate = self._decode_event_row(trade_row)
-                    if duplicate.committed.event.payload == event.payload:
-                        return duplicate.committed
-                    raise JournalIntegrityError("exchange trade identity has a conflicting payload")
+                    if duplicate.committed.executor_id != executor_id:
+                        raise JournalConflictError("exchange trade identity is owned by a different executor")
+                    raise JournalIntegrityError("exchange trade identity is already owned by a different event")
 
-            current = self._load_snapshot_connection(connection, executor_id)
-            if current is None:
-                raise JournalConflictError(f"executor {executor_id} does not exist")
             if next_snapshot.executor_id != executor_id:
                 raise JournalIntegrityError("next snapshot executor ID does not match repository key")
-            decoded = self._decoded_events(connection, executor_id)
             self._validate_intent_transition(event, decoded)
-            self._validate_snapshot_transition(current, next_snapshot)
+            reduced_snapshot = self._validate_snapshot_transition(current, event, next_snapshot)
 
             sequence = current.last_journal_sequence + 1
             mutation = {
@@ -746,8 +1547,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 "event": event.model_dump(mode="json"),
                 "snapshot_before": current.model_dump(mode="json"),
                 "snapshot_before_hash": current.canonical_sha256(),
-                "snapshot_after": next_snapshot.model_dump(mode="json"),
-                "snapshot_after_hash": next_snapshot.canonical_sha256(),
+                "snapshot_after": reduced_snapshot.model_dump(mode="json"),
+                "snapshot_after_hash": reduced_snapshot.canonical_sha256(),
             }
             payload_json = _canonical_json(mutation)
             payload_hash = _sha256_text(payload_json)
@@ -774,8 +1575,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                     "payload_hash": payload_hash,
                 },
             )
-            snapshot_json = next_snapshot.canonical_json()
-            next_json = next_snapshot.model_dump(mode="json")
+            snapshot_json = reduced_snapshot.canonical_json()
+            next_json = reduced_snapshot.model_dump(mode="json")
             updated = connection.execute(
                 text("""
                     UPDATE LeveragedEtfExecutorSnapshot
@@ -812,65 +1613,48 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             raise JournalConflictError("journal identity or reservation constraint rejected the append") from exception
 
     def events(self, executor_id: str) -> Tuple[CommittedJournalEventV1, ...]:
-        with self._sql_manager.engine.connect() as connection:
-            return tuple(mutation.committed for mutation in self._decoded_events(connection, executor_id))
+        def operation(connection: Connection):
+            verified = self._verified_recovery_state(connection, executor_id)
+            value = verified.get(executor_id)
+            return () if value is None else tuple(mutation.committed for mutation in value[1])
+
+        return self._read_transaction(operation)
 
     def replay(self, executor_id: str) -> LeveragedEtfPairExecutorSnapshotV1:
-        with self._sql_manager.engine.connect() as connection:
-            persisted = self._load_snapshot_connection(connection, executor_id)
-            if persisted is None:
+        def operation(connection: Connection):
+            verified = self._verified_recovery_state(connection, executor_id)
+            value = verified.get(executor_id)
+            if value is None:
                 raise JournalConflictError(f"executor {executor_id} does not exist")
-            mutations = self._decoded_events(connection, executor_id)
-        if not mutations:
-            if persisted.last_journal_sequence != 0:
-                raise JournalIntegrityError("snapshot sequence has no journal history")
-            return persisted
-        reduced = mutations[0].snapshot_before
-        if reduced.last_journal_sequence != 0:
-            raise JournalIntegrityError("journal replay does not begin at sequence zero")
-        for expected_sequence, mutation in enumerate(mutations, start=1):
-            if mutation.committed.sequence != expected_sequence:
-                raise JournalIntegrityError("journal sequence is not contiguous")
-            if mutation.snapshot_before != reduced:
-                raise JournalIntegrityError("journal snapshot hash chain diverges")
-            reduced = mutation.snapshot_after
-        if reduced != persisted:
-            raise JournalIntegrityError("persisted snapshot disagrees with journal replay")
-        return reduced
+            return value[0]
+
+        return self._read_transaction(operation)
 
     def incomplete_intents(self, executor_id: Optional[str] = None) -> Tuple[IncompleteIntentV1, ...]:
-        with self._sql_manager.engine.connect() as connection:
-            rows = self._event_rows(connection, executor_id)
-        by_executor = {}
-        for row in rows:
-            mutation = self._decode_event_row(row)
-            by_executor.setdefault(mutation.committed.executor_id, []).append(mutation)
-        result = []
-        for current_executor_id, mutations in by_executor.items():
-            result.extend(self._incomplete_from_decoded(current_executor_id, tuple(mutations)))
-        return tuple(sorted(result, key=lambda value: (value.executor_id, value.last_sequence, value.intent_id)))
+        def operation(connection: Connection):
+            verified = self._verified_recovery_state(connection, executor_id)
+            result = []
+            for current_executor_id, (_, mutations) in verified.items():
+                result.extend(self._incomplete_from_decoded(current_executor_id, mutations))
+            return tuple(sorted(result, key=lambda value: (value.executor_id, value.last_sequence, value.intent_id)))
+
+        return self._read_transaction(operation)
 
     def incomplete_executors(self) -> Tuple[LeveragedEtfPairExecutorSnapshotV1, ...]:
-        with self._sql_manager.engine.connect() as connection:
-            rows = (
-                connection.execute(
-                    text(
-                        self._SNAPSHOT_SELECT.replace(
-                            "WHERE executor_id = :executor_id",
-                            "ORDER BY executor_id",
-                        )
-                    )
-                )
-                .mappings()
-                .all()
+        def operation(connection: Connection):
+            verified = self._verified_recovery_state(connection)
+            incomplete_intent_ids = {
+                current_executor_id
+                for current_executor_id, (_, mutations) in verified.items()
+                if self._incomplete_from_decoded(current_executor_id, mutations)
+            }
+            return tuple(
+                snapshot
+                for current_executor_id, (snapshot, _) in sorted(verified.items())
+                if snapshot.state not in _TERMINAL_EXECUTOR_STATES or current_executor_id in incomplete_intent_ids
             )
-        snapshots = tuple(self._decode_snapshot_row(row) for row in rows)
-        incomplete_intent_ids = {intent.executor_id for intent in self.incomplete_intents()}
-        return tuple(
-            snapshot
-            for snapshot in snapshots
-            if snapshot.state not in _TERMINAL_EXECUTOR_STATES or snapshot.executor_id in incomplete_intent_ids
-        )
+
+        return self._read_transaction(operation)
 
     @staticmethod
     def _decode_reservation_row(row: Mapping[str, Any]) -> StrategyReservationV1:
@@ -900,6 +1684,43 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
 
     def reserve(self, reservation: StrategyReservationV1) -> StrategyReservationV1:
         def operation(connection: Connection):
+            serialized = reservation.model_dump(mode="json")
+            expected_key = (
+                f"{reservation.executor_id}:{reservation.leg}:" f"{_canonical_decimal_text(reservation.quantity)}"
+            )
+            if reservation.reservation_key != expected_key:
+                raise JournalConflictError("reservation key is not the canonical logical identity")
+            if reservation.released_at_utc is not None:
+                raise JournalConflictError("reservation cannot be created in a released state")
+            if reservation.updated_at_utc != reservation.created_at_utc:
+                raise JournalConflictError("reservation creation updated time must equal created time")
+
+            snapshot = self._load_snapshot_connection(connection, reservation.executor_id)
+            if snapshot is None:
+                raise JournalConflictError(f"reservation executor {reservation.executor_id} does not exist")
+            decoded = self._decoded_events(connection, reservation.executor_id)
+            self._replay_decoded(snapshot, decoded)
+            if reservation.leg == "ETF":
+                expected_connector = snapshot.etf_connector_name
+                expected_pair = snapshot.etf_trading_pair
+                expected_quantity = snapshot.leverage_reservation.etf_quantity
+                expected_leverage = snapshot.leverage_reservation.etf_leverage
+                expected_notional_cap = snapshot.leverage_reservation.etf_notional_cap
+            else:
+                expected_connector = snapshot.stock_connector_name
+                expected_pair = snapshot.stock_trading_pair
+                expected_quantity = snapshot.leverage_reservation.stock_quantity
+                expected_leverage = snapshot.leverage_reservation.stock_leverage
+                expected_notional_cap = snapshot.leverage_reservation.stock_notional_cap
+            if reservation.connector_name != expected_connector or reservation.trading_pair != expected_pair:
+                raise JournalIntegrityError("reservation connector or trading-pair role disagrees with executor")
+            if reservation.quantity > expected_quantity:
+                raise JournalIntegrityError("reservation quantity exceeds the executor leverage reservation")
+            if reservation.leverage != expected_leverage:
+                raise JournalIntegrityError("reservation leverage disagrees with the executor reservation")
+            if reservation.notional_cap != expected_notional_cap:
+                raise JournalIntegrityError("reservation notional cap disagrees with the executor reservation")
+
             existing_rows = (
                 connection.execute(
                     text("""
@@ -936,7 +1757,6 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             )
             if active is not None:
                 raise JournalConflictError("reservation active leg already exists")
-            serialized = reservation.model_dump(mode="json")
             payload_json = reservation.canonical_json()
             connection.execute(
                 text("""
@@ -983,6 +1803,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 if current_json["released_at_utc"] == released_at_utc:
                     return current
                 raise JournalConflictError("reservation was already released at a different time")
+            if released_at_utc < current_json["created_at_utc"] or released_at_utc < current_json["updated_at_utc"]:
+                raise JournalConflictError("reservation release time must be monotonic after creation")
             updated = StrategyReservationV1.model_validate(
                 {
                     **current_json,
@@ -1056,6 +1878,27 @@ class AnchorRepositoryV1(_TransactionalRepository):
         for key, expected in comparisons.items():
             if key in value and value[key] != expected:
                 raise AnchorIntegrityError(f"anchor payload {key} disagrees with storage metadata")
+
+    @staticmethod
+    def _assert_cycle_identity(
+        current: OpaqueAnchorStateV1,
+        proposed: OpaqueAnchorStateV1,
+        *,
+        inherit_missing_official_close: bool = False,
+    ) -> None:
+        current_json = current.model_dump(mode="json")
+        proposed_json = proposed.model_dump(mode="json")
+        if current.cycle_id != proposed.cycle_id:
+            raise AnchorIntegrityError("anchor cycle identity cannot change")
+        if current.target_session_date != proposed.target_session_date:
+            raise AnchorIntegrityError("anchor target session identity cannot change")
+        if current_json["deadline_utc"] != proposed_json["deadline_utc"]:
+            raise AnchorIntegrityError("anchor deadline identity cannot change")
+        proposed_close = proposed_json["official_close_utc"]
+        if inherit_missing_official_close and proposed_close is None:
+            proposed_close = current_json["official_close_utc"]
+        if current_json["official_close_utc"] != proposed_close:
+            raise AnchorIntegrityError("anchor official close identity cannot change")
 
     @classmethod
     def _decode_anchor_row(cls, row: Mapping[str, Any]) -> OpaqueAnchorStateV1:
@@ -1217,6 +2060,7 @@ class AnchorRepositoryV1(_TransactionalRepository):
                 return checkpoint
             if not isinstance(current, OpaqueAnchorCheckpointV1):
                 raise AnchorIntegrityError("finalized anchor cannot be replaced by a checkpoint")
+            self._assert_cycle_identity(current, checkpoint)
             if current.revision != expected_revision:
                 raise AnchorRevisionConflict(
                     f"checkpoint revision {current.revision} does not match expected {expected_revision}"
@@ -1283,6 +2127,11 @@ class AnchorRepositoryV1(_TransactionalRepository):
         def operation(connection: Connection):
             current = self._load_opaque_connection(connection, record.cycle_id)
             if isinstance(current, OpaqueAnchorFinalizedV1):
+                self._assert_cycle_identity(
+                    current,
+                    record,
+                    inherit_missing_official_close=True,
+                )
                 if current.evidence_hash != record.evidence_hash:
                     raise AnchorIntegrityError("different final evidence cannot overwrite an anchor")
                 if current.payload != record.payload:
@@ -1324,10 +2173,17 @@ class AnchorRepositoryV1(_TransactionalRepository):
                 return record
             if not isinstance(current, OpaqueAnchorCheckpointV1):
                 raise AnchorIntegrityError("anchor state kind is invalid")
+            self._assert_cycle_identity(
+                current,
+                record,
+                inherit_missing_official_close=True,
+            )
             if current.revision != expected_revision:
                 raise AnchorRevisionConflict(
                     f"checkpoint revision {current.revision} does not match expected {expected_revision}"
                 )
+            if record.revision != current.revision:
+                raise AnchorRevisionConflict("final record revision must match the checkpoint revision")
             parameters["revision"] = current.revision
             parameters["official_close_utc"] = record_json["official_close_utc"] or _utc_text(
                 current.official_close_utc
