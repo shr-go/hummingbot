@@ -1,1 +1,2 @@
 eip712-structs
+exchange-calendars==4.13.2  # Mirrors both conda environment pip sections for no-deps install flows.

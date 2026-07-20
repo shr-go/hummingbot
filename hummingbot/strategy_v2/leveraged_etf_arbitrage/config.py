@@ -177,9 +177,9 @@ class NavConfig(StrictFrozenModel):
     timezone: Literal["America/New_York"]
     calendar: Literal["US_EQUITIES"]
     anchor_source: Literal["yahoo_finance_chart_http"]
-    new_entry_cutoff_minutes: PositiveInt
-    maker_close_lead_minutes: PositiveInt
-    force_market_close_lead_seconds: PositiveInt
+    new_entry_cutoff_minutes: Annotated[int, Field(ge=30)]
+    maker_close_lead_minutes: Literal[30]
+    force_market_close_lead_seconds: Literal[60]
     anchor_wait_timeout_seconds: Annotated[int, Field(ge=1, le=600)]
     anchor_min_finalize_delay_seconds: PositiveInt
     anchor_poll_initial_interval_seconds: PositiveInt
@@ -221,11 +221,6 @@ class NavConfig(StrictFrozenModel):
         )
         if conservative_budget > self.anchor_wait_timeout_seconds:
             raise ValueError("conservative anchor success budget exceeds the configured deadline")
-        force_lead = self.force_market_close_lead_seconds
-        if force_lead > self.maker_close_lead_minutes * 60:
-            raise ValueError("forced market close cannot begin before the maker close stage")
-        if force_lead > self.new_entry_cutoff_minutes * 60:
-            raise ValueError("forced market close cannot begin before the new-entry cutoff")
         return self
 
 

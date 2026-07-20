@@ -63,3 +63,5 @@ dependencies:
   - xrpl-py==4.4.0
   - yaml>=0.2.5
   - zlib>=1.2.13
+  - pip:
+    - exchange-calendars==4.13.2  # Keep the supported DYDX variant consistent with default installs.
