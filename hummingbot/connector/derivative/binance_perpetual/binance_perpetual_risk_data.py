@@ -15,7 +15,10 @@ class BinancePerpetualPreflightError(BinancePerpetualRiskDataError):
     """Raised when authoritative account preflight cannot prove a safe state."""
 
 
-_MAX_NOTIONAL_EXACT_DECIMAL_DIGITS = 128
+_MAX_EXACT_DECIMAL_DIGITS = 128
+# Endpoint payload size and aligned integer width stay finite even for adversarial account rows.
+_MAX_EXACT_DECIMAL_AGGREGATE_TERMS = 4096
+_MAX_EXACT_DECIMAL_AGGREGATE_DIGITS = 4 * _MAX_EXACT_DECIMAL_DIGITS + 8
 
 
 def _mapping(value: Any, context: str) -> Mapping[str, Any]:
@@ -128,8 +131,8 @@ def _exact_decimal_components(value: Decimal, field: str) -> Tuple[int, int]:
     sign, digits, exponent = value.as_tuple()
     if (
             not isinstance(exponent, int)
-            or len(digits) > _MAX_NOTIONAL_EXACT_DECIMAL_DIGITS
-            or abs(exponent) > _MAX_NOTIONAL_EXACT_DECIMAL_DIGITS
+            or len(digits) > _MAX_EXACT_DECIMAL_DIGITS
+            or abs(exponent) > _MAX_EXACT_DECIMAL_DIGITS
     ):
         raise BinancePerpetualRiskDataError(f"{field} exceeds supported exact decimal precision")
     coefficient = 0
@@ -143,6 +146,40 @@ def _exact_decimal_components(value: Decimal, field: str) -> Tuple[int, int]:
         coefficient //= 10
         exponent += 1
     return coefficient, exponent
+
+
+def _exact_decimal_sum_components(
+        values: Sequence[Decimal],
+        context: str,
+) -> Tuple[int, int]:
+    if len(values) > _MAX_EXACT_DECIMAL_AGGREGATE_TERMS:
+        raise BinancePerpetualRiskDataError(
+            f"{context} exceeds supported exact decimal aggregate size"
+        )
+    components = tuple(
+        _exact_decimal_components(value, f"{context}[{index}]")
+        for index, value in enumerate(values)
+    )
+    if not components:
+        return 0, 0
+    common_exponent = min(exponent for _, exponent in components)
+    coefficient = sum(
+        value_coefficient * 10 ** (value_exponent - common_exponent)
+        for value_coefficient, value_exponent in components
+    )
+    if coefficient == 0:
+        return 0, 0
+    while coefficient % 10 == 0:
+        coefficient //= 10
+        common_exponent += 1
+    if (
+            len(str(abs(coefficient))) > _MAX_EXACT_DECIMAL_AGGREGATE_DIGITS
+            or abs(common_exponent) > _MAX_EXACT_DECIMAL_AGGREGATE_DIGITS
+    ):
+        raise BinancePerpetualRiskDataError(
+            f"{context} exceeds supported exact decimal aggregate precision"
+        )
+    return coefficient, common_exponent
 
 
 def _exact_decimal_product_components(
@@ -162,23 +199,86 @@ def _exact_decimal_product_components(
     return coefficient, exponent
 
 
+def _exact_decimal_components_compare(
+        left_components: Tuple[int, int],
+        right_components: Tuple[int, int],
+) -> int:
+    left_coefficient, left_exponent = left_components
+    right_coefficient, right_exponent = right_components
+    common_exponent = min(left_exponent, right_exponent)
+    left_scaled = left_coefficient * 10 ** (left_exponent - common_exponent)
+    right_scaled = right_coefficient * 10 ** (right_exponent - common_exponent)
+    return (left_scaled > right_scaled) - (left_scaled < right_scaled)
+
+
+def _exact_decimal_distance_within_tolerance(
+        left_components: Tuple[int, int],
+        right_components: Tuple[int, int],
+        tolerance_components: Tuple[int, int],
+) -> bool:
+    left_coefficient, left_exponent = left_components
+    right_coefficient, right_exponent = right_components
+    tolerance_coefficient, tolerance_exponent = tolerance_components
+    common_exponent = min(left_exponent, right_exponent, tolerance_exponent)
+    left_scaled = left_coefficient * 10 ** (left_exponent - common_exponent)
+    right_scaled = right_coefficient * 10 ** (right_exponent - common_exponent)
+    tolerance_scaled = tolerance_coefficient * 10 ** (tolerance_exponent - common_exponent)
+    return abs(left_scaled - right_scaled) <= tolerance_scaled
+
+
+def exact_decimal_values_reconcile(
+        left: Decimal,
+        right: Decimal,
+        tolerance: Decimal,
+        context: str,
+) -> bool:
+    _validate_decimal_value(tolerance, f"{context}.tolerance", non_negative=True)
+    return _exact_decimal_distance_within_tolerance(
+        left_components=_exact_decimal_components(left, f"{context}.left"),
+        right_components=_exact_decimal_components(right, f"{context}.right"),
+        tolerance_components=_exact_decimal_components(tolerance, f"{context}.tolerance"),
+    )
+
+
+def exact_decimal_sum_reconciles(
+        left: Decimal,
+        right_values: Sequence[Decimal],
+        tolerance: Decimal,
+        context: str,
+) -> bool:
+    _validate_decimal_value(tolerance, f"{context}.tolerance", non_negative=True)
+    return _exact_decimal_distance_within_tolerance(
+        left_components=_exact_decimal_components(left, f"{context}.left"),
+        right_components=_exact_decimal_sum_components(right_values, f"{context}.right"),
+        tolerance_components=_exact_decimal_components(tolerance, f"{context}.tolerance"),
+    )
+
+
+def exact_decimal_value_is_at_most_sum(
+        left: Decimal,
+        right_values: Sequence[Decimal],
+        context: str,
+) -> bool:
+    return _exact_decimal_components_compare(
+        left_components=_exact_decimal_components(left, f"{context}.left"),
+        right_components=_exact_decimal_sum_components(right_values, f"{context}.right"),
+    ) <= 0
+
+
 def _decimal_distance_within_tolerance(
         left: Decimal,
         right_components: Tuple[int, int],
         tolerance: Decimal,
         context: str,
 ) -> bool:
-    left_coefficient, left_exponent = _exact_decimal_components(left, f"{context}.notional")
-    tolerance_coefficient, tolerance_exponent = _exact_decimal_components(
-        tolerance,
-        f"{context}.notional tolerance",
+    return _exact_decimal_distance_within_tolerance(
+        left_components=_exact_decimal_components(left, f"{context}.notional"),
+        right_components=right_components,
+        tolerance_components=_exact_decimal_components(
+            tolerance,
+            f"{context}.notional tolerance",
+        ),
     )
-    right_coefficient, right_exponent = right_components
-    common_exponent = min(left_exponent, right_exponent, tolerance_exponent)
-    left_scaled = left_coefficient * 10 ** (left_exponent - common_exponent)
-    right_scaled = right_coefficient * 10 ** (right_exponent - common_exponent)
-    tolerance_scaled = tolerance_coefficient * 10 ** (tolerance_exponent - common_exponent)
-    return abs(left_scaled - right_scaled) <= tolerance_scaled
 
 
 def _validate_position_identity_and_notional(

@@ -50,6 +50,9 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_risk_da
     BinancePerpetualPreflightSnapshot,
     BinancePerpetualRiskDataError,
     BinancePerpetualSymbolConfig,
+    exact_decimal_sum_reconciles,
+    exact_decimal_value_is_at_most_sum,
+    exact_decimal_values_reconcile,
 )
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_user_stream_data_source import (
     BinancePerpetualUserStreamDataSource,
@@ -1339,9 +1342,6 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                         f"related unknown position or open order exists for {position.symbol}"
                     )
 
-        def reconciles(left: Decimal, right: Decimal) -> bool:
-            return abs(left - right) <= consistency_tolerance
-
         if set(account_position_by_key) != set(position_by_key):
             raise BinancePerpetualPreflightError(
                 "Account V3 and Position V3 position sets do not reconcile"
@@ -1349,53 +1349,102 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         for key, account_position in account_position_by_key.items():
             position = position_by_key[key]
             comparisons = (
-                (account_position.position_amount, position.position_amount),
-                (account_position.notional, position.notional),
-                (account_position.unrealized_profit, position.unrealized_profit),
-                (account_position.initial_margin, position.initial_margin),
-                (account_position.maint_margin, position.maint_margin),
-                (position.initial_margin,
-                 position.position_initial_margin + position.open_order_initial_margin),
+                ("position amount", account_position.position_amount, position.position_amount),
+                ("signed notional", account_position.notional, position.notional),
+                ("unrealized PnL", account_position.unrealized_profit, position.unrealized_profit),
+                ("initial margin", account_position.initial_margin, position.initial_margin),
+                ("maintenance margin", account_position.maint_margin, position.maint_margin),
             )
-            if any(not reconciles(left, right) for left, right in comparisons):
+            try:
+                endpoint_values_reconcile = all(
+                    exact_decimal_values_reconcile(
+                        left=left,
+                        right=right,
+                        tolerance=consistency_tolerance,
+                        context=f"Account V3 and Position V3 {key} {field}",
+                    )
+                    for field, left, right in comparisons
+                )
+                position_margins_reconcile = exact_decimal_sum_reconciles(
+                    left=position.initial_margin,
+                    right_values=(
+                        position.position_initial_margin,
+                        position.open_order_initial_margin,
+                    ),
+                    tolerance=consistency_tolerance,
+                    context=f"Position V3 {key} initial margin components",
+                )
+            except BinancePerpetualRiskDataError as exc:
+                raise BinancePerpetualPreflightError(
+                    "account reconciliation operand exceeds supported exact decimal precision"
+                ) from exc
+            if not endpoint_values_reconcile or not position_margins_reconcile:
                 raise BinancePerpetualPreflightError(
                     f"Account V3 and Position V3 values do not reconcile for {key}"
                 )
 
-        total_position_initial_margin = sum(
-            (position.position_initial_margin for position in positions),
-            Decimal("0"),
-        )
-        total_open_order_initial_margin = sum(
-            (position.open_order_initial_margin for position in positions),
-            Decimal("0"),
-        )
-        total_initial_margin = sum(
-            (position.initial_margin for position in positions),
-            Decimal("0"),
-        )
-        total_maint_margin = sum(
-            (position.maint_margin for position in positions),
-            Decimal("0"),
-        )
-        total_unrealized_profit = sum(
-            (position.unrealized_profit for position in positions),
-            Decimal("0"),
-        )
         account_reconciliations = (
-            (account.total_position_initial_margin, total_position_initial_margin),
-            (account.total_open_order_initial_margin, total_open_order_initial_margin),
-            (account.total_initial_margin, total_initial_margin),
-            (account.total_maint_margin, total_maint_margin),
-            (account.total_unrealized_profit, total_unrealized_profit),
-            (account.total_initial_margin,
-             account.total_position_initial_margin + account.total_open_order_initial_margin),
-            (account.total_margin_balance,
-             account.total_wallet_balance + account.total_unrealized_profit),
+            (
+                "totalPositionInitialMargin",
+                account.total_position_initial_margin,
+                tuple(position.position_initial_margin for position in positions),
+            ),
+            (
+                "totalOpenOrderInitialMargin",
+                account.total_open_order_initial_margin,
+                tuple(position.open_order_initial_margin for position in positions),
+            ),
+            (
+                "totalInitialMargin",
+                account.total_initial_margin,
+                tuple(position.initial_margin for position in positions),
+            ),
+            (
+                "totalMaintMargin",
+                account.total_maint_margin,
+                tuple(position.maint_margin for position in positions),
+            ),
+            (
+                "totalUnrealizedProfit",
+                account.total_unrealized_profit,
+                tuple(position.unrealized_profit for position in positions),
+            ),
+            (
+                "total initial margin components",
+                account.total_initial_margin,
+                (
+                    account.total_position_initial_margin,
+                    account.total_open_order_initial_margin,
+                ),
+            ),
+            (
+                "total margin balance components",
+                account.total_margin_balance,
+                (account.total_wallet_balance, account.total_unrealized_profit),
+            ),
         )
-        if any(not reconciles(left, right) for left, right in account_reconciliations):
+        try:
+            account_totals_reconcile = all(
+                exact_decimal_sum_reconciles(
+                    left=left,
+                    right_values=right_values,
+                    tolerance=consistency_tolerance,
+                    context=f"Account V3 {field}",
+                )
+                for field, left, right_values in account_reconciliations
+            )
+            available_balance_is_bounded = exact_decimal_value_is_at_most_sum(
+                left=account.available_balance,
+                right_values=(account.total_margin_balance, consistency_tolerance),
+                context="Account V3 availableBalance upper bound",
+            )
+        except BinancePerpetualRiskDataError as exc:
+            raise BinancePerpetualPreflightError(
+                "account reconciliation operand exceeds supported exact decimal precision"
+            ) from exc
+        if not account_totals_reconcile:
             raise BinancePerpetualPreflightError("account and per-symbol risk totals do not reconcile")
-        if account.available_balance > account.total_margin_balance + consistency_tolerance:
+        if not available_balance_is_bounded:
             raise BinancePerpetualPreflightError("availableBalance exceeds totalMarginBalance")
 
         bracket_by_symbol = {brackets.symbol: brackets for brackets in leverage_brackets}
@@ -1408,7 +1457,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             brackets = bracket_by_symbol[symbol]
             current_notional = max(
                 (
-                    abs(position.notional)
+                    position.notional.copy_abs()
                     for position in positions
                     if position.symbol == symbol
                 ),
