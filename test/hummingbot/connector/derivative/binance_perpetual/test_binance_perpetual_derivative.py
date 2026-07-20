@@ -49,6 +49,14 @@ def event_reusing_identity(identity: int, is_set: bool) -> asyncio.Event:
     raise AssertionError(f"CPython did not reuse asyncio.Event identity {identity}")
 
 
+class SubmissionResponseText:
+    def __init__(self, text: str):
+        self._text = text
+
+    def __str__(self) -> str:
+        return self._text
+
+
 class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
     # the level is required to receive logs from the data source logger
     level = 0
@@ -4472,6 +4480,103 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
         self.assertEqual(1, len(failure_logger.event_log))
         self.assertEqual(client_order_id, failure_logger.event_log[0].order_id)
+
+    async def test_review_candidate_text_and_punctuation_preserve_public_unknown_lifecycle(self):
+        self._simulate_trading_rules_initialized()
+        nested_response_failure = IOError("NEW_ORDER_REJECTED")
+        nested_response_failure.code = -2010
+        nested_response_failure.msg = "NEW_ORDER_REJECTED"
+        nested_response_failure.response = SubmissionResponseText(
+            "HTTP status is 503; execution status: unknown"
+        )
+        cases = (
+            ("nested-response-text", nested_response_failure, None),
+            (
+                "punctuated-unknown-message",
+                None,
+                {"status": 400, "code": -2010, "msg": "execution status: unknown"},
+            ),
+        )
+
+        for index, (label, exception, payload) in enumerate(cases):
+            with self.subTest(boundary=label):
+                client_order_id = f"t006-review-unknown-{index}"
+                failure_logger = EventLogger()
+                self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+                if exception is not None:
+                    self.exchange._api_post = AsyncMock(side_effect=exception)
+                else:
+                    self.exchange._api_post = AsyncMock(return_value=payload)
+
+                submitted_id = self.exchange.buy(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("3"),
+                    order_type=OrderType.MARKET,
+                    price=Decimal("10000"),
+                    client_order_id=client_order_id,
+                    position_action=PositionAction.OPEN,
+                )
+                await asyncio.sleep(0.01)
+
+                tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+                intent = self.exchange._unknown_submission_order_intents.get(client_order_id)
+                self.assertEqual(client_order_id, submitted_id)
+                self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+                self.assertIsNone(tracked_order.exchange_order_id)
+                self.assertIn(client_order_id, self.exchange.in_flight_orders)
+                self.assertIn(client_order_id, self.exchange._reserved_client_order_ids)
+                self.assertIsNotNone(intent)
+                self.assertEqual(
+                    (CONSTANTS.TIME_IN_FORCE_GTC, False, False, "BOTH"),
+                    (
+                        intent.time_in_force,
+                        intent.reduce_only,
+                        intent.close_position,
+                        intent.position_side,
+                    ),
+                )
+                self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+                self.assertEqual([], failure_logger.event_log)
+                self.exchange.remove_listener(MarketEvent.OrderFailure, failure_logger)
+
+    def test_review_candidate_text_and_unknown_punctuation_fact_matrix(self):
+        nested_503_failure = IOError("NEW_ORDER_REJECTED")
+        nested_503_failure.code = -2010
+        nested_503_failure.msg = "NEW_ORDER_REJECTED"
+        nested_503_failure.response = SubmissionResponseText(
+            "HTTP status is 503; execution status: unknown"
+        )
+        nested_408_failure = IOError("NEW_ORDER_REJECTED")
+        nested_408_failure.code = -2010
+        nested_408_failure.msg = "NEW_ORDER_REJECTED"
+        nested_408_failure.response = SubmissionResponseText("HTTP status is 408")
+        ambiguous_cases = (
+            ("nested-503-and-unknown", nested_503_failure),
+            ("nested-408", nested_408_failure),
+            (
+                "execution-status-colon",
+                {"status": 400, "code": -2010, "msg": "execution status: unknown"},
+            ),
+            (
+                "send-status-equals",
+                {"status": 400, "code": -2010, "msg": "send status = unknown"},
+            ),
+        )
+
+        for label, failure in ambiguous_cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+                    classify_binance_order_submission_failure(failure),
+                )
+        self.assertIs(
+            BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION,
+            classify_binance_order_submission_failure({
+                "status": 400,
+                "code": -2010,
+                "msg": "NEW_ORDER_REJECTED",
+            }),
+        )
 
     def test_feature_submission_failure_fact_matrix_fails_closed(self):
         attribute_failure = IOError("NEW_ORDER_REJECTED")
