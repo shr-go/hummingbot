@@ -146,6 +146,8 @@ def _snapshot_with_leg_fill(
     leg: str,
     submitted: str,
     filled: str,
+    client_order_id: str | None = None,
+    exchange_order_id: str | None = None,
     updated_at_utc: str = UPDATED_AT,
 ) -> LeveragedEtfPairExecutorSnapshotV1:
     payload = snapshot.model_dump(mode="json")
@@ -161,6 +163,16 @@ def _snapshot_with_leg_fill(
             "last_journal_sequence": sequence,
         }
     )
+    if exchange_order_id is not None:
+        assert client_order_id is not None
+        order_field = "maker_order_ids" if leg == "ETF" else "stock_order_ids"
+        payload[order_field] = [
+            {
+                "sequence": sequence,
+                "client_order_id": client_order_id,
+                "exchange_order_id": exchange_order_id,
+            }
+        ]
     return LeveragedEtfPairExecutorSnapshotV1.model_validate(payload)
 
 
@@ -681,6 +693,8 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
         leg="ETF",
         submitted="1",
         filled="1",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-order-1",
     )
     fill = _followup_event(
         initial,
@@ -1191,6 +1205,8 @@ def test_exchange_trade_duplicate_requires_complete_same_event_identity(
         leg="ETF",
         submitted="1",
         filled="1",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-order-owned",
     )
     event = _followup_event(
         initial,
@@ -1226,6 +1242,8 @@ def test_exchange_trade_duplicate_cannot_return_foreign_executor_event(
         leg="ETF",
         submitted="1",
         filled="1",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-order-shared",
     )
     fill_a = _followup_event(
         initial_a,
@@ -1316,6 +1334,8 @@ def test_cross_executor_exchange_trade_race_has_one_owner(manager: SQLConnection
         leg="ETF",
         submitted="1",
         filled="1",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-order-race-a",
     )
     filled_b = _snapshot_with_leg_fill(
         prepared_b,
@@ -1324,6 +1344,8 @@ def test_cross_executor_exchange_trade_race_has_one_owner(manager: SQLConnection
         leg="ETF",
         submitted="1",
         filled="1",
+        client_order_id="exec-sndk-snxx-0002-maker-1",
+        exchange_order_id="exchange-order-race-b",
     )
     fill_a = _followup_event(
         initial_a,
