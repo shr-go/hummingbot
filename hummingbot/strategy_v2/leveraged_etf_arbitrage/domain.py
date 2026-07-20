@@ -3,17 +3,19 @@ from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
+from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
+    decision_decimal_context,
+    validate_bounded_decimal,
+)
+
 
 def _validate_decimal(value: object, name: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:
-    if not isinstance(value, Decimal):
-        raise TypeError(f"{name} must be a Decimal")
-    if not value.is_finite():
-        raise ValueError(f"{name} must be finite")
-    if positive and value <= 0:
-        raise ValueError(f"{name} must be positive")
-    if nonnegative and value < 0:
-        raise ValueError(f"{name} must be nonnegative")
-    return value
+    return validate_bounded_decimal(
+        value,
+        name,
+        positive=positive,
+        nonnegative=nonnegative,
+    )
 
 
 class ArbitrageDirection(str, Enum):
@@ -50,7 +52,7 @@ class LegQuantities:
         _validate_decimal(self.stock_quantity, "stock quantity")
         if self.etf_quantity == 0 or self.stock_quantity == 0:
             raise ValueError("leg quantities must be nonzero")
-        if self.etf_quantity * self.stock_quantity >= 0:
+        if self.etf_quantity.is_signed() == self.stock_quantity.is_signed():
             raise ValueError("ETF and stock quantities must have opposing signs")
 
 
@@ -64,8 +66,9 @@ class LegNotionals:
         _validate_decimal(self.etf, "ETF notional", positive=True)
         _validate_decimal(self.stock, "stock notional", positive=True)
         _validate_decimal(self.gross, "gross notional", positive=True)
-        if self.gross != self.etf + self.stock:
-            raise ValueError("gross notional must equal the sum of both absolute leg notionals")
+        with decision_decimal_context():
+            if self.gross != self.etf + self.stock:
+                raise ValueError("gross notional must equal the sum of both absolute leg notionals")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,8 +95,9 @@ class RoundTripCosts:
             _validate_decimal(component, "cost component", nonnegative=True)
         _validate_decimal(self.total_quote, "total cost quote", nonnegative=True)
         _validate_decimal(self.total_bp, "total cost bp", nonnegative=True)
-        if self.total_quote != sum(components, start=Decimal("0")):
-            raise ValueError("total quote cost must equal the six one-time cost entries")
+        with decision_decimal_context():
+            if self.total_quote != sum(components, start=Decimal("0")):
+                raise ValueError("total quote cost must equal the six one-time cost entries")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +120,9 @@ class Opportunity:
         _validate_decimal(self.gross_profit_quote, "gross profit quote", positive=True)
         _validate_decimal(self.raw_bp, "raw bp", positive=True)
         _validate_decimal(self.net_bp, "net bp")
-        if self.net_bp != self.raw_bp - self.costs.total_bp:
-            raise ValueError("net bp must subtract the fixed cost ledger exactly once")
+        with decision_decimal_context():
+            if self.net_bp != self.raw_bp - self.costs.total_bp:
+                raise ValueError("net bp must subtract the fixed cost ledger exactly once")
 
 
 @dataclass(frozen=True, slots=True)

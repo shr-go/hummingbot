@@ -8,6 +8,8 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import validate_yahoo_decimal
+
 
 UTC = timezone.utc
 NEW_YORK = ZoneInfo("America/New_York")
@@ -34,11 +36,7 @@ def _require_utc(value: object, field_name: str) -> datetime:
 
 
 def _require_positive_decimal(value: object, field_name: str) -> Decimal:
-    if not isinstance(value, Decimal):
-        raise TypeError(f"{field_name} must be a Decimal")
-    if not value.is_finite() or value <= 0:
-        raise ValueError(f"{field_name} must be finite and positive")
-    return value
+    return validate_yahoo_decimal(value, field_name, positive=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,8 +254,18 @@ class YahooChartParser:
                         raise YahooChartParseError(
                             f"events.{group_name}.{event_key}.splitRatio must use numerator:denominator syntax"
                         )
-                    ratio_numerator = Decimal(ratio_match.group("numerator"))
-                    ratio_denominator = Decimal(ratio_match.group("denominator"))
+                    ratio_numerator = self._numeric_decimal(
+                        Decimal(ratio_match.group("numerator")),
+                        f"events.{group_name}.{event_key}.splitRatio numerator",
+                        positive=True,
+                        nullable=False,
+                    )
+                    ratio_denominator = self._numeric_decimal(
+                        Decimal(ratio_match.group("denominator")),
+                        f"events.{group_name}.{event_key}.splitRatio denominator",
+                        positive=True,
+                        nullable=False,
+                    )
                     if ratio_numerator != numerator or ratio_denominator != denominator:
                         raise YahooChartParseError(
                             f"events.{group_name}.{event_key}.splitRatio is inconsistent with split fields"
@@ -291,13 +299,15 @@ class YahooChartParser:
         if isinstance(value, bool) or not isinstance(value, (Decimal, int)):
             raise YahooChartParseError(f"{field_name} must be a JSON number")
         parsed = value if isinstance(value, Decimal) else Decimal(value)
-        if not parsed.is_finite():
-            raise YahooChartParseError(f"{field_name} must be finite")
-        if positive and parsed <= 0:
-            raise YahooChartParseError(f"{field_name} must be positive")
-        if not positive and parsed < 0:
-            raise YahooChartParseError(f"{field_name} must be nonnegative")
-        return parsed
+        try:
+            return validate_yahoo_decimal(
+                parsed,
+                field_name,
+                positive=positive,
+                nonnegative=not positive,
+            )
+        except (TypeError, ValueError) as exception:
+            raise YahooChartParseError(str(exception)) from exception
 
     @staticmethod
     def _volume(value: object) -> int | None:

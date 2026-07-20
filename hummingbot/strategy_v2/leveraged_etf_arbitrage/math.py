@@ -1,5 +1,7 @@
 from collections.abc import Mapping, Sequence
 from decimal import ROUND_DOWN, Decimal
+from fractions import Fraction
+from functools import wraps
 from typing import Optional
 
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
@@ -13,21 +15,44 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
     Opportunity,
     RoundTripCosts,
 )
+from hummingbot.strategy_v2.leveraged_etf_arbitrage.decimal_policy import (
+    decision_decimal_context,
+    validate_bounded_decimal,
+)
 
 
 BASIS_POINTS = Decimal("10000")
 
 
 def _decimal(value: object, name: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:
-    if not isinstance(value, Decimal):
-        raise TypeError(f"{name} must be a Decimal")
-    if not value.is_finite():
-        raise ValueError(f"{name} must be finite")
-    if positive and value <= 0:
-        raise ValueError(f"{name} must be positive")
-    if nonnegative and value < 0:
-        raise ValueError(f"{name} must be nonnegative")
-    return value
+    return validate_bounded_decimal(
+        value,
+        name,
+        positive=positive,
+        nonnegative=nonnegative,
+    )
+
+
+def _fixed_decimal_context(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with decision_decimal_context():
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def _exact_theoretical_price(
+    stock_price: Decimal,
+    stock_anchor: Decimal,
+    etf_anchor: Decimal,
+    etf_daily_multiplier: Decimal,
+) -> Fraction:
+    stock_price_fraction = Fraction(stock_price)
+    stock_anchor_fraction = Fraction(stock_anchor)
+    return Fraction(etf_anchor) * (
+        1 + Fraction(etf_daily_multiplier) * (stock_price_fraction / stock_anchor_fraction - 1)
+    )
 
 
 def _direction(value: object) -> ArbitrageDirection:
@@ -42,6 +67,7 @@ def _book_side(value: object) -> BookSide:
     return value
 
 
+@_fixed_decimal_context
 def calculate_hedge_ratio(
     stock_anchor: Decimal,
     etf_anchor: Decimal,
@@ -50,9 +76,14 @@ def calculate_hedge_ratio(
     stock_anchor = _decimal(stock_anchor, "stock anchor", positive=True)
     etf_anchor = _decimal(etf_anchor, "ETF anchor", positive=True)
     etf_daily_multiplier = _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True)
-    return etf_daily_multiplier * etf_anchor / stock_anchor
+    return validate_bounded_decimal(
+        etf_daily_multiplier * etf_anchor / stock_anchor,
+        "hedge ratio result",
+        positive=True,
+    )
 
 
+@_fixed_decimal_context
 def calculate_theoretical_etf_price(
     stock_price: Decimal,
     stock_anchor: Decimal,
@@ -63,14 +94,23 @@ def calculate_theoretical_etf_price(
     stock_anchor = _decimal(stock_anchor, "stock anchor", positive=True)
     etf_anchor = _decimal(etf_anchor, "ETF anchor", positive=True)
     etf_daily_multiplier = _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True)
-    theoretical_price = etf_anchor * (
-        Decimal("1") + etf_daily_multiplier * (stock_price / stock_anchor - Decimal("1"))
+    exact_price = _exact_theoretical_price(
+        stock_price,
+        stock_anchor,
+        etf_anchor,
+        etf_daily_multiplier,
     )
+    theoretical_price = Decimal(exact_price.numerator) / Decimal(exact_price.denominator)
     if theoretical_price <= 0:
         raise ValueError("theoretical ETF price must be positive")
-    return theoretical_price
+    return validate_bounded_decimal(
+        theoretical_price,
+        "theoretical ETF price result",
+        positive=True,
+    )
 
 
+@_fixed_decimal_context
 def determine_arbitrage_direction(
     etf_price: Decimal,
     theoretical_etf_price: Decimal,
@@ -84,6 +124,7 @@ def determine_arbitrage_direction(
     return None
 
 
+@_fixed_decimal_context
 def calculate_leg_quantities(
     etf_quantity: Decimal,
     direction: ArbitrageDirection,
@@ -102,6 +143,7 @@ def calculate_leg_quantities(
     return LegQuantities(etf_quantity=etf_quantity, stock_quantity=-stock_quantity)
 
 
+@_fixed_decimal_context
 def calculate_leg_notionals(
     quantities: LegQuantities,
     etf_price: Decimal,
@@ -120,6 +162,7 @@ def calculate_leg_notionals(
     return LegNotionals(etf=etf_notional, stock=stock_notional, gross=etf_notional + stock_notional)
 
 
+@_fixed_decimal_context
 def calculate_round_trip_costs(
     notionals: LegNotionals,
     maker_fee_bp: Decimal,
@@ -151,6 +194,7 @@ def calculate_round_trip_costs(
     )
 
 
+@_fixed_decimal_context
 def calculate_opportunity(
     *,
     stock_anchor: Decimal,
@@ -172,9 +216,23 @@ def calculate_opportunity(
         etf_daily_multiplier,
     )
     etf_entry_price = _decimal(etf_entry_price, "ETF entry price", positive=True)
-    direction = determine_arbitrage_direction(etf_entry_price, theoretical_price)
+    exact_theoretical_price = _exact_theoretical_price(
+        _decimal(stock_entry_price, "stock entry price", positive=True),
+        _decimal(stock_anchor, "stock anchor", positive=True),
+        _decimal(etf_anchor, "ETF anchor", positive=True),
+        _decimal(etf_daily_multiplier, "ETF daily multiplier", positive=True),
+    )
+    etf_entry_fraction = Fraction(etf_entry_price)
+    if etf_entry_fraction > exact_theoretical_price:
+        direction = ArbitrageDirection.SHORT_ETF_LONG_STOCK
+    elif etf_entry_fraction < exact_theoretical_price:
+        direction = ArbitrageDirection.LONG_ETF_SHORT_STOCK
+    else:
+        direction = None
     if direction is None:
         raise ValueError("entry prices contain no directional spread")
+    if etf_entry_price == theoretical_price:
+        raise ValueError("canonical theoretical price cannot establish a certain directional spread")
     hedge_ratio = calculate_hedge_ratio(stock_anchor, etf_anchor, etf_daily_multiplier)
     quantities = calculate_leg_quantities(
         etf_quantity,
@@ -213,6 +271,7 @@ def calculate_opportunity(
     )
 
 
+@_fixed_decimal_context
 def depth_vwap(
     levels: Sequence[DepthLevel],
     quantity: Decimal,
@@ -238,9 +297,14 @@ def depth_vwap(
             remaining -= filled
     if remaining > 0:
         raise InsufficientDepthError("order book cannot execute the full stock quantity")
-    return quote_value / quantity
+    return validate_bounded_decimal(
+        quote_value / quantity,
+        "stock VWAP result",
+        positive=True,
+    )
 
 
+@_fixed_decimal_context
 def stock_book_walk_bp(vwap: Decimal, best_quote: Decimal, side: BookSide) -> Decimal:
     vwap = _decimal(vwap, "stock VWAP", positive=True)
     best_quote = _decimal(best_quote, "best stock quote", positive=True)
@@ -251,7 +315,7 @@ def stock_book_walk_bp(vwap: Decimal, best_quote: Decimal, side: BookSide) -> De
         impact = (Decimal("1") - vwap / best_quote) * BASIS_POINTS
     if impact < 0:
         raise ValueError("stock VWAP cannot improve beyond the same-side best quote")
-    return impact
+    return validate_bounded_decimal(impact, "stock book walk result", nonnegative=True)
 
 
 def _ordered_tiers(position_tiers: Mapping[Decimal, Decimal]) -> tuple[tuple[Decimal, Decimal], ...]:
@@ -273,6 +337,7 @@ def _ordered_tiers(position_tiers: Mapping[Decimal, Decimal]) -> tuple[tuple[Dec
     return ordered
 
 
+@_fixed_decimal_context
 def select_entry_target(net_bp: Decimal, position_tiers: Mapping[Decimal, Decimal]) -> Decimal:
     net_bp = _decimal(net_bp, "net bp")
     ordered_tiers = _ordered_tiers(position_tiers)
@@ -281,6 +346,7 @@ def select_entry_target(net_bp: Decimal, position_tiers: Mapping[Decimal, Decima
     return max(target for threshold, target in ordered_tiers if threshold <= net_bp)
 
 
+@_fixed_decimal_context
 def advance_entry_confirmation(
     state: EntryConfirmationState,
     direction: Optional[ArbitrageDirection],
@@ -301,6 +367,7 @@ def advance_entry_confirmation(
     return EntryConfirmationState(direction=direction, target=target, consecutive_count=1)
 
 
+@_fixed_decimal_context
 def select_reduce_target(
     net_bp: Decimal,
     current_target: Decimal,
@@ -334,8 +401,13 @@ def select_reduce_target(
     return current_target
 
 
+@_fixed_decimal_context
 def quantize_quantity(quantity: Decimal, step: Decimal) -> Decimal:
     quantity = _decimal(quantity, "quantity")
     step = _decimal(step, "quantity step", positive=True)
     quantized_abs = (abs(quantity) / step).to_integral_value(rounding=ROUND_DOWN) * step
-    return -quantized_abs if quantity < 0 else quantized_abs
+    if quantized_abs.is_zero():
+        result = quantized_abs.copy_abs()
+    else:
+        result = -quantized_abs if quantity < 0 else quantized_abs
+    return validate_bounded_decimal(result, "quantized quantity result")
