@@ -106,6 +106,33 @@ class RaisingSubmissionResponseFailure(IOError):
         raise RuntimeError("response accessor failed")
 
 
+class AttributeErrorSubmissionResponse:
+    def __init__(self):
+        self.response_accesses = 0
+
+    @property
+    def response(self) -> Any:
+        self.response_accesses += 1
+        raise AttributeError("response accessor failed")
+
+    def __str__(self) -> str:
+        return "neutral attribute-error response wrapper"
+
+
+class AttributeErrorSubmissionResponseFailure(IOError):
+    def __init__(self):
+        super().__init__("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+        self.status = 400
+        self.code = -2010
+        self.msg = "NEW_ORDER_REJECTED"
+        self.response_accesses = 0
+
+    @property
+    def response(self) -> Any:
+        self.response_accesses += 1
+        raise AttributeError("response accessor failed")
+
+
 class RaisingSubmissionResponseMapping(dict):
     def __init__(self):
         super().__init__(status=400, code=-2010, msg="NEW_ORDER_REJECTED")
@@ -4738,6 +4765,101 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(0, equality_hostile_response.equality_checks)
         self.assertEqual(1, raising_accessor_failure.response_accesses)
         self.assertEqual(1, changing_boundary.response_accesses)
+
+    async def test_review_attribute_error_response_accessors_preserve_public_unknown_lifecycle(self):
+        self._simulate_trading_rules_initialized()
+
+        nested_accessor = AttributeErrorSubmissionResponse()
+        nested_failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+        nested_failure.status = 400
+        nested_failure.code = -2010
+        nested_failure.msg = "NEW_ORDER_REJECTED"
+        nested_failure.response = SubmissionResponseNode(response=nested_accessor)
+        outer_accessor = AttributeErrorSubmissionResponseFailure()
+        cases = (
+            ("outer-attribute-error-accessor", outer_accessor),
+            ("bounded-nested-attribute-error-accessor", nested_failure),
+        )
+
+        for index, (label, failure) in enumerate(cases):
+            with self.subTest(boundary=label):
+                client_order_id = f"t007-attribute-error-public-{index}"
+                failure_logger = EventLogger()
+                self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+                try:
+                    self.exchange._api_post = AsyncMock(side_effect=failure)
+
+                    submitted_id = self.exchange.buy(
+                        trading_pair=self.trading_pair,
+                        amount=Decimal("3"),
+                        order_type=OrderType.MARKET,
+                        price=Decimal("10000"),
+                        client_order_id=client_order_id,
+                        position_action=PositionAction.OPEN,
+                    )
+                    await asyncio.sleep(0.01)
+
+                    tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
+                    intent = self.exchange._unknown_submission_order_intents.get(client_order_id)
+                    self.assertEqual(
+                        {
+                            "submitted_id": client_order_id,
+                            "client_order_id": client_order_id,
+                            "state": OrderState.PENDING_CREATE,
+                            "exchange_order_id": None,
+                            "in_flight": True,
+                            "reserved": True,
+                            "intent": (CONSTANTS.TIME_IN_FORCE_GTC, False, False, "BOTH"),
+                            "submission_unknown": True,
+                            "failure_events": 0,
+                        },
+                        {
+                            "submitted_id": submitted_id,
+                            "client_order_id": tracked_order.client_order_id,
+                            "state": tracked_order.current_state,
+                            "exchange_order_id": tracked_order.exchange_order_id,
+                            "in_flight": client_order_id in self.exchange.in_flight_orders,
+                            "reserved": client_order_id in self.exchange._reserved_client_order_ids,
+                            "intent": None if intent is None else (
+                                intent.time_in_force,
+                                intent.reduce_only,
+                                intent.close_position,
+                                intent.position_side,
+                            ),
+                            "submission_unknown": self.exchange.is_order_submission_unknown(
+                                client_order_id
+                            ),
+                            "failure_events": len(failure_logger.event_log),
+                        },
+                    )
+                finally:
+                    self.exchange.remove_listener(MarketEvent.OrderFailure, failure_logger)
+
+        self.assertEqual(1, outer_accessor.response_accesses)
+        self.assertEqual(1, nested_accessor.response_accesses)
+
+    def test_review_attribute_error_response_accessors_fail_closed_once(self):
+        nested_accessor = AttributeErrorSubmissionResponse()
+        nested_failure = IOError("HTTP status is 400; Binance code -2010 NEW_ORDER_REJECTED")
+        nested_failure.status = 400
+        nested_failure.code = -2010
+        nested_failure.msg = "NEW_ORDER_REJECTED"
+        nested_failure.response = SubmissionResponseNode(response=nested_accessor)
+        outer_accessor = AttributeErrorSubmissionResponseFailure()
+        cases = (
+            ("outer-attribute-error-accessor", outer_accessor),
+            ("bounded-nested-attribute-error-accessor", nested_failure),
+        )
+
+        for label, failure in cases:
+            with self.subTest(boundary=label):
+                self.assertIs(
+                    BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH,
+                    classify_binance_order_submission_failure(failure),
+                )
+
+        self.assertEqual(1, outer_accessor.response_accesses)
+        self.assertEqual(1, nested_accessor.response_accesses)
 
     def test_review_bounded_response_chain_completeness_fact_matrix(self):
         def authoritative_failure() -> IOError:
