@@ -62,6 +62,7 @@ _BINANCE_AUTHORITATIVE_REJECTION_CODES = {-2010}
 _SUBMISSION_CODE_FIELDS = ("code",)
 _SUBMISSION_STATUS_FIELDS = ("status", "status_code", "http_status", "statusCode", "httpStatus")
 _SUBMISSION_MESSAGE_FIELDS = ("msg", "message", "error_message", "errorMessage")
+_SUBMISSION_FAILURE_CANDIDATE_LIMIT = 3
 _MISSING_SUBMISSION_FACT = object()
 
 
@@ -74,6 +75,7 @@ class _BinanceSubmissionFailureFacts:
     malformed_code: bool
     malformed_status: bool
     malformed_message: bool
+    incomplete_response_chain: bool
 
 
 def _submission_fact(candidate: Any, field: str) -> Any:
@@ -85,19 +87,31 @@ def _submission_fact(candidate: Any, field: str) -> Any:
         return _MISSING_SUBMISSION_FACT
 
 
-def _submission_failure_candidates(failure: Any) -> tuple[Any, ...]:
+def _submission_response(candidate: Any) -> tuple[Any, bool]:
+    try:
+        if isinstance(candidate, Mapping):
+            return candidate.get("response", _MISSING_SUBMISSION_FACT), False
+        return getattr(candidate, "response", _MISSING_SUBMISSION_FACT), False
+    except Exception:
+        return _MISSING_SUBMISSION_FACT, True
+
+
+def _submission_failure_candidates(failure: Any) -> tuple[tuple[Any, ...], bool]:
     candidates = [failure]
     index = 0
-    while index < len(candidates) and len(candidates) < 3:
-        response = _submission_fact(candidates[index], "response")
-        if (
-            response is not _MISSING_SUBMISSION_FACT
-            and response is not None
-            and all(response is not candidate for candidate in candidates)
-        ):
-            candidates.append(response)
+    while index < len(candidates):
+        response, access_failed = _submission_response(candidates[index])
+        if access_failed:
+            return tuple(candidates), True
+        if response is _MISSING_SUBMISSION_FACT or response is None:
+            return tuple(candidates), False
+        if any(response is candidate for candidate in candidates):
+            return tuple(candidates), True
+        if len(candidates) == _SUBMISSION_FAILURE_CANDIDATE_LIMIT:
+            return tuple(candidates), True
+        candidates.append(response)
         index += 1
-    return tuple(candidates)
+    return tuple(candidates), False
 
 
 def _submission_integer(value: Any, *, status: bool) -> Optional[int]:
@@ -118,7 +132,7 @@ def _submission_integer(value: Any, *, status: bool) -> Optional[int]:
 
 
 def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
-    candidates = _submission_failure_candidates(failure)
+    candidates, incomplete_response_chain = _submission_failure_candidates(failure)
     codes = set()
     statuses = set()
     messages = []
@@ -168,6 +182,7 @@ def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
         malformed_code=malformed_code,
         malformed_status=malformed_status,
         malformed_message=malformed_message,
+        incomplete_response_chain=incomplete_response_chain,
     )
 
 
@@ -200,6 +215,7 @@ def classify_binance_order_submission_failure(
         facts.malformed_code
         or facts.malformed_status
         or facts.malformed_message
+        or facts.incomplete_response_chain
         or len(facts.codes) > 1
         or len(facts.statuses) > 1
     ):
