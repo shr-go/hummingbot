@@ -42,11 +42,12 @@ class _StagedTradeUpdateToken:
 
 
 class _EventState(NamedTuple):
-    identity: Optional[int]
+    event: Optional[asyncio.Event]
     is_set: bool
 
 
 class _StagedTradeUpdateData(NamedTuple):
+    token_reference: weakref.ReferenceType[_StagedTradeUpdateToken]
     tracked_order: InFlightOrder
     staged_order: InFlightOrder
     trade_update: TradeUpdate
@@ -93,7 +94,7 @@ class ClientOrderTracker:
         self._order_tracking_task: Optional[asyncio.Task] = None
         self._last_poll_timestamp: int = -1
         self._order_not_found_records: Dict[str, int] = defaultdict(lambda: 0)
-        self._staged_trade_updates = weakref.WeakKeyDictionary()
+        self._staged_trade_updates: Dict[int, _StagedTradeUpdateData] = {}
 
     @property
     def active_orders(self) -> Dict[str, InFlightOrder]:
@@ -277,24 +278,63 @@ class ClientOrderTracker:
         for attribute_name, attribute_value in vars(tracked_order).items():
             if isinstance(attribute_value, asyncio.Event):
                 state[attribute_name] = _EventState(
-                    identity=id(attribute_value) if bind_event_identity else None,
+                    event=attribute_value if bind_event_identity else None,
                     is_set=attribute_value.is_set(),
                 )
             else:
                 state[attribute_name] = copy.deepcopy(attribute_value)
         return state
 
+    @staticmethod
+    def _order_matches_baseline(
+            tracked_order: InFlightOrder,
+            baseline_state: Dict[str, Any],
+    ) -> bool:
+        expected_attribute_names = set(baseline_state).difference({"__order_type__"})
+        current_attributes = vars(tracked_order)
+        if (
+            type(tracked_order) is not baseline_state["__order_type__"]
+            or set(current_attributes) != expected_attribute_names
+        ):
+            return False
+        for attribute_name, expected_value in baseline_state.items():
+            if attribute_name == "__order_type__":
+                continue
+            current_value = current_attributes[attribute_name]
+            if isinstance(expected_value, _EventState):
+                if (
+                    not isinstance(current_value, asyncio.Event)
+                    or current_value is not expected_value.event
+                    or current_value.is_set() != expected_value.is_set
+                ):
+                    return False
+            elif current_value != expected_value:
+                return False
+        return True
+
     def _staged_trade_update_data(self, staged_update: object) -> _StagedTradeUpdateData:
-        try:
-            return self._staged_trade_updates[staged_update]
-        except (KeyError, TypeError):
+        staged_identity = id(staged_update)
+        staged_data = self._staged_trade_updates.get(staged_identity)
+        if staged_data is None:
             raise ValueError("staged trade update is not owned by this tracker")
+        issued_token = staged_data.token_reference()
+        if (
+            issued_token is not staged_update
+            or self._staged_trade_updates.get(staged_identity) is not staged_data
+            or staged_data.token_reference() is not issued_token
+        ):
+            raise ValueError("staged trade update is not owned by this tracker")
+        return staged_data
 
     def _consume_staged_trade_update(self, staged_update: object) -> _StagedTradeUpdateData:
-        try:
-            return self._staged_trade_updates.pop(staged_update)
-        except (KeyError, TypeError):
+        staged_data = self._staged_trade_update_data(staged_update)
+        removed_data = self._staged_trade_updates.pop(id(staged_update), None)
+        if (
+            removed_data is not staged_data
+            or staged_data.token_reference() is not staged_update
+        ):
             raise ValueError("staged trade update is forged, reused, or owned by another tracker")
+        return staged_data
 
     def stage_trade_update(self, trade_update: TradeUpdate) -> Optional[_StagedTradeUpdateToken]:
         """Apply a trade to isolated order state without publishing or mutating the tracked order."""
@@ -327,7 +367,19 @@ class ClientOrderTracker:
             )
 
         staged_update = _StagedTradeUpdateToken()
-        self._staged_trade_updates[staged_update] = _StagedTradeUpdateData(
+        staged_identity = id(staged_update)
+        tracker_reference = weakref.ref(self)
+
+        def remove_abandoned_stage(token_reference):
+            tracker = tracker_reference()
+            if tracker is not None:
+                staged_data = tracker._staged_trade_updates.get(staged_identity)
+                if staged_data is not None and staged_data.token_reference is token_reference:
+                    tracker._staged_trade_updates.pop(staged_identity, None)
+
+        token_reference = weakref.ref(staged_update, remove_abandoned_stage)
+        self._staged_trade_updates[staged_identity] = _StagedTradeUpdateData(
+            token_reference=token_reference,
             tracked_order=tracked_order,
             staged_order=staged_order,
             trade_update=expected_trade_update,
@@ -366,7 +418,7 @@ class ClientOrderTracker:
             current_orders is not staged_data.source_orders
             or current_order is not tracked_order
             or staged_data.source_orders.get(tracked_order.client_order_id) is not tracked_order
-            or self._order_state(tracked_order, bind_event_identity=True) != staged_data.baseline_state
+            or not self._order_matches_baseline(tracked_order, staged_data.baseline_state)
         ):
             raise RuntimeError("tracked order or mapping changed before staged trade update commit")
         if not staged_data.transition_is_exact or not staged_data.updated:
