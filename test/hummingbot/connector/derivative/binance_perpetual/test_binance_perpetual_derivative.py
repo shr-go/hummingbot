@@ -3,7 +3,7 @@ import functools
 import json
 import re
 from dataclasses import FrozenInstanceError
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -471,6 +471,16 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(3, len(tracked_order.order_fills))
         self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
         self.assertEqual("0" if order_type is OrderType.MARKET else "10000.125", filled["o"]["p"])
+
+    def _submission_unknown_mutation_snapshot(self, tracked_order: InFlightOrder) -> tuple:
+        return (
+            tracked_order.current_state,
+            tracked_order.exchange_order_id,
+            tracked_order.executed_amount_base,
+            tracked_order.executed_amount_quote,
+            tuple(tracked_order.order_fills.items()),
+            self.exchange.is_order_submission_unknown(tracked_order.client_order_id),
+        )
 
     def _get_reconciliation_trade(
             self,
@@ -3350,6 +3360,208 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             observations,
         )
 
+    async def test_submission_unknown_stream_precision_requires_authoritative_positive_finite_rule(self):
+        self._simulate_trading_rules_initialized()
+        cases = (
+            ("missing", None),
+            ("zero", Decimal("0")),
+            ("NaN", Decimal("NaN")),
+            ("Infinity", Decimal("Infinity")),
+        )
+        observations = []
+
+        for index, (label, price_increment) in enumerate(cases, start=102):
+            if price_increment is None:
+                self.exchange._trading_rules = {}
+            else:
+                self.exchange._trading_rules = {
+                    self.trading_pair: TradingRule(
+                        trading_pair=self.trading_pair,
+                        min_price_increment=price_increment,
+                    )
+                }
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(client_order_id)
+            before = self._submission_unknown_mutation_snapshot(tracked_order)
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(
+                    self._submission_unknown_user_event(client_order_id=client_order_id)
+                )
+            except ValueError:
+                rejected = True
+            observations.append((
+                label,
+                rejected,
+                before == self._submission_unknown_mutation_snapshot(tracked_order),
+            ))
+
+        self.assertEqual([(label, True, True) for label, _ in cases], observations)
+
+    async def test_submission_unknown_stream_precision_rejects_coarse_average_encodings(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._trading_rules[self.trading_pair].min_price_increment = Decimal("0.01")
+        observations = []
+
+        for index, average_price in enumerate(("10000", "1E+4"), start=106):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(
+                client_order_id=client_order_id,
+                order_type=OrderType.MARKET,
+            )
+            event = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity="0.300",
+                cumulative_quantity="0.300",
+                trade_id=1,
+                fill_price="10000.01",
+                average_price=average_price,
+                order_type="MARKET",
+            )
+            before = self._submission_unknown_mutation_snapshot(tracked_order)
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except ValueError:
+                rejected = True
+            observations.append((
+                average_price,
+                rejected,
+                before == self._submission_unknown_mutation_snapshot(tracked_order),
+            ))
+
+        self.assertEqual(
+            [(average_price, True, True) for average_price in ("10000", "1E+4")],
+            observations,
+        )
+
+    async def test_submission_unknown_stream_precision_uses_authoritative_half_tick_boundary(self):
+        self._simulate_trading_rules_initialized()
+        cases = (
+            ("10000.1255", True),
+            ("10000.125500001", False),
+        )
+        observations = []
+
+        for index, (average_price, should_accept) in enumerate(cases, start=108):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(
+                client_order_id=client_order_id,
+                order_type=OrderType.MARKET,
+            )
+            event = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity="0.300",
+                cumulative_quantity="0.300",
+                trade_id=1,
+                fill_price="10000.125",
+                average_price=average_price,
+                order_type="MARKET",
+            )
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except ValueError:
+                rejected = True
+            observations.append((
+                average_price,
+                rejected,
+                tracked_order.current_state,
+                tracked_order.executed_amount_base,
+                tracked_order.executed_amount_quote,
+                len(tracked_order.order_fills),
+                self.exchange.is_order_submission_unknown(client_order_id),
+            ))
+
+        self.assertEqual(
+            [
+                (
+                    average_price,
+                    not should_accept,
+                    OrderState.PARTIALLY_FILLED if should_accept else OrderState.PENDING_CREATE,
+                    Decimal("0.300") if should_accept else Decimal("0"),
+                    Decimal("3000.037500") if should_accept else Decimal("0"),
+                    1 if should_accept else 0,
+                    not should_accept,
+                )
+                for average_price, should_accept in cases
+            ],
+            observations,
+        )
+
+    async def test_submission_unknown_stream_precision_computes_large_quote_exactly_under_low_context(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "exec-sndk-snxx-0110-stock-0"
+        tracked_order = self._track_submission_unknown_order(
+            client_order_id=client_order_id,
+            order_type=OrderType.MARKET,
+        )
+        fill_price = "10000000000000000000000000002"
+        exact_quote = "3000000000000000000000000000.600"
+        event = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="0.300",
+            cumulative_quantity="0.300",
+            trade_id=1,
+            fill_price=fill_price,
+            average_price=fill_price,
+            cumulative_quote=exact_quote,
+            order_type="MARKET",
+        )
+
+        with localcontext() as decimal_context:
+            decimal_context.prec = 6
+            await self.exchange._process_user_stream_event(event)
+            self.assertEqual(6, decimal_context.prec)
+
+        self.assertEqual(OrderState.PARTIALLY_FILLED, tracked_order.current_state)
+        self.assertEqual(Decimal("0.300"), tracked_order.executed_amount_base)
+        self.assertEqual(Decimal(exact_quote), tracked_order.executed_amount_quote)
+        self.assertEqual(Decimal(exact_quote), tracked_order.order_fills["1"].fill_quote_amount)
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_submission_unknown_stream_precision_rejects_sub_tick_misaligned_and_unsupported_prices(self):
+        self._simulate_trading_rules_initialized()
+        unsupported_price = "1" + "0" * 128
+        cases = (
+            ("sub tick", "1E-999999"),
+            ("misaligned", "10000.1255"),
+            ("unsupported width", unsupported_price),
+        )
+        observations = []
+
+        for index, (label, execution_price) in enumerate(cases, start=111):
+            client_order_id = f"exec-sndk-snxx-{index:04d}-stock-0"
+            tracked_order = self._track_submission_unknown_order(
+                client_order_id=client_order_id,
+                order_type=OrderType.MARKET,
+            )
+            event = self._submission_unknown_fill_event(
+                client_order_id=client_order_id,
+                status="PARTIALLY_FILLED",
+                last_fill_quantity="0.300",
+                cumulative_quantity="0.300",
+                trade_id=1,
+                order_type="MARKET",
+            )
+            event["o"].update({"ap": execution_price, "L": execution_price})
+            before = self._submission_unknown_mutation_snapshot(tracked_order)
+            rejected = False
+            try:
+                await self.exchange._process_user_stream_event(event)
+            except ValueError:
+                rejected = True
+            observations.append((
+                label,
+                rejected,
+                before == self._submission_unknown_mutation_snapshot(tracked_order),
+            ))
+
+        self.assertEqual([(label, True, True) for label, _ in cases], observations)
+
     async def test_submission_unknown_restore_pending_without_exchange_id_is_conservative(self):
         client_order_id = "exec-sndk-snxx-0023-stock-0"
         restored_order = InFlightOrder(
@@ -3697,14 +3909,19 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
 
     def _simulate_trading_rules_initialized(self):
         margin_asset = self.quote_asset
-        mocked_response = self._get_exchange_info_mock_response(margin_asset)
+        mocked_response = self._get_exchange_info_mock_response(
+            margin_asset,
+            min_order_size=0.001,
+            min_price_increment=0.001,
+            min_base_amount_increment=0.001,
+        )
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(mocked_response)
         self.exchange._trading_rules = {
             self.trading_pair: TradingRule(
                 trading_pair=self.trading_pair,
-                min_order_size=Decimal(str(1)),
-                min_price_increment=Decimal(str(2)),
-                min_base_amount_increment=Decimal(str(3)),
+                min_order_size=Decimal("0.001"),
+                min_price_increment=Decimal("0.001"),
+                min_base_amount_increment=Decimal("0.001"),
                 min_notional_size=Decimal(str(4)),
             )
         }
