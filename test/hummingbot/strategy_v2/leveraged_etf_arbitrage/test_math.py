@@ -2,7 +2,7 @@ import copy
 import hashlib
 import json
 import pickle
-from dataclasses import FrozenInstanceError, asdict, dataclass, fields, is_dataclass
+from dataclasses import FrozenInstanceError, asdict, dataclass, fields, is_dataclass, replace
 from decimal import (
     ROUND_DOWN,
     ROUND_HALF_EVEN,
@@ -17,7 +17,7 @@ from enum import Enum
 from fractions import Fraction
 
 import pytest
-from pydantic import create_model
+from pydantic import ValidationError, create_model
 
 from hummingbot.strategy_v2.leveraged_etf_arbitrage import decimal_policy
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
@@ -26,6 +26,10 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import (
     DepthLevel,
     EntryConfirmationState,
     InsufficientDepthError,
+    LegNotionals,
+    LegQuantities,
+    Opportunity,
+    RoundTripCosts,
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.math import (
     advance_entry_confirmation,
@@ -1010,6 +1014,216 @@ def test_raw_exact_decision_contract_preserves_explicit_legal_inputs():
     )
     assert select_entry_target(raw_net_bp(D("22.29")), tiers) == D("3")
     assert select_reduce_target(raw_net_bp(D("17")), D("3"), tiers, reductions) == D("3")
+
+
+def test_observed_etf_price_role_rejects_derived_values_even_with_valid_semantics():
+    derived_observation = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    theoretical = calculate_theoretical_etf_price(D("3"), D("3"), D("1"), D("1"))
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+
+    assert derived_observation.exact_fraction == Fraction(5, 3)
+    assert theoretical.exact_fraction == Fraction(1)
+    assert determine_arbitrage_direction(derived_observation, theoretical) is None
+    assert determine_arbitrage_direction(opportunity.net_bp, theoretical) is None
+    assert determine_arbitrage_direction(raw_net_bp(derived_observation.display), theoretical) is None
+    assert (
+        determine_arbitrage_direction(raw_etf_price(derived_observation.display), theoretical)
+        is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+    )
+
+
+def test_derived_threshold_roles_require_opportunity_net_bp_semantics():
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    theoretical_threshold = calculate_theoretical_etf_price(D("1"), D("1"), D("0.5"), D("1"))
+    tiers = {D("0"): D("1"), theoretical_threshold: D("3")}
+    reductions = {D("1"): D("0"), D("3"): theoretical_threshold}
+
+    assert theoretical_threshold == D("0.5")
+    assert opportunity.net_bp > theoretical_threshold
+    assert select_entry_target(opportunity.net_bp, tiers) == D("0")
+    assert select_reduce_target(opportunity.net_bp, D("3"), tiers, reductions) == D("1")
+
+
+@pytest.mark.parametrize(
+    "mutation_name",
+    [
+        "direction",
+        "hedge_ratio",
+        "theoretical_etf_price",
+        "quantities",
+        "notionals",
+        "gross_profit_quote",
+        "raw_and_cost_ledger",
+        "cost_ledger",
+        "net_bp",
+    ],
+)
+def test_opportunity_rejects_every_locally_valid_inconsistent_component(mutation_name: str):
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    alternate_price = _zero_cost_boundary_opportunity(D("60.02"))
+    alternate_costs = calculate_opportunity(
+        stock_anchor=D("100"),
+        etf_anchor=D("50"),
+        etf_daily_multiplier=D("2"),
+        stock_entry_price=D("110"),
+        etf_entry_price=D("60.01"),
+        etf_quantity=D("1"),
+        stock_contract_multiplier=D("1"),
+        etf_contract_multiplier=D("1"),
+        maker_fee_bp=D("1"),
+        taker_fee_bp=D("2"),
+        maker_slippage_bp_per_fill=D("3"),
+    )
+    mutations = {
+        "direction": {"direction": ArbitrageDirection.LONG_ETF_SHORT_STOCK},
+        "hedge_ratio": {"hedge_ratio": D("2")},
+        "theoretical_etf_price": {
+            "theoretical_etf_price": calculate_theoretical_etf_price(
+                D("100"), D("100"), D("50"), D("2")
+            )
+        },
+        "quantities": {
+            "quantities": LegQuantities(etf_quantity=D("-2"), stock_quantity=D("2"))
+        },
+        "notionals": {
+            "notionals": LegNotionals(etf=D("1"), stock=D("169.01"), gross=D("170.01"))
+        },
+        "gross_profit_quote": {"gross_profit_quote": D("1")},
+        "raw_and_cost_ledger": {
+            "raw_bp": opportunity.net_bp.display + D("1"),
+            "costs": RoundTripCosts(
+                etf_entry_maker_fee_quote=D("0"),
+                etf_exit_maker_fee_quote=D("0"),
+                stock_entry_taker_fee_quote=D("0"),
+                stock_exit_taker_fee_quote=D("0"),
+                etf_entry_slippage_budget_quote=D("0"),
+                etf_exit_slippage_budget_quote=D("0"),
+                total_quote=D("0"),
+                total_bp=D("1"),
+            ),
+        },
+        "cost_ledger": {
+            "raw_bp": opportunity.net_bp.display + alternate_costs.costs.total_bp,
+            "costs": alternate_costs.costs,
+        },
+        "net_bp": {
+            "raw_bp": alternate_price.net_bp.display,
+            "net_bp": alternate_price.net_bp,
+        },
+    }
+
+    with pytest.raises(ValueError, match="opportunity|direction|hedge|theoretical|quantit|notional|profit|bp|cost"):
+        replace(opportunity, **mutations[mutation_name])
+
+
+def test_opportunity_composite_round_trips_only_when_every_component_is_consistent():
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    envelope = create_model("VerifiedOpportunityEnvelope", opportunity=(Opportunity, ...))
+    direct_fields = {field.name: getattr(opportunity, field.name) for field in fields(opportunity)}
+    restored_values = (
+        Opportunity(**direct_fields),
+        envelope.model_validate_json(envelope(opportunity=opportunity).model_dump_json()).opportunity,
+        pickle.loads(pickle.dumps(opportunity)),
+        copy.copy(opportunity),
+        copy.deepcopy(opportunity),
+    )
+    tiers = {D("0"): D("1"), opportunity.net_bp.display: D("3")}
+    reductions = {D("1"): D("0"), D("3"): opportunity.net_bp.display}
+
+    for restored in restored_values:
+        restored.validate_integrity()
+        assert restored == opportunity
+        assert (
+            determine_arbitrage_direction(raw_etf_price(D("60.01")), restored.theoretical_etf_price)
+            is ArbitrageDirection.SHORT_ETF_LONG_STOCK
+        )
+        assert select_entry_target(restored.net_bp, tiers) == D("1")
+        assert select_reduce_target(restored.net_bp, D("3"), tiers, reductions) == D("1")
+
+    direction_mutated = copy.deepcopy(opportunity)
+    object.__setattr__(direction_mutated, "direction", ArbitrageDirection.LONG_ETF_SHORT_STOCK)
+    quantity_mutated = pickle.loads(pickle.dumps(opportunity))
+    object.__setattr__(quantity_mutated.quantities, "stock_quantity", D("2"))
+    for mutated in (direction_mutated, quantity_mutated):
+        with pytest.raises(ValueError, match="opportunity|direction|quantit"):
+            mutated.validate_integrity()
+
+
+@pytest.mark.parametrize("mutation_name", ["direction", "theoretical", "net_bp"])
+def test_pydantic_json_rejects_valid_local_components_in_an_inconsistent_opportunity(
+    mutation_name: str,
+):
+    opportunity = _zero_cost_boundary_opportunity(D("60.01"))
+    alternate = _zero_cost_boundary_opportunity(D("60.02"))
+    envelope = create_model("MutatedOpportunityEnvelope", opportunity=(Opportunity, ...))
+    payload = json.loads(envelope(opportunity=opportunity).model_dump_json())
+    if mutation_name == "direction":
+        payload["opportunity"]["direction"] = ArbitrageDirection.LONG_ETF_SHORT_STOCK.value
+    elif mutation_name == "theoretical":
+        payload["opportunity"]["theoretical_etf_price"] = calculate_theoretical_etf_price(
+            D("100"), D("100"), D("50"), D("2")
+        ).to_fields()
+    else:
+        payload["opportunity"]["raw_bp"] = str(alternate.net_bp.display)
+        payload["opportunity"]["net_bp"] = alternate.net_bp.to_fields()
+
+    with pytest.raises(ValidationError, match="opportunity|direction|theoretical|net|bp"):
+        envelope.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("schema_version", [1.0, D("1"), True, "1"])
+def test_raw_exact_decision_requires_a_builtin_int_schema_version_everywhere(schema_version):
+    raw_type = getattr(decimal_policy, "RawExactDecision")
+    raw_kind = getattr(decimal_policy, "RawDecisionKind")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    pydantic_model = create_model("StrictRawSchemaEnvelope", decision=(raw_type, ...))
+
+    with pytest.raises(integrity_error, match="schema version"):
+        raw_type(schema_version=schema_version, kind=raw_kind.ETF_PRICE, value=D("1"))
+    with pytest.raises(integrity_error, match="schema version"):
+        raw_type.from_fields(
+            {"schema_version": schema_version, "kind": "ETF_PRICE", "value": "1"}
+        )
+    with pytest.raises(ValidationError, match="schema_version"):
+        pydantic_model.model_validate(
+            {
+                "decision": {
+                    "schema_version": schema_version,
+                    "kind": "ETF_PRICE",
+                    "value": "1",
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize("schema_version", [2.0, D("2"), True, "2"])
+def test_decision_value_requires_a_builtin_int_schema_version_everywhere(schema_version):
+    decision_type = getattr(decimal_policy, "DecisionValue")
+    integrity_error = getattr(decimal_policy, "DecisionValueIntegrityError")
+    decision = calculate_theoretical_etf_price(D("4"), D("3"), D("1"), D("2"))
+    direct_fields = {field.name: getattr(decision, field.name) for field in fields(decision)}
+    direct_fields["schema_version"] = schema_version
+    if isinstance(schema_version, float):
+        serialized = decision.to_fields()
+        serialized["schema_version"] = schema_version
+        rehash_decision_fields(serialized)
+        direct_fields["integrity_hash"] = serialized["integrity_hash"]
+
+    with pytest.raises(integrity_error, match="schema version"):
+        decision_type(**direct_fields)
+
+    serialized = decision.to_fields()
+    serialized["schema_version"] = schema_version
+    if isinstance(schema_version, float):
+        rehash_decision_fields(serialized)
+    with pytest.raises(integrity_error, match="schema version"):
+        decision_type.from_fields(serialized)
+
+    pydantic_model = create_model("StrictDecisionSchemaEnvelope", decision=(decision_type, ...))
+    pydantic_fields = asdict(decision)
+    pydantic_fields["schema_version"] = schema_version
+    with pytest.raises(ValidationError, match="schema_version"):
+        pydantic_model.model_validate({"decision": pydantic_fields})
 
 
 @pytest.mark.parametrize(
