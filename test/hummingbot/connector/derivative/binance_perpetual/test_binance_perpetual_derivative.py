@@ -3197,6 +3197,41 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             order_type=OrderType.MARKET,
         )
 
+    async def test_submission_unknown_stream_native_accepts_rounded_average_with_optional_quote(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "exec-sndk-snxx-0101-stock-0"
+        tracked_order = self._track_submission_unknown_order(client_order_id)
+        first_partial = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="0.100",
+            cumulative_quantity="0.100",
+            trade_id=1,
+            fill_price="10000.125",
+            average_price="10000.125",
+            cumulative_quote="1000.012500",
+        )
+        await self.exchange._process_user_stream_event(first_partial)
+        self.exchange._unknown_submission_order_ids.add(client_order_id)
+        rounded_partial = self._submission_unknown_fill_event(
+            client_order_id=client_order_id,
+            status="PARTIALLY_FILLED",
+            last_fill_quantity="0.200",
+            cumulative_quantity="0.300",
+            trade_id=2,
+            fill_price="10000.126",
+            average_price="10000.12566667",
+            cumulative_quote="3000.037700",
+        )
+
+        await self.exchange._process_user_stream_event(rounded_partial)
+
+        self.assertEqual(OrderState.PARTIALLY_FILLED, tracked_order.current_state)
+        self.assertEqual(Decimal("0.300"), tracked_order.executed_amount_base)
+        self.assertEqual(Decimal("3000.037700"), tracked_order.executed_amount_quote)
+        self.assertEqual(2, len(tracked_order.order_fills))
+        self.assertFalse(self.exchange.is_order_submission_unknown(client_order_id))
+
     async def test_submission_unknown_stream_native_accepts_terminal_after_fill_without_cumulative_quote(self):
         self._simulate_trading_rules_initialized()
         cases = (
