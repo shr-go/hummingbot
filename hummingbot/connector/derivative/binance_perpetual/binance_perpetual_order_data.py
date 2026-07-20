@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from inspect import getattr_static
 from typing import Any, Mapping, Optional
 
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -64,7 +63,23 @@ _SUBMISSION_CODE_FIELDS = ("code",)
 _SUBMISSION_STATUS_FIELDS = ("status", "status_code", "http_status", "statusCode", "httpStatus")
 _SUBMISSION_MESSAGE_FIELDS = ("msg", "message", "error_message", "errorMessage")
 _SUBMISSION_FAILURE_CANDIDATE_LIMIT = 3
+_SUBMISSION_CARRIER_MRO_LIMIT = 16
 _MISSING_SUBMISSION_FACT = object()
+_TRUSTED_SUBMISSION_LEAF_TYPES = (str, bytes, bytearray, int, float, bool, list, tuple)
+_OBJECT_GETATTRIBUTE = object.__dict__["__getattribute__"]
+_BASE_EXCEPTION_GETATTRIBUTE = BaseException.__dict__["__getattribute__"]
+
+
+class _SubmissionFieldEvidenceKind(Enum):
+    VALUE = "VALUE"
+    ABSENT_PROVEN = "ABSENT_PROVEN"
+    INDETERMINATE = "INDETERMINATE"
+
+
+@dataclass(frozen=True)
+class _SubmissionFieldEvidence:
+    kind: _SubmissionFieldEvidenceKind
+    value: Any = None
 
 
 @dataclass(frozen=True)
@@ -76,42 +91,87 @@ class _BinanceSubmissionFailureFacts:
     malformed_code: bool
     malformed_status: bool
     malformed_message: bool
-    incomplete_response_chain: bool
+    incomplete_evidence: bool
 
 
-def _submission_fact(candidate: Any, field: str) -> Any:
-    if isinstance(candidate, Mapping):
-        return candidate.get(field, _MISSING_SUBMISSION_FACT)
+def _submission_attribute_absence_is_proven(candidate: Any, field: str) -> bool:
+    candidate_type = type(candidate)
+    if any(candidate_type is trusted_type for trusted_type in _TRUSTED_SUBMISSION_LEAF_TYPES):
+        return True
     try:
-        return getattr(candidate, field, _MISSING_SUBMISSION_FACT)
-    except Exception:
-        return _MISSING_SUBMISSION_FACT
+        mro = type.__getattribute__(candidate_type, "__mro__")
+    except BaseException:
+        return False
+    if type(mro) is not tuple or not 1 <= len(mro) <= _SUBMISSION_CARRIER_MRO_LIMIT:
+        return False
 
-
-def _submission_response(candidate: Any) -> tuple[Any, bool]:
+    effective_getattribute = None
+    effective_getattribute_owner = None
     try:
-        if isinstance(candidate, Mapping):
-            return candidate.get("response", _MISSING_SUBMISSION_FACT), False
-        response = getattr(candidate, "response", _MISSING_SUBMISSION_FACT)
-        if (
-            response is _MISSING_SUBMISSION_FACT
-            and getattr_static(candidate, "response", _MISSING_SUBMISSION_FACT)
-            is not _MISSING_SUBMISSION_FACT
-        ):
-            return _MISSING_SUBMISSION_FACT, True
-        return response, False
-    except Exception:
-        return _MISSING_SUBMISSION_FACT, True
+        for base in mro:
+            namespace = type.__getattribute__(base, "__dict__")
+            if field in namespace or "__getattr__" in namespace:
+                return False
+            if effective_getattribute is None and "__getattribute__" in namespace:
+                effective_getattribute = namespace["__getattribute__"]
+                effective_getattribute_owner = base
+    except BaseException:
+        return False
+    return (
+        effective_getattribute_owner is object
+        and effective_getattribute is _OBJECT_GETATTRIBUTE
+    ) or (
+        effective_getattribute_owner is BaseException
+        and effective_getattribute is _BASE_EXCEPTION_GETATTRIBUTE
+    )
+
+
+def _submission_field(candidate: Any, field: str) -> _SubmissionFieldEvidence:
+    candidate_type = type(candidate)
+    if candidate_type is dict:
+        value = dict.get(candidate, field, _MISSING_SUBMISSION_FACT)
+        if value is _MISSING_SUBMISSION_FACT:
+            return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.ABSENT_PROVEN)
+        return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.VALUE, value)
+
+    try:
+        is_mapping = isinstance(candidate, Mapping)
+    except BaseException:
+        return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.INDETERMINATE)
+    if is_mapping:
+        try:
+            value = candidate.get(field, _MISSING_SUBMISSION_FACT)
+        except BaseException:
+            return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.INDETERMINATE)
+        if value is _MISSING_SUBMISSION_FACT:
+            return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.INDETERMINATE)
+        return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.VALUE, value)
+
+    try:
+        value = getattr(candidate, field)
+    except AttributeError:
+        kind = (
+            _SubmissionFieldEvidenceKind.ABSENT_PROVEN
+            if _submission_attribute_absence_is_proven(candidate, field)
+            else _SubmissionFieldEvidenceKind.INDETERMINATE
+        )
+        return _SubmissionFieldEvidence(kind)
+    except BaseException:
+        return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.INDETERMINATE)
+    return _SubmissionFieldEvidence(_SubmissionFieldEvidenceKind.VALUE, value)
 
 
 def _submission_failure_candidates(failure: Any) -> tuple[tuple[Any, ...], bool]:
     candidates = [failure]
     index = 0
     while index < len(candidates):
-        response, access_failed = _submission_response(candidates[index])
-        if access_failed:
+        response_evidence = _submission_field(candidates[index], "response")
+        if response_evidence.kind is _SubmissionFieldEvidenceKind.INDETERMINATE:
             return tuple(candidates), True
-        if response is _MISSING_SUBMISSION_FACT or response is None:
+        if response_evidence.kind is _SubmissionFieldEvidenceKind.ABSENT_PROVEN:
+            return tuple(candidates), False
+        response = response_evidence.value
+        if response is None:
             return tuple(candidates), False
         if any(response is candidate for candidate in candidates):
             return tuple(candidates), True
@@ -140,7 +200,7 @@ def _submission_integer(value: Any, *, status: bool) -> Optional[int]:
 
 
 def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
-    candidates, incomplete_response_chain = _submission_failure_candidates(failure)
+    candidates, incomplete_evidence = _submission_failure_candidates(failure)
     codes = set()
     statuses = set()
     messages = []
@@ -151,24 +211,36 @@ def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
 
     for candidate in candidates:
         for field in _SUBMISSION_CODE_FIELDS:
-            raw_code = _submission_fact(candidate, field)
-            if raw_code is not _MISSING_SUBMISSION_FACT:
-                code = _submission_integer(raw_code, status=False)
+            evidence = _submission_field(candidate, field)
+            incomplete_evidence = (
+                incomplete_evidence
+                or evidence.kind is _SubmissionFieldEvidenceKind.INDETERMINATE
+            )
+            if evidence.kind is _SubmissionFieldEvidenceKind.VALUE:
+                code = _submission_integer(evidence.value, status=False)
                 malformed_code = malformed_code or code is None
                 if code is not None:
                     codes.add(code)
         for field in _SUBMISSION_STATUS_FIELDS:
-            raw_status = _submission_fact(candidate, field)
-            if raw_status is not _MISSING_SUBMISSION_FACT:
-                status = _submission_integer(raw_status, status=True)
+            evidence = _submission_field(candidate, field)
+            incomplete_evidence = (
+                incomplete_evidence
+                or evidence.kind is _SubmissionFieldEvidenceKind.INDETERMINATE
+            )
+            if evidence.kind is _SubmissionFieldEvidenceKind.VALUE:
+                status = _submission_integer(evidence.value, status=True)
                 malformed_status = malformed_status or status is None
                 if status is not None:
                     statuses.add(status)
         for field in _SUBMISSION_MESSAGE_FIELDS:
-            raw_message = _submission_fact(candidate, field)
-            if raw_message is not _MISSING_SUBMISSION_FACT:
-                if isinstance(raw_message, str) and raw_message != "":
-                    messages.append(raw_message)
+            evidence = _submission_field(candidate, field)
+            incomplete_evidence = (
+                incomplete_evidence
+                or evidence.kind is _SubmissionFieldEvidenceKind.INDETERMINATE
+            )
+            if evidence.kind is _SubmissionFieldEvidenceKind.VALUE:
+                if isinstance(evidence.value, str) and evidence.value != "":
+                    messages.append(evidence.value)
                 else:
                     malformed_message = True
 
@@ -190,7 +262,7 @@ def _submission_failure_facts(failure: Any) -> _BinanceSubmissionFailureFacts:
         malformed_code=malformed_code,
         malformed_status=malformed_status,
         malformed_message=malformed_message,
-        incomplete_response_chain=incomplete_response_chain,
+        incomplete_evidence=incomplete_evidence,
     )
 
 
@@ -223,7 +295,7 @@ def classify_binance_order_submission_failure(
         facts.malformed_code
         or facts.malformed_status
         or facts.malformed_message
-        or facts.incomplete_response_chain
+        or facts.incomplete_evidence
         or len(facts.codes) > 1
         or len(facts.statuses) > 1
     ):
