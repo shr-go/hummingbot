@@ -129,6 +129,7 @@ class SQLConnectionManager(TransactionBase):
     def check_and_migrate_db(self, client_config_map: "ClientConfigAdapter"):
         from hummingbot.model.db_migration.migrator import Migrator
         from hummingbot.model.leveraged_etf_persistence import (
+            ensure_leveraged_etf_order_ownership_guards,
             ensure_leveraged_etf_persistence_schema,
             validate_leveraged_etf_persistence_schema,
         )
@@ -177,7 +178,8 @@ class SQLConnectionManager(TransactionBase):
 
         if current_version == target_version:
             try:
-                with self._engine.connect() as connection:
+                with self._engine.begin() as connection:
+                    ensure_leveraged_etf_order_ownership_guards(connection)
                     validate_leveraged_etf_persistence_schema(connection)
             except Exception as exception:
                 self._engine.dispose()

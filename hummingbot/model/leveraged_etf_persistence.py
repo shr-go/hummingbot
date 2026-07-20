@@ -329,6 +329,46 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
             SELECT RAISE(ABORT, 'LeveragedEtfJournalEvent identity already exists');
         END
     """,
+    "lepf_journal_client_order_owner_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_journal_client_order_owner_insert
+        BEFORE INSERT ON LeveragedEtfJournalEvent
+        FOR EACH ROW
+        WHEN NEW.connector_name IS NOT NULL
+         AND NEW.client_order_id IS NOT NULL
+         AND EXISTS (
+            SELECT 1 FROM LeveragedEtfJournalEvent
+            WHERE connector_name = NEW.connector_name
+              AND client_order_id = NEW.client_order_id
+              AND (
+                    executor_id <> NEW.executor_id
+                    OR intent_id IS NOT NEW.intent_id
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfJournalEvent client order has a different owner');
+        END
+    """,
+    "lepf_journal_exchange_order_owner_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_journal_exchange_order_owner_insert
+        BEFORE INSERT ON LeveragedEtfJournalEvent
+        FOR EACH ROW
+        WHEN NEW.connector_name IS NOT NULL
+         AND NEW.trading_pair IS NOT NULL
+         AND NEW.exchange_order_id IS NOT NULL
+         AND EXISTS (
+            SELECT 1 FROM LeveragedEtfJournalEvent
+            WHERE connector_name = NEW.connector_name
+              AND trading_pair = NEW.trading_pair
+              AND exchange_order_id = NEW.exchange_order_id
+              AND (
+                    executor_id <> NEW.executor_id
+                    OR intent_id IS NOT NEW.intent_id
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfJournalEvent exchange order has a different owner');
+        END
+    """,
     "lepf_reservation_executor_fk_insert": """
         CREATE TRIGGER IF NOT EXISTS lepf_reservation_executor_fk_insert
         BEFORE INSERT ON LeveragedEtfStrategyReservation
@@ -485,6 +525,11 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         END
     """,
 }
+
+JOURNAL_ORDER_OWNERSHIP_GUARDS = (
+    "lepf_journal_client_order_owner_insert",
+    "lepf_journal_exchange_order_owner_insert",
+)
 
 
 for table in LEVERAGED_ETF_PERSISTENCE_TABLES:
@@ -1361,6 +1406,26 @@ def validate_leveraged_etf_persistence_schema(connection: Connection) -> None:
 
     if errors:
         raise RuntimeError("incompatible leveraged ETF persistence schema: " + "; ".join(errors))
+
+
+def ensure_leveraged_etf_order_ownership_guards(connection: Connection) -> None:
+    """Add only the post-v1 ownership guards; exact validation still rejects drift."""
+
+    if connection.dialect.name != "sqlite":
+        raise RuntimeError("leveraged ETF persistence supports SQLite only")
+    existing = {
+        row[0]
+        for row in connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (:client, :exchange)"),
+            {
+                "client": JOURNAL_ORDER_OWNERSHIP_GUARDS[0],
+                "exchange": JOURNAL_ORDER_OWNERSHIP_GUARDS[1],
+            },
+        )
+    }
+    for name in JOURNAL_ORDER_OWNERSHIP_GUARDS:
+        if name not in existing:
+            connection.execute(text(SQLITE_GUARD_DDL[name]))
 
 
 def ensure_leveraged_etf_persistence_schema(connection: Connection) -> None:
