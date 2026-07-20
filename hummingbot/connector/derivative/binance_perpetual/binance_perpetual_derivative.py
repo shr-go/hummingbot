@@ -1695,6 +1695,12 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             if not isinstance(order_result, Mapping):
                 raise BinancePerpetualOrderDataError("order submission response must be an object")
             if "code" in order_result:
+                failure_kind = classify_binance_order_submission_failure(order_result)
+                if (
+                    failure_kind
+                    is BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
+                ):
+                    raise BinancePerpetualOrderSubmissionUnknown(order_id)
                 raise BinancePerpetualOrderSubmissionRejected()
             o_id = self._validated_non_negative_integer_string(
                 order_result.get("orderId"),

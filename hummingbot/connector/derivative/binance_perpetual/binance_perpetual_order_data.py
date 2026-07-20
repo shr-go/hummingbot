@@ -44,17 +44,70 @@ _HTTP_STATUS_PATTERN = re.compile(
     r"\b(?:HTTP\s+)?status(?:\s+code)?(?:\s+is|\s*[:=])?\s*(?P<status>[1-5][0-9]{2})\b",
     re.IGNORECASE,
 )
+_BINANCE_ERROR_CODE_PATTERN = re.compile(
+    r"(?:\bBinance\s+code\b|[\"']?code[\"']?\s*[:=])\s*(?P<code>-[0-9]+)\b",
+    re.IGNORECASE,
+)
+_BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN = re.compile(
+    r"\b(?:execution|send)\s+status\s+(?:is\s+)?unknown\b",
+    re.IGNORECASE,
+)
+_BINANCE_AMBIGUOUS_SUBMISSION_CODES = {-1007, -1006}
+
+
+def _binance_error_code(failure: Any) -> Optional[int]:
+    candidates = (failure, getattr(failure, "response", None))
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            raw_code = candidate.get("code")
+        else:
+            raw_code = getattr(candidate, "code", None)
+        if isinstance(raw_code, bool):
+            continue
+        if isinstance(raw_code, int):
+            return raw_code
+        if (
+            isinstance(raw_code, str)
+            and raw_code.isascii()
+            and raw_code.startswith("-")
+            and raw_code[1:].isdigit()
+        ):
+            return int(raw_code)
+
+    match = _BINANCE_ERROR_CODE_PATTERN.search(str(failure))
+    return int(match.group("code")) if match is not None else None
+
+
+def _has_explicit_unknown_execution_status(failure: Any) -> bool:
+    texts = [str(failure)]
+    candidates = (failure, getattr(failure, "response", None))
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            message = candidate.get("msg")
+            if isinstance(message, str):
+                texts.append(message)
+    return any(_BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN.search(text) is not None for text in texts)
 
 
 def classify_binance_order_submission_failure(
-        exception: BaseException,
+        failure: Any,
 ) -> BinancePerpetualOrderSubmissionFailureKind:
-    """Classifies only authoritative HTTP rejection responses as a definitive submission failure."""
-    if isinstance(exception, BinancePerpetualOrderSubmissionRejected):
+    """Classifies structured unknown-execution responses before HTTP transport fallbacks."""
+    if isinstance(failure, BinancePerpetualOrderSubmissionRejected):
         return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+    if isinstance(failure, BinancePerpetualOrderSubmissionUnknown):
+        return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
+
+    error_code = _binance_error_code(failure)
+    if error_code in _BINANCE_AMBIGUOUS_SUBMISSION_CODES:
+        return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
+    if error_code is not None:
+        return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+    if _has_explicit_unknown_execution_status(failure):
+        return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
 
     status = None
-    candidates = [exception, getattr(exception, "response", None)]
+    candidates = [failure, getattr(failure, "response", None)]
     for candidate in candidates:
         if candidate is None:
             continue
@@ -71,7 +124,7 @@ def classify_binance_order_submission_failure(
         if status is not None:
             break
     if status is None:
-        match = _HTTP_STATUS_PATTERN.search(str(exception))
+        match = _HTTP_STATUS_PATTERN.search(str(failure))
         if match is not None:
             status = int(match.group("status"))
 
