@@ -2,6 +2,7 @@ import asyncio
 import functools
 import json
 import re
+from dataclasses import FrozenInstanceError
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Any, Callable, Dict, List, Optional
@@ -272,6 +273,85 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             "lastFundingRate": 1010
         }
         return funding_info
+
+    def _get_reconciliation_order(
+            self,
+            client_order_id: str = "exec-sndk-snxx-0001-stock-0",
+            exchange_order_id: int = 8886774,
+            status: str = "PARTIALLY_FILLED",
+            executed_quantity: str = "0.125",
+    ) -> Dict[str, Any]:
+        execution_price = Decimal("10000.125")
+        executed = Decimal(executed_quantity)
+        return {
+            "avgPrice": "0" if executed == 0 else f"{execution_price:f}",
+            "clientOrderId": client_order_id,
+            "cumQuote": f"{execution_price * executed:f}",
+            "executedQty": executed_quantity,
+            "orderId": exchange_order_id,
+            "origQty": "1.250",
+            "origType": "LIMIT",
+            "price": "10000.125",
+            "reduceOnly": False,
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "status": status,
+            "closePosition": False,
+            "symbol": self.symbol,
+            "time": 1700000000000,
+            "timeInForce": "GTC",
+            "type": "LIMIT",
+            "updateTime": 1700000000123,
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": False,
+        }
+
+    def _get_reconciliation_trade(
+            self,
+            trade_id: int = 698759,
+            exchange_order_id: int = 8886774,
+            price: str = "10000.125",
+    ) -> Dict[str, Any]:
+        return {
+            "buyer": False,
+            "commission": "0.00001234",
+            "commissionAsset": self.quote_asset,
+            "id": trade_id,
+            "maker": False,
+            "orderId": exchange_order_id,
+            "price": price,
+            "qty": "0.125",
+            "quoteQty": "1250.015625",
+            "realizedPnl": "-0.00000001",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "symbol": self.symbol,
+            "time": 1700000000456,
+        }
+
+    def _get_reconciliation_position(self, position_amount: str = "-0.125") -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "positionSide": "BOTH",
+            "positionAmt": position_amount,
+            "entryPrice": "10000.125",
+            "breakEvenPrice": "10000.12509872",
+            "markPrice": "10001.25",
+            "unRealizedProfit": "-0.140625",
+            "liquidationPrice": "12000.5",
+            "isolatedMargin": "0",
+            "notional": "-1250.15625",
+            "marginAsset": self.quote_asset,
+            "isolatedWallet": "0",
+            "initialMargin": "62.5078125",
+            "maintMargin": "5.000625",
+            "positionInitialMargin": "62.5078125",
+            "openOrderInitialMargin": "0",
+            "adl": 1,
+            "bidNotional": "0",
+            "askNotional": "0",
+            "updateTime": 1700000000789,
+        }
 
     def _get_trading_pair_symbol_map(self) -> Dict[str, str]:
         trading_pair_symbol_map = {self.symbol: f"{self.base_asset}-{self.quote_asset}"}
@@ -1779,15 +1859,18 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         mock_api.post(regex_url, body=json.dumps(mock_response), status=503)
         self._simulate_trading_rules_initialized()
 
-        o_id, timestamp = await self.exchange._place_order(
-            trade_type=TradeType.BUY,
-            order_id="OID1",
-            trading_pair=self.trading_pair,
-            amount=Decimal("10000"),
-            order_type=OrderType.LIMIT,
-            position_action=PositionAction.OPEN,
-            price=Decimal("10000"))
-        self.assertEqual(o_id, "UNKNOWN")
+        with self.assertRaisesRegex(
+            IOError,
+            "submission outcome is unknown for client order ID OID1",
+        ):
+            await self.exchange._place_order(
+                trade_type=TradeType.BUY,
+                order_id="OID1",
+                trading_pair=self.trading_pair,
+                amount=Decimal("10000"),
+                order_type=OrderType.LIMIT,
+                position_action=PositionAction.OPEN,
+                price=Decimal("10000"))
 
     @aioresponses()
     async def test_create_limit_maker_successful(self, req_mock):
@@ -1951,6 +2034,369 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("OID2", self.exchange.in_flight_orders)
         self.assertNotIn("OID3", self.exchange.in_flight_orders)
         self.assertNotIn("OID4", self.exchange.in_flight_orders)
+
+    async def test_caller_id_reaches_native_order_tracker_created_event_and_signed_order_request(self):
+        client_order_id = "exec-sndk-snxx-0005-maker-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(return_value={
+            "updateTime": 1700000000000,
+            "status": "NEW",
+            "orderId": 8886774,
+        })
+        created_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.BuyOrderCreated, created_logger)
+
+        await self.exchange._create_order(
+            trade_type=TradeType.BUY,
+            order_id=client_order_id,
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.LIMIT_MAKER,
+            position_action=PositionAction.OPEN,
+            price=Decimal("10000"),
+        )
+        await asyncio.sleep(0.001)
+
+        tracked_order = self.exchange.in_flight_orders[client_order_id]
+        self.assertEqual(client_order_id, tracked_order.client_order_id)
+        self.assertEqual("8886774", tracked_order.exchange_order_id)
+        self.assertEqual(OrderState.OPEN, tracked_order.current_state)
+        self.assertEqual(1, len(created_logger.event_log))
+        self.assertEqual(client_order_id, created_logger.event_log[0].order_id)
+        request = self.exchange._api_post.await_args.kwargs
+        self.assertEqual(CONSTANTS.ORDER_URL, request["path_url"])
+        self.assertTrue(request["is_auth_required"])
+        self.assertEqual(client_order_id, request["data"]["newClientOrderId"])
+        self.assertEqual("GTX", request["data"]["timeInForce"])
+
+    async def test_preallocated_market_close_preserves_native_market_and_reduce_only_payload(self):
+        client_order_id = "exec-sndk-snxx-0005-stock-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._position_mode = PositionMode.ONEWAY
+        self.exchange._api_post = AsyncMock(return_value={
+            "updateTime": 1700000000000,
+            "status": "NEW",
+            "orderId": 8886775,
+        })
+
+        exchange_order_id, update_timestamp = await self.exchange._place_order(
+            trade_type=TradeType.SELL,
+            order_id=client_order_id,
+            trading_pair=self.trading_pair,
+            amount=Decimal("1.250"),
+            order_type=OrderType.MARKET,
+            position_action=PositionAction.CLOSE,
+            price=Decimal("NaN"),
+        )
+
+        self.assertEqual("8886775", exchange_order_id)
+        self.assertEqual(1700000000, update_timestamp)
+        request = self.exchange._api_post.await_args.kwargs
+        self.assertEqual(
+            {
+                "symbol": self.symbol,
+                "side": "SELL",
+                "quantity": "1.250",
+                "type": "MARKET",
+                "newClientOrderId": client_order_id,
+                "reduceOnly": "true",
+            },
+            request["data"],
+        )
+
+    async def test_post_only_market_is_rejected_before_network_and_limit_maker_keeps_gtx(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(return_value={
+            "updateTime": 1700000000000,
+            "status": "NEW",
+            "orderId": 8886776,
+        })
+
+        with self.assertRaisesRegex(ValueError, "post-only.*MARKET"):
+            await self.exchange._place_order(
+                trade_type=TradeType.BUY,
+                order_id="exec-sndk-snxx-0006-stock-0",
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                order_type=OrderType.MARKET,
+                position_action=PositionAction.OPEN,
+                price=Decimal("NaN"),
+                post_only=True,
+            )
+
+        self.exchange._api_post.assert_not_awaited()
+
+        await self.exchange._place_order(
+            trade_type=TradeType.BUY,
+            order_id="exec-sndk-snxx-0006-maker-0",
+            trading_pair=self.trading_pair,
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT_MAKER,
+            position_action=PositionAction.OPEN,
+            price=Decimal("10000"),
+            post_only=True,
+        )
+
+        request = self.exchange._api_post.await_args.kwargs
+        self.assertEqual("LIMIT", request["data"]["type"])
+        self.assertEqual("GTX", request["data"]["timeInForce"])
+
+    async def test_timeout_after_send_keeps_caller_id_as_unknown_pending_submission(self):
+        client_order_id = "exec-sndk-snxx-0007-stock-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        await self.exchange._create_order(
+            trade_type=TradeType.BUY,
+            order_id=client_order_id,
+            trading_pair=self.trading_pair,
+            amount=Decimal("3"),
+            order_type=OrderType.MARKET,
+            position_action=PositionAction.OPEN,
+            price=Decimal("10000"),
+        )
+        await asyncio.sleep(0.001)
+
+        tracked_order = self.exchange.in_flight_orders[client_order_id]
+        self.assertEqual(client_order_id, tracked_order.client_order_id)
+        self.assertIsNone(tracked_order.exchange_order_id)
+        self.assertEqual(OrderState.PENDING_CREATE, tracked_order.current_state)
+        self.assertTrue(self.exchange.is_order_submission_unknown(client_order_id))
+
+    async def test_typed_order_query_covers_late_partial_and_terminal_statuses(self):
+        client_order_id = "exec-sndk-snxx-0008-stock-0"
+        self._simulate_trading_rules_initialized()
+        expected_terminal = {
+            "NEW": False,
+            "PARTIALLY_FILLED": False,
+            "FILLED": True,
+            "CANCELED": True,
+            "EXPIRED": True,
+            "REJECTED": True,
+        }
+
+        for status, is_terminal in expected_terminal.items():
+            with self.subTest(status=status):
+                executed_quantity = {
+                    "NEW": "0",
+                    "FILLED": "1.250",
+                    "REJECTED": "0",
+                }.get(status, "0.125")
+                self.exchange._api_get = AsyncMock(return_value=self._get_reconciliation_order(
+                    client_order_id=client_order_id,
+                    status=status,
+                    executed_quantity=executed_quantity,
+                ))
+
+                fact = await self.exchange.get_order_status_by_client_order_id(
+                    trading_pair=self.trading_pair,
+                    client_order_id=client_order_id,
+                )
+
+                self.assertEqual("BinancePerpetualOrderSnapshot", type(fact).__name__)
+                self.assertEqual(client_order_id, fact.client_order_id)
+                self.assertEqual("8886774", fact.exchange_order_id)
+                self.assertEqual(status, fact.status.value)
+                self.assertEqual(is_terminal, fact.is_terminal)
+                self.assertFalse(fact.is_not_found)
+                self.assertEqual(Decimal("10000.125"), fact.price)
+                self.assertEqual(Decimal("1.250"), fact.original_quantity)
+                self.assertEqual(Decimal(executed_quantity), fact.executed_quantity)
+                self.assertEqual(
+                    Decimal("10000.125") * Decimal(executed_quantity),
+                    fact.cumulative_quote_quantity,
+                )
+                self.assertEqual(1700000000123, fact.update_time_ms)
+                with self.assertRaises(FrozenInstanceError):
+                    fact.client_order_id = "changed"
+                self.exchange._api_get.assert_awaited_once_with(
+                    path_url=CONSTANTS.ORDER_URL,
+                    params={
+                        "symbol": self.symbol,
+                        "origClientOrderId": client_order_id,
+                    },
+                    is_auth_required=True,
+                    return_err=True,
+                    limit_id=CONSTANTS.GET_ORDER_LIMIT_ID,
+                )
+
+    async def test_order_query_returns_one_non_terminal_not_found_fact(self):
+        client_order_id = "exec-sndk-snxx-0009-stock-0"
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_get = AsyncMock(return_value={
+            "code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE,
+            "msg": "Order does not exist.",
+        })
+
+        fact = await self.exchange.get_order_status_by_client_order_id(
+            trading_pair=self.trading_pair,
+            client_order_id=client_order_id,
+        )
+
+        self.assertEqual(client_order_id, fact.client_order_id)
+        self.assertEqual("NOT_FOUND", fact.status.value)
+        self.assertTrue(fact.is_not_found)
+        self.assertFalse(fact.is_terminal)
+        self.assertIsNone(fact.exchange_order_id)
+        self.assertIsNone(fact.executed_quantity)
+
+    async def test_order_query_rejects_conflicting_id_and_redacts_transport_payload(self):
+        client_order_id = "exec-sndk-snxx-0010-stock-0"
+        self._simulate_trading_rules_initialized()
+        conflicting = self._get_reconciliation_order(client_order_id="different-order-id")
+        self.exchange._api_get = AsyncMock(return_value=conflicting)
+
+        with self.assertRaisesRegex(ValueError, "client order ID does not match"):
+            await self.exchange.get_order_status_by_client_order_id(
+                trading_pair=self.trading_pair,
+                client_order_id=client_order_id,
+            )
+
+        secret_payload = "private-key-and-response-payload-sentinel"
+        self.exchange._api_get = AsyncMock(side_effect=IOError(secret_payload))
+        with self.assertRaises(ValueError) as raised:
+            await self.exchange.get_order_status_by_client_order_id(
+                trading_pair=self.trading_pair,
+                client_order_id=client_order_id,
+            )
+        self.assertNotIn(secret_payload, str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+
+    async def test_typed_open_orders_are_immutable_deduplicated_and_conflicts_fail_closed(self):
+        self._simulate_trading_rules_initialized()
+        first = self._get_reconciliation_order(
+            client_order_id="exec-sndk-snxx-0011-maker-0",
+            exchange_order_id=8886780,
+            status="NEW",
+            executed_quantity="0",
+        )
+        second = self._get_reconciliation_order(
+            client_order_id="exec-sndk-snxx-0011-stock-0",
+            exchange_order_id=8886781,
+            status="PARTIALLY_FILLED",
+        )
+        self.exchange._api_get = AsyncMock(return_value=[first, first.copy(), second])
+
+        facts = await self.exchange.get_open_orders(self.trading_pair)
+
+        self.assertIsInstance(facts, tuple)
+        self.assertEqual(2, len(facts))
+        self.assertEqual(
+            {"exec-sndk-snxx-0011-maker-0", "exec-sndk-snxx-0011-stock-0"},
+            {fact.client_order_id for fact in facts},
+        )
+        self.assertEqual({"NEW", "PARTIALLY_FILLED"}, {fact.status.value for fact in facts})
+        self.exchange._api_get.assert_awaited_once_with(
+            path_url=CONSTANTS.OPEN_ORDERS_URL,
+            params={"symbol": self.symbol},
+            is_auth_required=True,
+        )
+
+        conflict = first.copy()
+        conflict["orderId"] = 9999999
+        self.exchange._api_get = AsyncMock(return_value=[first, conflict])
+        with self.assertRaisesRegex(ValueError, "conflicting client order ID"):
+            await self.exchange.get_open_orders(self.trading_pair)
+
+    async def test_typed_account_trades_preserve_exact_decimals_and_deduplicate_trade_id(self):
+        self._simulate_trading_rules_initialized()
+        trade = self._get_reconciliation_trade()
+        self.exchange._api_get = AsyncMock(return_value=[trade, trade.copy()])
+
+        facts = await self.exchange.get_account_trades(
+            trading_pair=self.trading_pair,
+            exchange_order_id="8886774",
+        )
+
+        self.assertIsInstance(facts, tuple)
+        self.assertEqual(1, len(facts))
+        fact = facts[0]
+        self.assertEqual("698759", fact.trade_id)
+        self.assertEqual("8886774", fact.exchange_order_id)
+        self.assertEqual(Decimal("10000.125"), fact.price)
+        self.assertEqual(Decimal("0.125"), fact.quantity)
+        self.assertEqual(Decimal("1250.015625"), fact.quote_quantity)
+        self.assertEqual(Decimal("0.00001234"), fact.commission)
+        self.assertEqual(Decimal("-0.00000001"), fact.realized_pnl)
+        self.assertEqual(TradeType.SELL, fact.side)
+        self.assertEqual(1700000000456, fact.timestamp_ms)
+        with self.assertRaises(FrozenInstanceError):
+            fact.trade_id = "changed"
+        self.exchange._api_get.assert_awaited_once_with(
+            path_url=CONSTANTS.ACCOUNT_TRADE_LIST_URL,
+            params={"symbol": self.symbol, "orderId": "8886774"},
+            is_auth_required=True,
+        )
+
+        conflict = trade.copy()
+        conflict["price"] = "10000.126"
+        self.exchange._api_get = AsyncMock(return_value=[trade, conflict])
+        with self.assertRaisesRegex(ValueError, "conflicting trade ID"):
+            await self.exchange.get_account_trades(
+                trading_pair=self.trading_pair,
+                exchange_order_id="8886774",
+            )
+
+    async def test_reconciliation_reads_reject_malformed_identifiers_and_non_finite_fills(self):
+        self._simulate_trading_rules_initialized()
+        client_order_id = "exec-sndk-snxx-0012-stock-0"
+        malformed_order = self._get_reconciliation_order(client_order_id=client_order_id)
+        malformed_order["orderId"] = True
+        self.exchange._api_get = AsyncMock(return_value=malformed_order)
+
+        with self.assertRaisesRegex(ValueError, "orderId"):
+            await self.exchange.get_order_status_by_client_order_id(
+                self.trading_pair, client_order_id
+            )
+
+        malformed_trade = self._get_reconciliation_trade()
+        malformed_trade["id"] = ""
+        self.exchange._api_get = AsyncMock(return_value=[malformed_trade])
+        with self.assertRaisesRegex(ValueError, "trade.*id"):
+            await self.exchange.get_account_trades(self.trading_pair, "8886774")
+
+        malformed_trade = self._get_reconciliation_trade()
+        malformed_trade["qty"] = "NaN"
+        self.exchange._api_get = AsyncMock(return_value=[malformed_trade])
+        with self.assertRaisesRegex(ValueError, "qty"):
+            await self.exchange.get_account_trades(self.trading_pair, "8886774")
+
+    async def test_position_v3_facts_deduplicate_identical_rows_and_reject_conflicts(self):
+        self._simulate_trading_rules_initialized()
+        position = self._get_reconciliation_position()
+        self.exchange._api_get = AsyncMock(return_value=[position, position.copy()])
+
+        facts = await self.exchange.get_position_risk_snapshots(self.trading_pair)
+
+        self.assertIsInstance(facts, tuple)
+        self.assertEqual(1, len(facts))
+        self.assertEqual(self.symbol, facts[0].symbol)
+        self.assertEqual(Decimal("-0.125"), facts[0].position_amount)
+        self.assertEqual(Decimal("-1250.15625"), facts[0].notional)
+
+        conflict = position.copy()
+        conflict["positionAmt"] = "-0.250"
+        self.exchange._api_get = AsyncMock(return_value=[position, conflict])
+        with self.assertRaisesRegex(ValueError, "conflicting position"):
+            await self.exchange.get_position_risk_snapshots(self.trading_pair)
+
+    async def test_reconciliation_reads_propagate_cancellation(self):
+        client_order_id = "exec-sndk-snxx-0013-stock-0"
+        self._simulate_trading_rules_initialized()
+        calls = (
+            lambda: self.exchange.get_order_status_by_client_order_id(
+                self.trading_pair, client_order_id
+            ),
+            lambda: self.exchange.get_open_orders(self.trading_pair),
+            lambda: self.exchange.get_account_trades(self.trading_pair, "8886774"),
+            lambda: self.exchange.get_position_risk_snapshots(self.trading_pair),
+        )
+
+        for call in calls:
+            with self.subTest(call=call):
+                self.exchange._api_get = AsyncMock(side_effect=asyncio.CancelledError)
+                with self.assertRaises(asyncio.CancelledError):
+                    await call()
 
     @patch("hummingbot.connector.utils.get_tracking_nonce")
     async def test_client_order_id_on_order(self, mocked_nonce):
