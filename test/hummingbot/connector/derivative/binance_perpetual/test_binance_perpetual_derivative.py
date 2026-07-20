@@ -3675,7 +3675,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             client_order_id="exec-sndk-snxx-0115-stock-0",
             overflow_trapped=False,
             clamp=1,
-            rounding=ROUND_DOWN,
+            rounding=ROUND_UP,
         )
 
     async def test_submission_unknown_stream_context_trapped_overflow_stores_exactly(self):
@@ -3683,7 +3683,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             client_order_id="exec-sndk-snxx-0116-stock-0",
             overflow_trapped=True,
             clamp=0,
-            rounding=ROUND_UP,
+            rounding=ROUND_DOWN,
         )
 
     async def test_submission_unknown_stream_context_rolls_back_partial_tracker_failure(self):
