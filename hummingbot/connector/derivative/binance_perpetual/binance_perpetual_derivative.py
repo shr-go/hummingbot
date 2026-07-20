@@ -1310,45 +1310,130 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             order_message.get("q"),
             "user stream order quantity",
         )
-        if original_quantity != tracked_order.amount:
+        if original_quantity <= 0 or original_quantity != tracked_order.amount:
             raise BinancePerpetualOrderDataError("user stream order quantity is contradictory")
+        order_price = self._validated_finite_decimal(
+            order_message.get("p"),
+            "user stream order price",
+        )
         if tracked_order.order_type.is_limit_type():
-            order_price = self._validated_finite_decimal(
-                order_message.get("p"),
-                "user stream order price",
-            )
-            if order_price != tracked_order.price:
+            if order_price <= 0 or order_price != tracked_order.price:
                 raise BinancePerpetualOrderDataError("user stream order price is contradictory")
+        elif order_price != 0:
+            raise BinancePerpetualOrderDataError("user stream order price is contradictory")
 
         raw_status = order_message.get("X")
-        if not isinstance(raw_status, str) or raw_status not in CONSTANTS.ORDER_STATE:
-            raise BinancePerpetualOrderDataError("user stream order status is unsupported")
+        execution_type = order_message.get("x")
+        execution_statuses = {
+            "NEW": {"NEW"},
+            "TRADE": {"PARTIALLY_FILLED", "FILLED"},
+            "CANCELED": {"CANCELED"},
+            "EXPIRED": {"EXPIRED", "EXPIRED_IN_MATCH"},
+        }
+        if (
+            not isinstance(execution_type, str)
+            or not isinstance(raw_status, str)
+            or raw_status not in execution_statuses.get(execution_type, set())
+        ):
+            raise BinancePerpetualOrderDataError(
+                "user stream execution type and order status are contradictory"
+            )
         event_timestamp_ms = int(self._validated_non_negative_integer_string(
             event_message.get("T"),
             "user stream event timestamp",
+        ))
+        fill_timestamp_ms = int(self._validated_non_negative_integer_string(
+            order_message.get("T"),
+            "user stream fill timestamp",
         ))
         trade_id = self._validated_non_negative_integer_string(
             order_message.get("t"),
             "user stream trade ID",
         )
+        last_fill_base_amount = self._validated_finite_decimal(
+            order_message.get("l"),
+            "user stream last fill quantity",
+        )
+        cumulative_fill_base_amount = self._validated_finite_decimal(
+            order_message.get("z"),
+            "user stream cumulative fill quantity",
+        )
+        average_fill_price = self._validated_finite_decimal(
+            order_message.get("ap"),
+            "user stream average fill price",
+        )
+        last_fill_price = self._validated_finite_decimal(
+            order_message.get("L"),
+            "user stream last fill price",
+        )
+        cumulative_fill_quote_amount = self._validated_finite_decimal(
+            order_message.get("Z"),
+            "user stream cumulative fill quote amount",
+        )
+        if any(
+            value < 0
+            for value in (
+                last_fill_base_amount,
+                cumulative_fill_base_amount,
+                average_fill_price,
+                last_fill_price,
+                cumulative_fill_quote_amount,
+            )
+        ):
+            raise BinancePerpetualOrderDataError(
+                "user stream fill quantities and prices must be non-negative"
+            )
+        if cumulative_fill_base_amount > original_quantity:
+            raise BinancePerpetualOrderDataError(
+                "user stream cumulative fill quantity exceeds the order quantity"
+            )
+        if (
+            cumulative_fill_base_amount < tracked_order.executed_amount_base
+            or cumulative_fill_quote_amount < tracked_order.executed_amount_quote
+        ):
+            raise BinancePerpetualOrderDataError("user stream cumulative fill rolled back")
+        if cumulative_fill_base_amount == 0:
+            if average_fill_price != 0 or cumulative_fill_quote_amount != 0:
+                raise BinancePerpetualOrderDataError(
+                    "user stream zero cumulative fill has contradictory price facts"
+                )
+        elif (
+            average_fill_price <= 0
+            or cumulative_fill_quote_amount <= 0
+            or average_fill_price * cumulative_fill_base_amount != cumulative_fill_quote_amount
+        ):
+            raise BinancePerpetualOrderDataError(
+                "user stream cumulative fill price facts are contradictory"
+            )
 
         trade_update = None
-        if trade_id != "0":
-            fill_timestamp_ms = int(self._validated_non_negative_integer_string(
-                order_message.get("T"),
-                "user stream fill timestamp",
-            ))
-            fill_price = self._validated_finite_decimal(
-                order_message.get("L"),
-                "user stream fill price",
-            )
-            fill_base_amount = self._validated_finite_decimal(
-                order_message.get("l"),
-                "user stream fill quantity",
-            )
-            if fill_price <= 0 or fill_base_amount <= 0:
+        if execution_type == "NEW":
+            if (
+                trade_id != "0"
+                or last_fill_base_amount != 0
+                or last_fill_price != 0
+                or cumulative_fill_base_amount != 0
+                or tracked_order.executed_amount_base != 0
+                or tracked_order.executed_amount_quote != 0
+            ):
+                raise BinancePerpetualOrderDataError(
+                    "user stream new order contains contradictory fill facts"
+                )
+        elif execution_type == "TRADE":
+            if trade_id == "0" or last_fill_price <= 0 or last_fill_base_amount <= 0:
                 raise BinancePerpetualOrderDataError(
                     "user stream fill price and quantity must be positive"
+                )
+            if (
+                raw_status == "PARTIALLY_FILLED"
+                and not Decimal("0") < cumulative_fill_base_amount < original_quantity
+            ):
+                raise BinancePerpetualOrderDataError(
+                    "user stream partial fill quantity is contradictory"
+                )
+            if raw_status == "FILLED" and cumulative_fill_base_amount != original_quantity:
+                raise BinancePerpetualOrderDataError(
+                    "user stream filled quantity is contradictory"
                 )
             fee_amount = self._validated_finite_decimal(
                 order_message.get("n", "0"),
@@ -1379,17 +1464,49 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 percent_token=fee_asset,
                 flat_fees=flat_fees,
             )
-            trade_update = TradeUpdate(
+            candidate_trade_update = TradeUpdate(
                 trade_id=trade_id,
                 client_order_id=client_order_id,
                 exchange_order_id=exchange_order_id,
                 trading_pair=tracked_order.trading_pair,
                 fill_timestamp=fill_timestamp_ms * 1e-3,
-                fill_price=fill_price,
-                fill_base_amount=fill_base_amount,
-                fill_quote_amount=fill_price * fill_base_amount,
+                fill_price=last_fill_price,
+                fill_base_amount=last_fill_base_amount,
+                fill_quote_amount=last_fill_price * last_fill_base_amount,
                 fee=fee,
             )
+            existing_fill = tracked_order.order_fills.get(trade_id)
+            if existing_fill is not None:
+                if (
+                    candidate_trade_update != existing_fill
+                    or cumulative_fill_base_amount != tracked_order.executed_amount_base
+                    or cumulative_fill_quote_amount != tracked_order.executed_amount_quote
+                ):
+                    raise BinancePerpetualOrderDataError(
+                        "user stream duplicate trade facts are contradictory"
+                    )
+            else:
+                if (
+                    cumulative_fill_base_amount
+                    != tracked_order.executed_amount_base + last_fill_base_amount
+                    or cumulative_fill_quote_amount
+                    != tracked_order.executed_amount_quote + candidate_trade_update.fill_quote_amount
+                ):
+                    raise BinancePerpetualOrderDataError(
+                        "user stream cumulative and last fill facts are contradictory"
+                    )
+                trade_update = candidate_trade_update
+        else:
+            if (
+                trade_id != "0"
+                or last_fill_base_amount != 0
+                or last_fill_price != 0
+                or cumulative_fill_base_amount != tracked_order.executed_amount_base
+                or cumulative_fill_quote_amount != tracked_order.executed_amount_quote
+            ):
+                raise BinancePerpetualOrderDataError(
+                    "user stream terminal order contains contradictory fill facts"
+                )
 
         order_update = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
@@ -1418,7 +1535,18 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 )
                 if trade_update is not None:
                     self._order_tracker.process_trade_update(trade_update)
+                    if tracked_order.order_fills.get(trade_update.trade_id) != trade_update:
+                        raise BinancePerpetualOrderDataError(
+                            "user stream trade update was not applied"
+                        )
                 await self._order_tracker.process_order_update(order_update)
+                if (
+                    tracked_order.exchange_order_id != order_update.exchange_order_id
+                    or tracked_order.current_state != order_update.new_state
+                ):
+                    raise BinancePerpetualOrderDataError(
+                        "user stream order update was not applied"
+                    )
                 self._resolve_order_submission_unknown(client_order_id)
                 return
             tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
