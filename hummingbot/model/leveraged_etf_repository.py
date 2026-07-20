@@ -817,6 +817,19 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         )
 
     @classmethod
+    def _intent_terminal(cls, events: Tuple[JournalEventV1, ...]) -> bool:
+        """Derive terminal progress from facts without depending on their arrival order."""
+
+        return any(cls._event_terminal(event) for event in events)
+
+    @staticmethod
+    def _late_submission_fact(event: JournalEventV1) -> bool:
+        return event.event_type in {
+            JournalEventType.ACKNOWLEDGED,
+            JournalEventType.ORDER_CREATED,
+        }
+
+    @classmethod
     def _decode_event_row(cls, row: Mapping[str, Any]) -> _DecodedJournalMutation:
         try:
             mutation = _verify_canonical_json(row["payload_json"], row["payload_hash"], "journal mutation")
@@ -997,20 +1010,21 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         decoded: Tuple[_DecodedJournalMutation, ...],
     ) -> Tuple[IncompleteIntentV1, ...]:
         prepared = {}
-        latest = {}
+        by_intent: dict[str, list[CommittedJournalEventV1]] = {}
         for mutation in decoded:
             event = mutation.committed.event
             if event.intent_id is None:
                 continue
             if event.event_type == JournalEventType.PREPARED:
                 prepared[event.intent_id] = event
-            latest[event.intent_id] = mutation.committed
+            by_intent.setdefault(event.intent_id, []).append(mutation.committed)
         incomplete = []
-        for intent_id, committed in latest.items():
+        for intent_id, committed_events in by_intent.items():
             prepared_event = prepared.get(intent_id)
             if prepared_event is None:
                 raise JournalIntegrityError(f"intent {intent_id} has no PREPARED event")
-            if not cls._event_terminal(committed.event):
+            if not cls._intent_terminal(tuple(committed.event for committed in committed_events)):
+                committed = committed_events[-1]
                 incomplete.append(
                     IncompleteIntentV1(
                         executor_id=executor_id,
@@ -1060,13 +1074,19 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         matching = [existing for existing in events if existing.intent_id == event.intent_id]
         if not matching or matching[0].event_type != JournalEventType.PREPARED:
             raise JournalConflictError(f"intent {event.intent_id} has no PREPARED event")
-        if cls._event_terminal(matching[-1]):
-            raise JournalConflictError(f"intent {event.intent_id} is already terminal")
 
         prepared_identity = getattr(matching[0].payload, "identity", None)
         event_identity = getattr(event.payload, "identity", None)
         if prepared_identity is None or event_identity is None or event_identity != prepared_identity:
             raise JournalConflictError(f"intent {event.intent_id} side-effect identity or action changed")
+
+        has_fill_fact = any(isinstance(existing.payload, FillJournalPayloadV1) for existing in matching)
+        if cls._late_submission_fact(event) and has_fill_fact:
+            if any(existing.event_type == event.event_type for existing in matching):
+                raise JournalConflictError(f"intent {event.intent_id} already recorded {event.event_type.value}")
+            return
+        if cls._intent_terminal(tuple(matching)):
+            raise JournalConflictError(f"intent {event.intent_id} is already terminal")
 
         action = prepared_identity.action
         latest_type = matching[-1].event_type
@@ -1192,6 +1212,23 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         )
 
     @classmethod
+    def _action_logical_target(
+        cls,
+        decoded: Tuple[_DecodedJournalMutation, ...],
+        identity: SideEffectIdentityV1,
+    ) -> Decimal:
+        targets = tuple(
+            event.payload.identity.logical_quantity
+            for event in cls._events_with_candidate(decoded)
+            if isinstance(event.payload, PreparedJournalPayloadV1)
+            and event.payload.identity.action == identity.action
+            and event.payload.identity.leg == identity.leg
+        )
+        if not targets:
+            raise JournalIntegrityError("fill action has no authoritative prepared leg target")
+        return max(targets)
+
+    @classmethod
     def _intent_fill_total(
         cls,
         decoded: Tuple[_DecodedJournalMutation, ...],
@@ -1234,11 +1271,11 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         decoded: Tuple[_DecodedJournalMutation, ...],
         event: JournalEventV1,
     ) -> bool:
-        latest: dict[str, JournalEventV1] = {}
+        by_intent: dict[str, list[JournalEventV1]] = {}
         for candidate in cls._events_with_candidate(decoded, event):
             if candidate.intent_id is not None:
-                latest[candidate.intent_id] = candidate
-        return all(cls._event_terminal(candidate) for candidate in latest.values())
+                by_intent.setdefault(candidate.intent_id, []).append(candidate)
+        return all(cls._intent_terminal(tuple(intent_events)) for intent_events in by_intent.values())
 
     @classmethod
     def _exposure_totals(
@@ -1338,6 +1375,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             else:
                 prefix = None
             if prefix is not None:
+                append_order_reference(prefix, event.payload.exchange_order_id)
                 filled_field = f"{prefix}_filled_quantity"
                 submitted_field = f"{prefix}_submitted_quantity"
                 new_filled = Decimal(serialized[filled_field]) + event.payload.fill_quantity
@@ -1419,8 +1457,15 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             prior_leg_fill = cls._action_fill_total(decoded, identity.action)
             if payload.leg_cumulative_filled_quantity != prior_leg_fill + payload.fill_quantity:
                 raise JournalIntegrityError("fill leg cumulative quantity disagrees with accepted trades")
-            if payload.leg_cumulative_filled_quantity > identity.logical_quantity:
-                raise JournalIntegrityError("fill leg cumulative quantity exceeds the intent logical quantity")
+            immutable_leg_target = (
+                current.etf_target_quantity if identity.leg == "ETF" else current.stock_target_quantity
+            )
+            authoritative_leg_target = min(
+                immutable_leg_target,
+                cls._action_logical_target(decoded, identity),
+            )
+            if payload.leg_cumulative_filled_quantity > authoritative_leg_target:
+                raise JournalIntegrityError("fill leg cumulative quantity exceeds the authoritative leg target")
             if payload.order_cumulative_filled_quantity > identity.order_quantity:
                 raise JournalIntegrityError("fill per-order cumulative quantity exceeds prepared order quantity")
             if payload.outcome == "FILLED":
@@ -1511,7 +1556,13 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         decoded: Tuple[_DecodedJournalMutation, ...],
     ) -> LeveragedEtfPairState:
         source = current.state
+        late_after_fill = cls._late_submission_fact(event) and any(
+            candidate.intent_id == event.intent_id and isinstance(candidate.payload, FillJournalPayloadV1)
+            for candidate in cls._events_with_candidate(decoded)
+        )
         if source in _TERMINAL_EXECUTOR_STATES:
+            if late_after_fill:
+                return source
             raise JournalConflictError(f"terminal executor state {source.value} cannot accept journal events")
         payload = event.payload
         identity = getattr(payload, "identity", None)
@@ -1644,6 +1695,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 JournalSideEffect.ETF_ROLLBACK: LeveragedEtfPairState.RECOVERY_REQUIRED,
             }[action]
         if event.event_type in {JournalEventType.ACKNOWLEDGED, JournalEventType.ORDER_CREATED}:
+            if late_after_fill:
+                return source
             return (
                 LeveragedEtfPairState.MAKER_WORKING if action == JournalSideEffect.ETF_MAKER else pending_state[action]
             )
