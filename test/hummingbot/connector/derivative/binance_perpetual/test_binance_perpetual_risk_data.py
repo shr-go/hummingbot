@@ -507,7 +507,16 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
         self.exchange._api_post.assert_not_awaited()
 
     async def test_strict_preflight_rejects_unsafe_freshness_parameters(self):
-        max_age_cases = (5.000001, float("nan"), float("inf"), -0.001, True, "5")
+        max_age_cases = (
+            5.000001,
+            float("nan"),
+            float("inf"),
+            -0.001,
+            True,
+            "5",
+            Decimal("5.0000000000000000000000000000001"),
+            Decimal("-1E-10000"),
+        )
         for value in max_age_cases:
             with self.subTest(parameter="max_age_seconds", value=value):
                 exchange = self._new_exchange()
@@ -540,14 +549,16 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
                         consistency_tolerance=value,
                     )
 
-        exchange = self._new_exchange()
-        self._configure_preflight_sources(exchange, self._typed_bundle())
-        await exchange.strict_account_preflight(
-            trading_pairs=[self.trading_pair],
-            known_position_trading_pairs=[self.trading_pair],
-            max_age_seconds=5,
-            consistency_tolerance=Decimal("0.01"),
-        )
+        for value in (Decimal("0"), Decimal("5")):
+            with self.subTest(parameter="max_age_seconds boundary", value=value):
+                exchange = self._new_exchange()
+                self._configure_preflight_sources(exchange, self._typed_bundle())
+                await exchange.strict_account_preflight(
+                    trading_pairs=[self.trading_pair],
+                    known_position_trading_pairs=[self.trading_pair],
+                    max_age_seconds=value,
+                    consistency_tolerance=Decimal("0.01"),
+                )
 
     async def test_strict_preflight_validates_meaningful_source_timestamps(self):
         base = self._typed_bundle()
