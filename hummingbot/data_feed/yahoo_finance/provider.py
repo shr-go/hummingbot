@@ -4,7 +4,7 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
@@ -30,6 +30,10 @@ class YahooHTTPError(IOError):
 
 class YahooDeadlineExceeded(YahooHTTPError):
     """Raised when the original absolute acquisition deadline has elapsed."""
+
+
+class YahooAttemptTimeout(TimeoutError):
+    """Raised when one approved Yahoo host exhausts its bounded attempt."""
 
 
 class YahooResponseError(YahooHTTPError):
@@ -119,6 +123,84 @@ class YahooCycleBudget:
             awaitable.cancel()
 
 
+class _YahooAttemptBudget:
+    """A host-attempt deadline bounded by, and never extending, one cycle budget."""
+
+    def __init__(
+        self,
+        cycle_budget: YahooCycleBudget,
+        deadline_utc: datetime,
+        monotonic_deadline: float,
+    ):
+        self._cycle_budget = cycle_budget
+        self.deadline_utc = deadline_utc
+        self.monotonic_deadline = monotonic_deadline
+
+    @classmethod
+    def start(
+        cls,
+        cycle_budget: YahooCycleBudget,
+        maximum_seconds: float,
+    ) -> "_YahooAttemptBudget":
+        utc_now = cycle_budget._utc_clock()
+        monotonic_now = cycle_budget._monotonic_clock()
+        wall_remaining = (cycle_budget.deadline_utc - utc_now).total_seconds()
+        monotonic_remaining = cycle_budget.monotonic_deadline - monotonic_now
+        cycle_remaining = max(0.0, min(wall_remaining, monotonic_remaining))
+        if cycle_remaining <= 0:
+            raise YahooDeadlineExceeded("Yahoo acquisition deadline elapsed before host attempt")
+        attempt_seconds = min(float(maximum_seconds), cycle_remaining)
+        return cls(
+            cycle_budget=cycle_budget,
+            deadline_utc=utc_now + timedelta(seconds=attempt_seconds),
+            monotonic_deadline=monotonic_now + attempt_seconds,
+        )
+
+    def remaining_seconds(self) -> float:
+        wall_remaining = (self.deadline_utc - self._cycle_budget._utc_clock()).total_seconds()
+        monotonic_remaining = self.monotonic_deadline - self._cycle_budget._monotonic_clock()
+        return max(
+            0.0,
+            min(
+                wall_remaining,
+                monotonic_remaining,
+                self._cycle_budget.remaining_seconds(),
+            ),
+        )
+
+    def ensure_remaining(self, operation: str) -> float:
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            self._raise_timeout(operation)
+        return remaining
+
+    async def wait(self, awaitable, operation: str, *, check_after: bool = True):
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            YahooCycleBudget._discard_unstarted(awaitable)
+            self._raise_timeout(operation)
+        try:
+            result = await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as exception:
+            self._raise_timeout(operation, exception)
+        if check_after:
+            self.ensure_remaining(operation)
+        return result
+
+    def _raise_timeout(self, operation: str, cause: BaseException | None = None) -> None:
+        if self._cycle_budget.remaining_seconds() <= 0:
+            error = YahooDeadlineExceeded(
+                f"Yahoo acquisition deadline elapsed during {operation}"
+            )
+        else:
+            error = YahooAttemptTimeout(f"Yahoo host attempt timed out during {operation}")
+        if cause is None:
+            raise error
+        raise error from cause
+
+
 class YahooChartProvider:
     """Fetch raw Yahoo chart bytes through Hummingbot's shared REST lifecycle."""
 
@@ -170,18 +252,6 @@ class YahooChartProvider:
             raise ValueError("Yahoo cycle budget deadline does not match the requested deadline")
         budget.ensure_remaining("Yahoo request")
 
-        try:
-            rest_assistant = await budget.wait(
-                self._web_assistants_factory.get_rest_assistant(),
-                "WebAssistantsFactory acquisition",
-            )
-        except asyncio.CancelledError:
-            raise
-        except YahooDeadlineExceeded:
-            raise
-        except _TRANSPORT_ERRORS as exception:
-            raise YahooHTTPError(f"Yahoo REST assistant acquisition failed: {exception}") from exception
-
         encoded_symbol = quote(symbol, safe="")
         last_error: BaseException | None = None
         rate_limit_attempt = 0
@@ -192,7 +262,6 @@ class YahooChartProvider:
             while True:
                 try:
                     status, raw_bytes, source_url = await self._request_host(
-                        rest_assistant=rest_assistant,
                         request_url=request_url,
                         symbol=symbol,
                         budget=budget,
@@ -255,16 +324,20 @@ class YahooChartProvider:
 
     async def _request_host(
         self,
-        rest_assistant,
         request_url: str,
         symbol: str,
         budget: YahooCycleBudget,
     ) -> tuple[int, bytes | None, str]:
-        timeout = min(
-            self._nav_config.anchor_http_request_timeout_seconds,
-            budget.ensure_remaining("Yahoo HTTP attempt"),
+        attempt_budget = _YahooAttemptBudget.start(
+            cycle_budget=budget,
+            maximum_seconds=self._nav_config.anchor_http_request_timeout_seconds,
         )
-        response = await budget.wait(
+        rest_assistant = await attempt_budget.wait(
+            self._web_assistants_factory.get_rest_assistant(),
+            "WebAssistantsFactory acquisition",
+        )
+        timeout = attempt_budget.ensure_remaining("Yahoo HTTP request")
+        response = await attempt_budget.wait(
             rest_assistant.execute_request_and_get_response(
                 url=request_url,
                 throttler_limit_id=YAHOO_CHART_RATE_LIMIT_ID,
@@ -283,7 +356,7 @@ class YahooChartProvider:
             check_after=False,
         )
         try:
-            budget.ensure_remaining("Yahoo throttler and HTTP request")
+            attempt_budget.ensure_remaining("Yahoo throttler and HTTP request")
             source_url = self._validate_final_url(response.url, symbol)
             try:
                 status = int(response.status)
@@ -291,12 +364,12 @@ class YahooChartProvider:
                 raise YahooResponseError("Yahoo response status is invalid") from exception
             raw_bytes = None
             if status == 200:
-                raw_bytes = await self._read_response_body(response, budget)
+                raw_bytes = await self._read_response_body(response, attempt_budget)
             return status, raw_bytes, source_url
         finally:
             self._release_response(response)
 
-    async def _read_response_body(self, response, budget: YahooCycleBudget) -> bytes:
+    async def _read_response_body(self, response, budget: _YahooAttemptBudget) -> bytes:
         headers = response.headers
         if headers is not None and isinstance(headers, Mapping):
             content_length = headers.get("Content-Length")
