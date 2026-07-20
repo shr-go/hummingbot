@@ -98,6 +98,18 @@ def _create_compiled_table(connection: sqlite3.Connection, table, transform=lamb
     connection.execute(transform(_compiled_table_sql(table)))
 
 
+def _insert_compiled_column(create_sql: str, column_sql: str) -> str:
+    marker = "\tPRIMARY KEY"
+    assert marker in create_sql
+    return create_sql.replace(marker, f"\t{column_sql}, \n{marker}", 1)
+
+
+def _append_compiled_constraint(create_sql: str, constraint_sql: str) -> str:
+    closing_index = create_sql.rfind("\n)")
+    assert closing_index > 0
+    return f"{create_sql[:closing_index]}, \n\t{constraint_sql}{create_sql[closing_index:]}"
+
+
 def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "original") -> None:
     connection.execute(
         text("""
@@ -521,6 +533,85 @@ def test_same_named_incompatible_trigger_is_rejected_before_version_stamp(
     _assert_legacy_data_unchanged(db_path)
 
 
+@pytest.mark.parametrize(
+    ("table_transform", "attached_object_sql"),
+    [
+        (
+            lambda create_sql: _insert_compiled_column(create_sql, "sabotage_required TEXT NOT NULL"),
+            None,
+        ),
+        (
+            lambda create_sql: _append_compiled_constraint(
+                create_sql,
+                "CONSTRAINT sabotage_snapshot_json CHECK (snapshot_json <> 'blocked')",
+            ),
+            None,
+        ),
+        (
+            lambda create_sql: _append_compiled_constraint(
+                create_sql,
+                "CONSTRAINT sabotage_controller_unique UNIQUE (controller_id)",
+            ),
+            None,
+        ),
+        (
+            lambda create_sql: _append_compiled_constraint(
+                create_sql,
+                'CONSTRAINT sabotage_executor_fk FOREIGN KEY (executor_id) REFERENCES "Executors" (id) '
+                "ON DELETE CASCADE",
+            ),
+            None,
+        ),
+        (
+            lambda create_sql: create_sql,
+            """
+            CREATE UNIQUE INDEX sabotage_snapshot_state_unique
+            ON LeveragedEtfExecutorSnapshot (state)
+            """,
+        ),
+        (
+            lambda create_sql: create_sql,
+            """
+            CREATE TRIGGER arbitrary_block_snapshot_inserts
+            BEFORE INSERT ON LeveragedEtfExecutorSnapshot
+            BEGIN
+                SELECT RAISE(ABORT, 'sabotage');
+            END
+            """,
+        ),
+    ],
+    ids=[
+        "extra_required_column",
+        "extra_check_constraint",
+        "extra_unique_constraint",
+        "extra_foreign_key",
+        "extra_unique_index",
+        "arbitrary_named_blocking_trigger",
+    ],
+)
+def test_managed_schema_rejects_unexpected_behavior_before_version_stamp(
+    tmp_path: Path,
+    table_transform,
+    attached_object_sql: str | None,
+):
+    db_path = _materialize_legacy_database(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        _create_compiled_table(
+            connection,
+            LeveragedEtfExecutorSnapshot.__table__,
+            transform=table_transform,
+        )
+        if attached_object_sql is not None:
+            connection.execute(attached_object_sql)
+
+    with pytest.raises(DatabaseMigrationError, match="schema|column|constraint|foreign key|index|trigger"):
+        unexpected = _open_manager(db_path)
+        unexpected.engine.dispose()
+
+    _assert_legacy_data_unchanged(db_path)
+    assert "LeveragedEtfStrategyReservation" not in _table_names(db_path)
+
+
 OR_REPLACE_CASES = [
     (
         "snapshot_executor_id",
@@ -756,6 +847,53 @@ def test_reservation_numeric_fields_reject_noncanonical_or_out_of_domain_values(
         manager.engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("quantity", "1\x00suffix"),
+        ("notional_cap", "1000\x00suffix"),
+    ],
+)
+def test_reservation_numeric_fields_reject_embedded_nul_suffix(
+    tmp_path: Path,
+    column: str,
+    invalid_value: str,
+):
+    manager = _open_manager(tmp_path / f"nul-{column}.sqlite")
+    try:
+        with manager.engine.begin() as connection:
+            _insert_snapshot(connection)
+
+        values = {
+            "quantity": "1",
+            "notional_cap": "1000",
+            column: invalid_value,
+        }
+        with pytest.raises(IntegrityError):
+            with manager.engine.begin() as connection:
+                connection.execute(
+                    text("""
+                        INSERT INTO LeveragedEtfStrategyReservation (
+                            reservation_id, executor_id, reservation_key, connector_name,
+                            trading_pair, leg, quantity, leverage, notional_cap, payload_json,
+                            payload_hash, created_at_utc, updated_at_utc, released_at_utc
+                        ) VALUES (
+                            'reservation-nul', 'executor-1', 'reservation-key-nul',
+                            'binance_perpetual', 'SNXX-USDT', 'ETF', :quantity, 20,
+                            :notional_cap, '{}', :payload_hash, :created_at, :updated_at, NULL
+                        )
+                        """),
+                    {
+                        **values,
+                        "payload_hash": HASH_A,
+                        "created_at": CREATED_AT,
+                        "updated_at": UPDATED_AT,
+                    },
+                )
+    finally:
+        manager.engine.dispose()
+
+
 BAD_HASH_INSERTS = {
     "snapshot_hash": """
         INSERT INTO LeveragedEtfExecutorSnapshot (
@@ -838,6 +976,49 @@ def test_all_hash_constraints_reject_lowercase_non_hex_text(
                     text(insert_sql),
                     {
                         "bad_hash": BAD_HASH,
+                        "hash_a": HASH_A,
+                        "created_at": CREATED_AT,
+                        "updated_at": UPDATED_AT,
+                    },
+                )
+    finally:
+        manager.engine.dispose()
+
+
+@pytest.mark.parametrize(("case_name", "insert_sql"), BAD_HASH_INSERTS.items())
+def test_all_hash_constraints_reject_embedded_nul_suffix(
+    tmp_path: Path,
+    case_name: str,
+    insert_sql: str,
+):
+    manager = _open_manager(tmp_path / f"nul-hash-{case_name}.sqlite")
+    try:
+        with manager.engine.begin() as connection:
+            _insert_snapshot(connection)
+            connection.execute(
+                text("""
+                    INSERT INTO LeveragedEtfAnchorState (
+                        cycle_id, schema_version, state_kind, revision, target_session_date,
+                        official_close_utc, deadline_utc, evidence_hash, payload_json,
+                        payload_hash, created_at_utc, updated_at_utc
+                    ) VALUES ('xnys-2026-07-17', 1, 'FINALIZED', 1, '2026-07-17', NULL,
+                              '2026-07-17T20:10:00.000000Z', :hash_b, '{}', :hash_a,
+                              :created_at, :updated_at)
+                    """),
+                {
+                    "hash_a": HASH_A,
+                    "hash_b": HASH_B,
+                    "created_at": CREATED_AT,
+                    "updated_at": UPDATED_AT,
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            with manager.engine.begin() as connection:
+                connection.execute(
+                    text(insert_sql),
+                    {
+                        "bad_hash": f"{HASH_A}\x00g",
                         "hash_a": HASH_A,
                         "created_at": CREATED_AT,
                         "updated_at": UPDATED_AT,
