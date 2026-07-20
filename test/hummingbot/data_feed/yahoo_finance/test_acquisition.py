@@ -387,7 +387,11 @@ class YahooAnchorAcquisitionTest(unittest.IsolatedAsyncioTestCase):
         acquisition = self.acquisition(clock, provider)
 
         first = await acquisition.advance(self.new_checkpoint(acquisition), "SNDK", "SNXX")
-        early_checkpoint = replace(first.checkpoint, next_poll_utc=too_soon_at)
+        early_checkpoint = replace(
+            first.checkpoint,
+            next_poll_utc=too_soon_at,
+            integrity_hash=None,
+        )
         clock.current = too_soon_at
         clock.monotonic_value += 4
         too_soon = await acquisition.advance(early_checkpoint, "SNDK", "SNXX")
