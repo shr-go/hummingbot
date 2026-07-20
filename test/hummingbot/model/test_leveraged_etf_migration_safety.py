@@ -14,11 +14,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateTable
 
 import hummingbot.model.db_migration.migrator as migrator_module
+import hummingbot.model.leveraged_etf_persistence as persistence_module
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.model.db_migration.migrator import Migrator
 from hummingbot.model.leveraged_etf_persistence import (
     SQLITE_GUARD_DDL,
+    LeveragedEtfAnchorState,
     LeveragedEtfExecutorSnapshot,
     LeveragedEtfJournalEvent,
     LeveragedEtfStrategyReservation,
@@ -270,6 +272,35 @@ def _install_round5_meaningful_drift(connection: sqlite3.Connection, drift: str)
         raise AssertionError(f"unknown round-five index drift: {drift}")
     index_name, key_sql, predicate_sql = index_keys[drift]
     connection.execute(f"CREATE INDEX {index_name} ON {table_name} ({key_sql}){predicate_sql}")
+
+
+def _install_round6_keyword_parentheses_variant(connection: sqlite3.Connection, variant: str) -> tuple[str, str]:
+    if variant == "managed_check_is_null":
+        _create_compiled_table(
+            connection,
+            LeveragedEtfAnchorState.__table__,
+            transform=lambda create_sql: create_sql.replace(
+                "evidence_hash IS NULL",
+                "evidence_hash IS (NULL)",
+                1,
+            ),
+        )
+        return "table", LeveragedEtfAnchorState.__tablename__
+    if variant == "partial_index_is_null":
+        _create_compiled_table(connection, LeveragedEtfExecutorSnapshot.__table__)
+        _create_compiled_table(connection, LeveragedEtfStrategyReservation.__table__)
+        connection.execute(f"""
+            CREATE UNIQUE INDEX lepf_reservation_active_leg
+            ON {LeveragedEtfStrategyReservation.__tablename__} (
+                executor_id,
+                connector_name,
+                trading_pair,
+                leg
+            )
+            WHERE released_at_utc IS (NULL)
+            """)
+        return "index", "lepf_reservation_active_leg"
+    raise AssertionError(f"unknown round-six keyword-parentheses variant: {variant}")
 
 
 def _insert_snapshot(connection, executor_id: str = "executor-1", snapshot_json: str = "original") -> None:
@@ -1127,6 +1158,95 @@ def test_round5_meaningful_schema_drift_remains_rejected_before_version_stamp(
         unexpected.engine.dispose()
 
     _assert_legacy_data_unchanged(db_path)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["managed_check_is_null", "partial_index_is_null"],
+)
+def test_round6_keyword_operand_parentheses_survive_legacy_migration_and_current_reopen(
+    tmp_path: Path,
+    variant: str,
+):
+    db_path = _materialize_legacy_database(tmp_path, f"round6-equivalent-{variant}.sqlite")
+    with sqlite3.connect(db_path) as connection:
+        object_type, object_name = _install_round6_keyword_parentheses_variant(connection, variant)
+
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+    assert _version(db_path) == TARGET_VERSION
+
+    with sqlite3.connect(db_path) as connection:
+        persisted_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type, object_name),
+        ).fetchone()[0]
+    assert "IS (NULL)" in persisted_sql
+
+    reopened = _open_manager(db_path)
+    reopened.engine.dispose()
+    with sqlite3.connect(db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+                (object_type, object_name),
+            ).fetchone()[0]
+            == persisted_sql
+        )
+
+
+@pytest.mark.parametrize(
+    ("canonical_sql", "equivalent_sql"),
+    [
+        ("evidence_hash IS NULL", "evidence_hash IS (NULL)"),
+        ("evidence_hash IS NOT NULL", "evidence_hash IS NOT (NULL)"),
+        ("state GLOB 'F*'", "state GLOB ('F*')"),
+        ("state NOT GLOB 'F*'", "state NOT GLOB ('F*')"),
+        ("revision BETWEEN 1 AND 3", "revision BETWEEN (1) AND (3)"),
+        ("is_valid AND is_ready", "is_valid AND (is_ready)"),
+        ("is_valid OR is_ready", "is_valid OR (is_ready)"),
+        ("NOT is_valid", "NOT (is_valid)"),
+        ("name LIKE 'a%' ESCAPE '_'", "name LIKE ('a%') ESCAPE ('_')"),
+    ],
+)
+def test_round6_atomic_parentheses_are_normalized_after_keyword_operators(
+    canonical_sql: str,
+    equivalent_sql: str,
+):
+    assert persistence_module._normalize_sql(equivalent_sql) == persistence_module._normalize_sql(canonical_sql)
+
+
+@pytest.mark.parametrize(
+    ("with_parentheses", "without_parentheses"),
+    [
+        ("custom_function(value)", "custom_function value"),
+        ("glob(value)", "glob value"),
+        ("value IN ('ETF')", "value IN 'ETF'"),
+        ("EXISTS (SELECT 1)", "EXISTS SELECT 1"),
+        ("value = (SELECT 1)", "value = SELECT 1"),
+        ("left_value + (middle_value * right_value)", "left_value + middle_value * right_value"),
+    ],
+)
+def test_round6_grammar_significant_parentheses_remain_distinct(
+    with_parentheses: str,
+    without_parentheses: str,
+):
+    assert persistence_module._normalize_sql(with_parentheses) != persistence_module._normalize_sql(without_parentheses)
+
+
+def test_round6_trigger_body_parentheses_remain_token_significant():
+    parenthesized_body = """
+        CREATE TRIGGER preserve_body_parentheses
+        BEFORE UPDATE ON LeveragedEtfExecutorSnapshot
+        BEGIN
+            SELECT (1);
+        END
+    """
+    unparenthesized_body = parenthesized_body.replace("SELECT (1)", "SELECT 1")
+
+    assert persistence_module._normalize_trigger_sql(parenthesized_body) != persistence_module._normalize_trigger_sql(
+        unparenthesized_body
+    )
 
 
 OR_REPLACE_CASES = [
