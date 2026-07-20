@@ -53,6 +53,7 @@ _BINANCE_EXECUTION_STATUS_UNKNOWN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _BINANCE_AMBIGUOUS_SUBMISSION_CODES = {-1007, -1006}
+_BINANCE_AUTHORITATIVE_REJECTION_CODES = {-2010}
 
 
 def _binance_error_code(failure: Any) -> Optional[int]:
@@ -101,7 +102,7 @@ def classify_binance_order_submission_failure(
     error_code = _binance_error_code(failure)
     if error_code in _BINANCE_AMBIGUOUS_SUBMISSION_CODES:
         return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
-    if error_code is not None:
+    if error_code in _BINANCE_AUTHORITATIVE_REJECTION_CODES:
         return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
     if _has_explicit_unknown_execution_status(failure):
         return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
@@ -129,6 +130,8 @@ def classify_binance_order_submission_failure(
             status = int(match.group("status"))
 
     if status is not None and 400 <= status < 500 and status != 408:
+        return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
+    if status is None and isinstance(failure, Mapping) and "code" in failure:
         return BinancePerpetualOrderSubmissionFailureKind.AUTHORITATIVE_REJECTION
     return BinancePerpetualOrderSubmissionFailureKind.AMBIGUOUS_AFTER_DISPATCH
 
