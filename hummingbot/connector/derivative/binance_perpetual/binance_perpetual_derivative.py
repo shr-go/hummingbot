@@ -78,6 +78,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     LONG_POLL_INTERVAL = 120.0
     MAX_ACCOUNT_DATA_AGE_SECONDS = 5
     MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS = 128
+    # Position V3 positionAmt and markPrice already define USD-M notional; exchangeInfo contractSize is not reapplied.
+    USD_M_POSITION_NOTIONAL_AMOUNT_MULTIPLIER = Decimal("1")
     # The tracker also quantizes remaining base to 1e-8 after applying an exact fill.
     UNKNOWN_STREAM_TRACKER_DECIMAL_PRECISION = 3 * MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
     UNKNOWN_STREAM_TRACKER_DECIMAL_EXPONENT_LIMIT = 2 * MAX_UNKNOWN_STREAM_EXACT_DECIMAL_DIGITS
@@ -1127,6 +1129,16 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         except BinancePerpetualRiskDataError as exc:
             raise BinancePerpetualPreflightError(
                 "authoritative account or position facts violate economic domains"
+            ) from exc
+        try:
+            for position in positions:
+                position.validate_notional_magnitude(
+                    position_amount_multiplier=self.USD_M_POSITION_NOTIONAL_AMOUNT_MULTIPLIER,
+                    tolerance=consistency_tolerance,
+                )
+        except BinancePerpetualRiskDataError as exc:
+            raise BinancePerpetualPreflightError(
+                "authoritative Position V3 notional magnitude is inconsistent"
             ) from exc
         account_config = await authoritative_fetch(
             "account configuration", self.get_account_config()

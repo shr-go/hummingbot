@@ -15,6 +15,9 @@ class BinancePerpetualPreflightError(BinancePerpetualRiskDataError):
     """Raised when authoritative account preflight cannot prove a safe state."""
 
 
+_MAX_NOTIONAL_EXACT_DECIMAL_DIGITS = 128
+
+
 def _mapping(value: Any, context: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise BinancePerpetualRiskDataError(f"{context} must be an object")
@@ -118,6 +121,64 @@ def _validate_maintenance_margin_relationship(
         raise BinancePerpetualRiskDataError(
             f"{context}.maintMargin must not exceed initialMargin"
         )
+
+
+def _exact_decimal_components(value: Decimal, field: str) -> Tuple[int, int]:
+    _validate_decimal_value(value, field)
+    sign, digits, exponent = value.as_tuple()
+    if (
+            not isinstance(exponent, int)
+            or len(digits) > _MAX_NOTIONAL_EXACT_DECIMAL_DIGITS
+            or abs(exponent) > _MAX_NOTIONAL_EXACT_DECIMAL_DIGITS
+    ):
+        raise BinancePerpetualRiskDataError(f"{field} exceeds supported exact decimal precision")
+    coefficient = 0
+    for digit in digits:
+        coefficient = coefficient * 10 + digit
+    if coefficient == 0:
+        return 0, 0
+    if sign:
+        coefficient = -coefficient
+    while coefficient % 10 == 0:
+        coefficient //= 10
+        exponent += 1
+    return coefficient, exponent
+
+
+def _exact_decimal_product_components(
+        values: Sequence[Tuple[Decimal, str]],
+) -> Tuple[int, int]:
+    components = tuple(
+        _exact_decimal_components(value, field)
+        for value, field in values
+    )
+    if any(coefficient == 0 for coefficient, _ in components):
+        return 0, 0
+    coefficient = 1
+    exponent = 0
+    for value_coefficient, value_exponent in components:
+        coefficient *= value_coefficient
+        exponent += value_exponent
+    return coefficient, exponent
+
+
+def _decimal_distance_within_tolerance(
+        left: Decimal,
+        right_components: Tuple[int, int],
+        tolerance: Decimal,
+        context: str,
+) -> bool:
+    left_coefficient, left_exponent = _exact_decimal_components(left, f"{context}.notional")
+    tolerance_coefficient, tolerance_exponent = _exact_decimal_components(
+        tolerance,
+        f"{context}.notional tolerance",
+    )
+    right_coefficient, right_exponent = right_components
+    common_exponent = min(left_exponent, right_exponent, tolerance_exponent)
+    left_scaled = left_coefficient * 10 ** (left_exponent - common_exponent)
+    right_scaled = right_coefficient * 10 ** (right_exponent - common_exponent)
+    tolerance_scaled = tolerance_coefficient * 10 ** (tolerance_exponent - common_exponent)
+    return abs(left_scaled - right_scaled) <= tolerance_scaled
 
 
 def _validate_position_identity_and_notional(
@@ -637,6 +698,39 @@ class BinancePerpetualPositionRiskSnapshot:
             raise BinancePerpetualRiskDataError(f"{context}.adl must be between 0 and 4")
         _validate_non_negative_integer_value(self.update_time_ms, f"{context}.updateTime")
         _data_time(self.data_time)
+
+    def validate_notional_magnitude(
+            self,
+            *,
+            position_amount_multiplier: Decimal,
+            tolerance: Decimal,
+            context: str = "Position Information V3",
+    ) -> None:
+        self.validate(context)
+        _validate_decimal_value(
+            position_amount_multiplier,
+            f"{context}.position amount multiplier",
+            positive=True,
+        )
+        _validate_decimal_value(
+            tolerance,
+            f"{context}.notional tolerance",
+            non_negative=True,
+        )
+        expected_notional = _exact_decimal_product_components((
+            (self.position_amount, f"{context}.positionAmt"),
+            (self.mark_price, f"{context}.markPrice"),
+            (position_amount_multiplier, f"{context}.position amount multiplier"),
+        ))
+        if not _decimal_distance_within_tolerance(
+                left=self.notional,
+                right_components=expected_notional,
+                tolerance=tolerance,
+                context=context,
+        ):
+            raise BinancePerpetualRiskDataError(
+                f"{context} signed notional magnitude contradicts position amount and mark price"
+            )
 
     @classmethod
     def from_payload(

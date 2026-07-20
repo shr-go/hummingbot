@@ -339,6 +339,10 @@ class BinancePerpetualOrderSnapshot:
             cumulative_quote_quantity,
         )):
             raise BinancePerpetualOrderDataError("order reconciliation quantities and prices must be non-negative")
+        if order_type is OrderType.LIMIT and price <= 0:
+            raise BinancePerpetualOrderDataError("LIMIT order reconciliation price must be positive")
+        if order_type is OrderType.MARKET and price != 0:
+            raise BinancePerpetualOrderDataError("MARKET order reconciliation price must use the zero sentinel")
         if original_quantity == 0:
             raise BinancePerpetualOrderDataError("order reconciliation original quantity must be positive")
         if executed_quantity > original_quantity:
