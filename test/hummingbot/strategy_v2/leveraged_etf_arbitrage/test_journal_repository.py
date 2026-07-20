@@ -353,7 +353,7 @@ def test_fill_identity_is_deduplicated_and_out_of_order_snapshot_is_rejected(
         ),
         created_at_utc=UPDATED_AT,
     )
-    filled_snapshot = _snapshot_at(prepared, 2, "MAKER_PARTIALLY_FILLED")
+    filled_snapshot = _snapshot_at(prepared, 2, "STOCK_HEDGE_PENDING")
     committed = repository.append_and_reduce(initial.executor_id, fill, filled_snapshot)
     duplicate_fill = JournalEventV1.model_validate(
         {
