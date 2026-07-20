@@ -35,6 +35,7 @@ SERVER_TIME_PATH_URL = "v1/time"
 
 # Private API v1 Endpoints
 ORDER_URL = "v1/order"
+OPEN_ORDERS_URL = "v1/openOrders"
 CANCEL_ALL_OPEN_ORDERS_URL = "v1/allOpenOrders"
 ACCOUNT_TRADE_LIST_URL = "v1/userTrades"
 SET_LEVERAGE_URL = "v1/leverage"
@@ -47,6 +48,7 @@ SYMBOL_CONFIG_URL = "v1/symbolConfig"
 
 POST_POSITION_MODE_LIMIT_ID = f"POST{CHANGE_POSITION_MODE_URL}"
 GET_POSITION_MODE_LIMIT_ID = f"GET{CHANGE_POSITION_MODE_URL}"
+GET_ORDER_LIMIT_ID = f"GET{ORDER_URL}"
 
 # Private API v2 Endpoints
 ACCOUNT_INFO_URL = "v2/account"
@@ -117,6 +119,10 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1),
                              LinkedLimitWeightPair(ORDERS_1MIN, weight=1),
                              LinkedLimitWeightPair(ORDERS_1SEC, weight=1)]),
+    RateLimit(limit_id=GET_ORDER_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
+    RateLimit(limit_id=OPEN_ORDERS_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
     RateLimit(limit_id=CANCEL_ALL_OPEN_ORDERS_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
     RateLimit(limit_id=ACCOUNT_TRADE_LIST_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,

@@ -1,6 +1,5 @@
 import asyncio
 import math
-import time
 from collections import defaultdict
 from decimal import Decimal
 from typing import Any, AsyncIterable, Collection, Dict, List, Optional, Tuple
@@ -16,6 +15,15 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_api_ord
     BinancePerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_auth import BinancePerpetualAuth
+from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_order_data import (
+    BinancePerpetualOrderDataError,
+    BinancePerpetualOrderSnapshot,
+    BinancePerpetualOrderSubmissionUnknown,
+    BinancePerpetualOrderStatus,
+    BinancePerpetualTrade,
+    validate_binance_client_order_id,
+    validate_binance_exchange_order_id,
+)
 from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_risk_data import (
     BinancePerpetualAccountConfig,
     BinancePerpetualAccountRiskSnapshot,
@@ -76,6 +84,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         self._position_mode = None
         self._leverage_bracket_cache: Dict[str, BinancePerpetualLeverageBrackets] = {}
         self._last_trade_history_timestamp = None
+        self._unknown_submission_order_ids = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -137,6 +146,15 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         """
         return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
+    def _validate_preallocated_client_order_id_format(self, client_order_id: str) -> None:
+        validate_binance_client_order_id(
+            client_order_id=client_order_id,
+            max_length=self.client_order_id_max_length,
+        )
+
+    def is_order_submission_unknown(self, client_order_id: str) -> bool:
+        return client_order_id in self._unknown_submission_order_ids
+
     def supported_position_modes(self):
         """
         This method needs to be overridden to provide the accurate information depending on the exchange.
@@ -166,24 +184,175 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         )
         return BinancePerpetualAccountRiskSnapshot.from_payload(response, self.current_timestamp)
 
+    async def _reconciliation_api_get(self, context: str, **request_kwargs) -> Any:
+        try:
+            return await self._api_get(**request_kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise BinancePerpetualOrderDataError(f"{context} request failed") from None
+
+    async def get_order_status_by_client_order_id(
+            self,
+            trading_pair: str,
+            client_order_id: str,
+    ) -> BinancePerpetualOrderSnapshot:
+        validate_binance_client_order_id(client_order_id)
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._reconciliation_api_get(
+            context="order status",
+            path_url=CONSTANTS.ORDER_URL,
+            params={"symbol": symbol, "origClientOrderId": client_order_id},
+            is_auth_required=True,
+            return_err=True,
+            limit_id=CONSTANTS.GET_ORDER_LIMIT_ID,
+        )
+        data_time = self.current_timestamp
+        if isinstance(response, dict) and "code" in response:
+            if response.get("code") == CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE:
+                return BinancePerpetualOrderSnapshot.not_found(
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    trading_pair=trading_pair,
+                    data_time=data_time,
+                )
+            raise BinancePerpetualOrderDataError("order status response contains an exchange error")
+
+        fact = BinancePerpetualOrderSnapshot.from_payload(
+            payload=response,
+            expected_symbol=symbol,
+            trading_pair=trading_pair,
+            expected_client_order_id=client_order_id,
+            data_time=data_time,
+        )
+        self._unknown_submission_order_ids.discard(client_order_id)
+        return fact
+
+    async def get_open_orders(
+            self,
+            trading_pair: str,
+    ) -> Tuple[BinancePerpetualOrderSnapshot, ...]:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._reconciliation_api_get(
+            context="open orders",
+            path_url=CONSTANTS.OPEN_ORDERS_URL,
+            params={"symbol": symbol},
+            is_auth_required=True,
+        )
+        if not isinstance(response, list):
+            raise BinancePerpetualOrderDataError("open orders response must be an array")
+
+        data_time = self.current_timestamp
+        facts_by_client_order_id: Dict[str, BinancePerpetualOrderSnapshot] = {}
+        client_order_id_by_exchange_order_id: Dict[str, str] = {}
+        for payload in response:
+            fact = BinancePerpetualOrderSnapshot.from_payload(
+                payload=payload,
+                expected_symbol=symbol,
+                trading_pair=trading_pair,
+                data_time=data_time,
+            )
+            if fact.status not in {
+                BinancePerpetualOrderStatus.NEW,
+                BinancePerpetualOrderStatus.PARTIALLY_FILLED,
+            }:
+                raise BinancePerpetualOrderDataError("open orders response contains a non-open order")
+
+            existing_fact = facts_by_client_order_id.get(fact.client_order_id)
+            if existing_fact is not None:
+                if existing_fact != fact:
+                    raise BinancePerpetualOrderDataError("conflicting client order ID in open orders response")
+                continue
+
+            existing_client_order_id = client_order_id_by_exchange_order_id.get(fact.exchange_order_id)
+            if existing_client_order_id is not None and existing_client_order_id != fact.client_order_id:
+                raise BinancePerpetualOrderDataError("conflicting exchange order ID in open orders response")
+            facts_by_client_order_id[fact.client_order_id] = fact
+            client_order_id_by_exchange_order_id[fact.exchange_order_id] = fact.client_order_id
+
+        return tuple(
+            facts_by_client_order_id[client_order_id]
+            for client_order_id in sorted(facts_by_client_order_id)
+        )
+
+    async def get_account_trades(
+            self,
+            trading_pair: str,
+            exchange_order_id: Optional[str] = None,
+    ) -> Tuple[BinancePerpetualTrade, ...]:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        params = {"symbol": symbol}
+        if exchange_order_id is not None:
+            exchange_order_id = validate_binance_exchange_order_id(exchange_order_id)
+            params["orderId"] = exchange_order_id
+        response = await self._reconciliation_api_get(
+            context="account trades",
+            path_url=CONSTANTS.ACCOUNT_TRADE_LIST_URL,
+            params=params,
+            is_auth_required=True,
+        )
+        if not isinstance(response, list):
+            raise BinancePerpetualOrderDataError("account trades response must be an array")
+
+        data_time = self.current_timestamp
+        facts_by_trade_id: Dict[str, BinancePerpetualTrade] = {}
+        for payload in response:
+            fact = BinancePerpetualTrade.from_payload(
+                payload=payload,
+                expected_symbol=symbol,
+                trading_pair=trading_pair,
+                expected_exchange_order_id=exchange_order_id,
+                data_time=data_time,
+            )
+            existing_fact = facts_by_trade_id.get(fact.trade_id)
+            if existing_fact is not None:
+                if existing_fact != fact:
+                    raise BinancePerpetualOrderDataError("conflicting trade ID in account trades response")
+                continue
+            facts_by_trade_id[fact.trade_id] = fact
+
+        return tuple(sorted(
+            facts_by_trade_id.values(),
+            key=lambda fact: (fact.timestamp_ms, len(fact.trade_id), fact.trade_id),
+        ))
+
     async def get_position_risk_snapshots(
             self,
             trading_pair: Optional[str] = None,
     ) -> Tuple[BinancePerpetualPositionRiskSnapshot, ...]:
         params = None
+        expected_symbol = None
         if trading_pair is not None:
-            params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair)}
-        response = await self._api_get(
-            path_url=CONSTANTS.POSITION_INFORMATION_V3_URL,
-            params=params,
-            is_auth_required=True,
-        )
+            expected_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+            params = {"symbol": expected_symbol}
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.POSITION_INFORMATION_V3_URL,
+                params=params,
+                is_auth_required=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise BinancePerpetualRiskDataError("Position Information V3 request failed") from None
         if not isinstance(response, list):
             raise BinancePerpetualRiskDataError("Position Information V3 response must be an array")
         data_time = self.current_timestamp
+        facts_by_key: Dict[Tuple[str, str], BinancePerpetualPositionRiskSnapshot] = {}
+        for payload in response:
+            fact = BinancePerpetualPositionRiskSnapshot.from_payload(payload, data_time)
+            if expected_symbol is not None and fact.symbol != expected_symbol:
+                raise BinancePerpetualRiskDataError("Position Information V3 symbol does not match request")
+            key = (fact.symbol, fact.position_side)
+            existing_fact = facts_by_key.get(key)
+            if existing_fact is not None:
+                if existing_fact != fact:
+                    raise BinancePerpetualRiskDataError("conflicting position in Position Information V3 response")
+                continue
+            facts_by_key[key] = fact
         return tuple(
-            BinancePerpetualPositionRiskSnapshot.from_payload(position, data_time)
-            for position in response
+            facts_by_key[key]
+            for key in sorted(facts_by_key)
         )
 
     async def get_account_config(self) -> BinancePerpetualAccountConfig:
@@ -766,6 +935,14 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
             **kwargs,
     ) -> Tuple[str, float]:
 
+        post_only = kwargs.get("post_only", False)
+        if type(post_only) is not bool:
+            raise ValueError("post-only flag must be a boolean")
+        if post_only and order_type is OrderType.MARKET:
+            raise ValueError("post-only order cannot use MARKET order type")
+        if post_only and order_type is not OrderType.LIMIT_MAKER:
+            raise ValueError("post-only order must use LIMIT_MAKER order type")
+
         amount_str = f"{amount:f}"
         price_str = f"{price:f}"
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -797,16 +974,57 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 is_auth_required=True)
             o_id = str(order_result["orderId"])
             transact_time = order_result["updateTime"] * 1e-3
+            self._unknown_submission_order_ids.discard(order_id)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self._unknown_submission_order_ids.add(order_id)
+            raise BinancePerpetualOrderSubmissionUnknown(order_id) from None
         except IOError as e:
             error_description = str(e)
             is_server_overloaded = ("status is 503" in error_description
                                     and "Unknown error, please check your request or try again later." in error_description)
             if is_server_overloaded:
-                o_id = "UNKNOWN"
-                transact_time = time.time()
-            else:
-                raise
+                self._unknown_submission_order_ids.add(order_id)
+                raise BinancePerpetualOrderSubmissionUnknown(order_id) from None
+            raise
         return o_id, transact_time
+
+    def _on_order_failure(
+            self,
+            order_id: str,
+            trading_pair: str,
+            amount: Decimal,
+            trade_type: TradeType,
+            order_type: OrderType,
+            price: Optional[Decimal],
+            exception: Exception,
+            **kwargs,
+    ):
+        if isinstance(exception, BinancePerpetualOrderSubmissionUnknown):
+            self._unknown_submission_order_ids.add(order_id)
+            self.logger().warning(
+                f"Submission outcome is unknown for order {order_id}; reconcile it before any retry."
+            )
+            return
+        super()._on_order_failure(
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            trade_type=trade_type,
+            order_type=order_type,
+            price=price,
+            exception=exception,
+            **kwargs,
+        )
+
+    async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
+        if self.is_order_submission_unknown(order.client_order_id):
+            self.logger().debug(
+                f"Order {order.client_order_id} remains submission-unknown after a status polling error."
+            )
+            return
+        await super()._handle_update_error_for_active_order(order=order, error=error)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
@@ -861,7 +1079,8 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                 "symbol": trading_pair,
                 "origClientOrderId": tracked_order.client_order_id
             },
-            is_auth_required=True)
+            is_auth_required=True,
+            limit_id=CONSTANTS.GET_ORDER_LIMIT_ID)
         if "code" in order_update:
             if self._is_request_exception_related_to_time_synchronizer(request_exception=order_update):
                 _order_update = OrderUpdate(
@@ -871,6 +1090,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
                     client_order_id=tracked_order.client_order_id,
                 )
                 return _order_update
+        self._unknown_submission_order_ids.discard(tracked_order.client_order_id)
         _order_update: OrderUpdate = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
 
@@ -914,6 +1134,7 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         if event_type == "ORDER_TRADE_UPDATE":
             order_message = event_message.get("o")
             client_order_id = order_message.get("c", None)
+            self._unknown_submission_order_ids.discard(client_order_id)
             tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
             if tracked_order is not None:
                 trade_id: str = str(order_message["t"])
