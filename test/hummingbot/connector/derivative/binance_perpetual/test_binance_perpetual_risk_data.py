@@ -890,6 +890,13 @@ class BinancePerpetualRiskDataTest(IsolatedAsyncioWrapperTestCase):
                 entryPrice="0",
                 breakEvenPrice="0",
                 markPrice="0",
+                unRealizedProfit="0",
+                isolatedMargin="0",
+                isolatedWallet="0",
+                initialMargin="0",
+                maintMargin="0",
+                positionInitialMargin="0",
+                openOrderInitialMargin="0",
             ),
             self.data_time,
         )

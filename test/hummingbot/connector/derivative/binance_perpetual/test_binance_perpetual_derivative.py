@@ -4214,6 +4214,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             position_action=PositionAction.OPEN,
             price=Decimal("10000"),
         )
+        await asyncio.sleep(0.001)
 
         tracked_order = self.exchange._order_tracker.all_orders[client_order_id]
         self.assertEqual(OrderState.FAILED, tracked_order.current_state)
