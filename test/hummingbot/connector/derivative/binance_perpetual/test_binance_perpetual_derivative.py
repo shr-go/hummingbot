@@ -2712,6 +2712,7 @@ class BinancePerpetualDerivativeUnitTest(IsolatedAsyncioWrapperTestCase):
             with self.subTest(price=price):
                 client_order_id = f"risk-status-limit-price-{index}"
                 tracked_order = self._track_submission_unknown_order(client_order_id)
+                tracked_order.price = Decimal(price)
                 payload = self._get_reconciliation_order(
                     client_order_id=client_order_id,
                     exchange_order_id=8886820 + index,
