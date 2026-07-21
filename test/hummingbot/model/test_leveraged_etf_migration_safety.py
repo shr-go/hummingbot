@@ -27,7 +27,7 @@ from hummingbot.model.leveraged_etf_persistence import (
 )
 from hummingbot.model.sql_connection_manager import DatabaseMigrationError, SQLConnectionManager, SQLConnectionType
 
-TARGET_VERSION = "20260721"
+TARGET_VERSION = "20260722"
 LEGACY_VERSION = "20230516"
 LEGACY_FIXTURE = Path(__file__).with_name("fixtures") / "leveraged_etf_legacy_20230516.sql"
 HASH_A = "a" * 64

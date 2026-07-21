@@ -12,10 +12,11 @@ from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.model.sql_connection_manager import DatabaseMigrationError, SQLConnectionManager, SQLConnectionType
 
-TARGET_VERSION = "20260721"
+TARGET_VERSION = "20260722"
 TARGET_TABLES = {
     "LeveragedEtfAnchorRevisionObservation",
     "LeveragedEtfAnchorState",
+    "LeveragedEtfExposureEpisodeAudit",
     "LeveragedEtfExecutorSnapshot",
     "LeveragedEtfJournalEvent",
     "LeveragedEtfStrategyReservation",
@@ -510,6 +511,52 @@ def test_fresh_database_registers_versioned_tables_constraints_and_indexes(tmp_p
         assert observation_foreign_keys[0]["referred_columns"] == ["pair_id", "cycle_id"]
     finally:
         manager.engine.dispose()
+
+
+def test_t005_previous_final_database_adds_episode_audit_without_data_loss(tmp_path: Path):
+    """The deployed 20260721 schema must migrate instead of failing current-version validation."""
+
+    db_path = tmp_path / "previous-final-20260721.sqlite"
+    bootstrap = _open_manager(db_path)
+    bootstrap.engine.dispose()
+
+    with sqlite3.connect(db_path) as connection:
+        for trigger_name in (
+            "lepf_snapshot_episode_referenced_no_delete",
+            "lepf_episode_executor_fk_insert",
+            "lepf_episode_identity_insert",
+            "lepf_episode_no_update",
+            "lepf_episode_no_delete",
+        ):
+            connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+        connection.execute('DROP TABLE IF EXISTS "LeveragedEtfExposureEpisodeAudit"')
+        connection.execute(
+            "UPDATE Metadata SET value = '20260721' WHERE key = 'local_db_version'"
+        )
+        connection.execute(
+            "INSERT INTO Metadata (key, value) VALUES ('t005_previous_final_sentinel', 'preserve-me')"
+        )
+
+    migrated = _open_manager(db_path)
+    try:
+        assert _database_version(migrated) == TARGET_VERSION
+        assert "LeveragedEtfExposureEpisodeAudit" in _table_names(migrated)
+        with migrated.engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT value FROM Metadata WHERE key = 't005_previous_final_sentinel'")
+            ).scalar_one() == "preserve-me"
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM LeveragedEtfExposureEpisodeAudit")
+            ).scalar_one() == 0
+    finally:
+        migrated.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        assert _database_version(reopened) == TARGET_VERSION
+        assert "LeveragedEtfExposureEpisodeAudit" in _table_names(reopened)
+    finally:
+        reopened.engine.dispose()
 
 
 def test_real_legacy_database_migrates_without_data_loss_and_reopens(tmp_path: Path):
