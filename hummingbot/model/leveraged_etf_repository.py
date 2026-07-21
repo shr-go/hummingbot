@@ -38,6 +38,8 @@ _ANCHOR_PAIR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _ANCHOR_CYCLE_ID_PATTERN = re.compile(r"^xnys-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _ANCHOR_PAYLOAD_KIND_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_CURRENT_REDUCER_SEMANTICS_VERSION = 3
+_SUPPORTED_REDUCER_SEMANTICS_VERSIONS = frozenset({1, 2, 3})
 _TERMINAL_EXECUTOR_STATES = frozenset(
     {
         LeveragedEtfPairState.COMPLETED,
@@ -1274,6 +1276,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         )
         legacy_zero_fill = any(
             mutation.legacy_without_evidence_state
+            and mutation.reducer_semantics_version in {None, 1}
             and isinstance(mutation.committed.event.payload, ReconciliationJournalPayloadV1)
             and mutation.committed.event.payload.order_cumulative_filled_quantity == 0
             and mutation.committed.event.payload.outcome
@@ -1310,7 +1313,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 raise ValueError("journal mutation envelope is invalid")
             reducer_semantics_version = mutation.get("reducer_semantics_version")
             if reducer_semantics_version is not None and (
-                type(reducer_semantics_version) is not int or reducer_semantics_version not in {1, 2}
+                type(reducer_semantics_version) is not int
+                or reducer_semantics_version not in _SUPPORTED_REDUCER_SEMANTICS_VERSIONS
             ):
                 raise ValueError("journal reducer semantics version is invalid")
             raw_event = mutation["event"]
@@ -1406,8 +1410,10 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             event_is_legacy_reconciliation = mutation.legacy_without_evidence_state
             if mutation.reducer_semantics_version is None:
                 use_legacy_semantics = legacy_prefix or event_is_legacy_reconciliation
+                effective_reducer_semantics_version = 1
             else:
                 use_legacy_semantics = mutation.reducer_semantics_version == 1
+                effective_reducer_semantics_version = mutation.reducer_semantics_version
             if use_legacy_semantics and event_is_legacy_reconciliation:
                 legacy_reconciliation_event_ids.add(event.event_id)
             legacy_terminal_event_ids = (
@@ -1423,6 +1429,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 event,
                 tuple(prior),
                 legacy_terminal_event_ids=legacy_terminal_event_ids,
+                reducer_semantics_version=effective_reducer_semantics_version,
             )
             if mutation.snapshot_after != expected:
                 raise JournalIntegrityError("persisted journal snapshot disagrees with authoritative event reduction")
@@ -2142,6 +2149,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         event: JournalEventV1,
         decoded: Tuple[_DecodedJournalMutation, ...],
         legacy_terminal_event_ids: frozenset[str] = frozenset(),
+        reducer_semantics_version: int = _CURRENT_REDUCER_SEMANTICS_VERSION,
     ) -> LeveragedEtfPairExecutorSnapshotV1:
         if event.created_at_utc < current.updated_at_utc:
             raise JournalIntegrityError("journal event timestamp moved backwards")
@@ -2205,6 +2213,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             event,
             decoded,
             legacy_terminal_event_ids=legacy_terminal_event_ids,
+            reducer_semantics_version=reducer_semantics_version,
         )
         serialized["state"] = state.value
         if state in _TERMINAL_EXECUTOR_STATES:
@@ -2395,6 +2404,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         event: JournalEventV1,
         decoded: Tuple[_DecodedJournalMutation, ...],
         legacy_terminal_event_ids: frozenset[str] = frozenset(),
+        reducer_semantics_version: int = _CURRENT_REDUCER_SEMANTICS_VERSION,
     ) -> LeveragedEtfPairState:
         source = current.state
         late_after_fill = cls._late_submission_fact(event) and any(
@@ -2569,7 +2579,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             and rollback_filled == 0
         )
         if event.event_type == JournalEventType.CANCEL_CONFIRMED:
-            if balanced and all_terminal and maker_filled == 0:
+            if reducer_semantics_version >= 3 and balanced and all_terminal and maker_filled == 0:
                 return LeveragedEtfPairState.ABORTED_NO_FILL
             return LeveragedEtfPairState.MAKER_CANCEL_PENDING
         if event.event_type == JournalEventType.HEDGE_CONFIRMED:
@@ -2612,6 +2622,10 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             if action == JournalSideEffect.ETF_MAKER:
                 if maker_filled > 0 and not balanced:
                     return LeveragedEtfPairState.STOCK_HEDGE_PENDING
+                if reducer_semantics_version < 3:
+                    if source == LeveragedEtfPairState.MAKER_CANCEL_PENDING and all_terminal and maker_filled == 0:
+                        return LeveragedEtfPairState.ABORTED_NO_FILL
+                    return LeveragedEtfPairState.MAKER_WORKING
                 if (
                     all_terminal
                     and maker_filled == 0
@@ -2645,6 +2659,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                     if balanced and all_terminal
                     else LeveragedEtfPairState.ETF_ROLLBACK_PENDING
                 )
+            if reducer_semantics_version < 3:
+                return LeveragedEtfPairState.MAKER_CANCEL_PENDING
             if balanced and all_terminal and maker_filled == 0:
                 return LeveragedEtfPairState.ABORTED_NO_FILL
             if source in {LeveragedEtfPairState.RECONCILING, LeveragedEtfPairState.RECOVERY_REQUIRED}:
@@ -2879,7 +2895,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             sequence = current.last_journal_sequence + 1
             mutation = {
                 "schema_version": 1,
-                "reducer_semantics_version": 2,
+                "reducer_semantics_version": _CURRENT_REDUCER_SEMANTICS_VERSION,
                 "event": event.model_dump(mode="json"),
                 "snapshot_before": current.model_dump(mode="json"),
                 "snapshot_before_hash": current.canonical_sha256(),
