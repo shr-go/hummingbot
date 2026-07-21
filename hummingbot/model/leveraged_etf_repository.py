@@ -417,7 +417,6 @@ class ReconciliationJournalPayloadV1(_IdentityJournalPayloadV1):
     order_cumulative_filled_quantity: CanonicalNonNegativeDecimal = Decimal("0")
     evidence_state: ReconciliationEvidenceState = ReconciliationEvidenceState.UNKNOWN
     proven_no_fill: Optional[ProvenNoFillEvidenceV1] = None
-    legacy_without_evidence_state: bool = Field(default=False, exclude=True, repr=False)
 
     @model_validator(mode="after")
     def validate_evidence_arm(self) -> ReconciliationJournalPayloadV1:
@@ -528,12 +527,10 @@ class JournalEventV1(CanonicalWireModel):
                 normalized.setdefault("final_order_cumulative_filled_quantity", legacy_cumulative)
             normalized.setdefault("final_order_cumulative_filled_quantity", "0")
         elif kind == "RECONCILIATION":
-            legacy_without_evidence_state = "evidence_state" not in normalized
             normalized.pop("legacy_without_evidence_state", None)
             normalized.pop("terminal", None)
             normalized.setdefault("exchange_order_id", value.get("exchange_order_id"))
             normalized.setdefault("order_cumulative_filled_quantity", "0")
-            normalized["legacy_without_evidence_state"] = legacy_without_evidence_state
         elif kind == "STATE_TRANSITION" and isinstance(legacy_state, Mapping):
             normalized.setdefault("target_state", legacy_state.get("state"))
         return {**value, "payload": normalized}
@@ -1081,6 +1078,7 @@ class _DecodedJournalMutation(NamedTuple):
     snapshot_before: LeveragedEtfPairExecutorSnapshotV1
     snapshot_after: LeveragedEtfPairExecutorSnapshotV1
     reducer_semantics_version: Optional[int]
+    legacy_without_evidence_state: bool
 
 
 class _ReconciliationEvidenceOwner(NamedTuple):
@@ -1234,7 +1232,6 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         if (
             event.event_id in legacy_terminal_event_ids
             and isinstance(event.payload, ReconciliationJournalPayloadV1)
-            and event.payload.legacy_without_evidence_state
         ):
             return event.payload.outcome in {
                 ReconciliationOutcome.FILLED,
@@ -1265,32 +1262,45 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         }
 
     @classmethod
-    def _authoritative_fill_reopens_legacy_no_fill(
+    def _legacy_no_fill_fact_reopens_terminal(
         cls,
         event: JournalEventV1,
         decoded: Tuple[_DecodedJournalMutation, ...],
     ) -> bool:
-        if not isinstance(event.payload, FillJournalPayloadV1) or event.intent_id is None:
+        if event.event_type not in {JournalEventType.ORDER_CREATED, JournalEventType.FILL} or event.intent_id is None:
             return False
         matching = tuple(
-            candidate
-            for candidate in cls._events_with_candidate(decoded)
-            if candidate.intent_id == event.intent_id
+            mutation for mutation in decoded if mutation.committed.event.intent_id == event.intent_id
         )
         legacy_zero_fill = any(
-            isinstance(candidate.payload, ReconciliationJournalPayloadV1)
-            and candidate.payload.legacy_without_evidence_state
-            and candidate.payload.order_cumulative_filled_quantity == 0
-            and candidate.payload.outcome
+            mutation.legacy_without_evidence_state
+            and isinstance(mutation.committed.event.payload, ReconciliationJournalPayloadV1)
+            and mutation.committed.event.payload.order_cumulative_filled_quantity == 0
+            and mutation.committed.event.payload.outcome
             in {
                 ReconciliationOutcome.CANCELED,
                 ReconciliationOutcome.EXPIRED,
                 ReconciliationOutcome.REJECTED,
                 ReconciliationOutcome.CONSISTENT_NO_FILL,
             }
-            for candidate in matching
+            for mutation in matching
         )
-        return legacy_zero_fill and not any(cls._event_terminal(candidate) for candidate in matching)
+        return legacy_zero_fill and not any(
+            cls._event_terminal(mutation.committed.event) for mutation in matching
+        )
+
+    @staticmethod
+    def _legacy_reconciliation_without_evidence_state(raw_event: Any) -> bool:
+        if not isinstance(raw_event, Mapping) or raw_event.get("event_type") != JournalEventType.RECONCILIATION.value:
+            return False
+        payload = raw_event.get("payload")
+        if isinstance(payload, Mapping) and {"payload_json", "payload_hash", "kind"} <= set(payload):
+            payload = CanonicalOpaquePayload.model_validate(payload).value()
+        return (
+            isinstance(payload, Mapping)
+            and payload.get("kind") == "RECONCILIATION"
+            and "evidence_state" not in payload
+        )
 
     @classmethod
     def _decode_event_row(cls, row: Mapping[str, Any]) -> _DecodedJournalMutation:
@@ -1303,7 +1313,9 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 type(reducer_semantics_version) is not int or reducer_semantics_version not in {1, 2}
             ):
                 raise ValueError("journal reducer semantics version is invalid")
-            event = JournalEventV1.model_validate(mutation["event"])
+            raw_event = mutation["event"]
+            legacy_without_evidence_state = cls._legacy_reconciliation_without_evidence_state(raw_event)
+            event = JournalEventV1.model_validate(raw_event)
             snapshot_before = LeveragedEtfPairExecutorSnapshotV1.model_validate(mutation["snapshot_before"])
             snapshot_after = LeveragedEtfPairExecutorSnapshotV1.model_validate(mutation["snapshot_after"])
             if snapshot_before.canonical_sha256() != mutation["snapshot_before_hash"]:
@@ -1343,6 +1355,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             snapshot_before=snapshot_before,
             snapshot_after=snapshot_after,
             reducer_semantics_version=reducer_semantics_version,
+            legacy_without_evidence_state=legacy_without_evidence_state,
         )
 
     @classmethod
@@ -1390,10 +1403,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             if mutation.snapshot_before != reduced:
                 raise JournalIntegrityError("journal snapshot hash chain diverges")
             event = mutation.committed.event
-            event_is_legacy_reconciliation = (
-                isinstance(event.payload, ReconciliationJournalPayloadV1)
-                and event.payload.legacy_without_evidence_state
-            )
+            event_is_legacy_reconciliation = mutation.legacy_without_evidence_state
             if mutation.reducer_semantics_version is None:
                 use_legacy_semantics = legacy_prefix or event_is_legacy_reconciliation
             else:
@@ -2032,6 +2042,51 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         )
 
     @classmethod
+    def _action_has_incomplete_intent_after(
+        cls,
+        decoded: Tuple[_DecodedJournalMutation, ...],
+        event: JournalEventV1,
+        action: JournalSideEffect,
+        legacy_terminal_event_ids: frozenset[str] = frozenset(),
+    ) -> bool:
+        by_intent: dict[str, list[JournalEventV1]] = {}
+        for candidate in cls._events_with_candidate(decoded, event):
+            identity = getattr(candidate.payload, "identity", None)
+            if candidate.intent_id is not None and identity is not None and identity.action == action:
+                by_intent.setdefault(candidate.intent_id, []).append(candidate)
+        return any(
+            not cls._intent_terminal(tuple(intent_events), legacy_terminal_event_ids)
+            for intent_events in by_intent.values()
+        )
+
+    @classmethod
+    def _terminal_cancel_targets_maker_after(
+        cls,
+        decoded: Tuple[_DecodedJournalMutation, ...],
+        event: JournalEventV1,
+        maker_intent_id: str,
+        legacy_terminal_event_ids: frozenset[str] = frozenset(),
+    ) -> bool:
+        by_cancel_intent: dict[str, list[JournalEventV1]] = {}
+        for candidate in cls._events_with_candidate(decoded, event):
+            identity = getattr(candidate.payload, "identity", None)
+            if (
+                candidate.intent_id is not None
+                and identity is not None
+                and identity.action == JournalSideEffect.CANCEL
+            ):
+                by_cancel_intent.setdefault(candidate.intent_id, []).append(candidate)
+        return any(
+            any(
+                isinstance(candidate.payload, CancelJournalPayloadV1)
+                and candidate.payload.target_intent_id == maker_intent_id
+                for candidate in intent_events
+            )
+            and cls._intent_terminal(tuple(intent_events), legacy_terminal_event_ids)
+            for intent_events in by_cancel_intent.values()
+        )
+
+    @classmethod
     def _exposure_totals(
         cls,
         decoded: Tuple[_DecodedJournalMutation, ...],
@@ -2347,8 +2402,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             for candidate in cls._events_with_candidate(decoded)
         )
         reopens_legacy_no_fill = (
-            source == LeveragedEtfPairState.ABORTED_NO_FILL
-            and cls._authoritative_fill_reopens_legacy_no_fill(event, decoded)
+            source in {LeveragedEtfPairState.ABORTED_NO_FILL, LeveragedEtfPairState.FAILED_SAFE}
+            and cls._legacy_no_fill_fact_reopens_terminal(event, decoded)
         )
         if source in _TERMINAL_EXECUTOR_STATES:
             if late_after_fill:
@@ -2469,10 +2524,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             )
         if event.event_type == JournalEventType.PREPARED:
             return pending_state[action]
-        if event.event_type in {
-            JournalEventType.CANCEL_REQUESTED,
-            JournalEventType.CANCEL_CONFIRMED,
-        }:
+        if event.event_type == JournalEventType.CANCEL_REQUESTED:
             return LeveragedEtfPairState.MAKER_CANCEL_PENDING
         if event.event_type == JournalEventType.HEDGE_REQUESTED:
             return LeveragedEtfPairState.STOCK_HEDGE_PENDING
@@ -2516,6 +2568,10 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             and stock_filled == current.stock_target_quantity
             and rollback_filled == 0
         )
+        if event.event_type == JournalEventType.CANCEL_CONFIRMED:
+            if balanced and all_terminal and maker_filled == 0:
+                return LeveragedEtfPairState.ABORTED_NO_FILL
+            return LeveragedEtfPairState.MAKER_CANCEL_PENDING
         if event.event_type == JournalEventType.HEDGE_CONFIRMED:
             if balanced and all_terminal and completely_filled:
                 return LeveragedEtfPairState.COMPLETED
@@ -2529,10 +2585,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 else LeveragedEtfPairState.RECOVERY_REQUIRED
             )
         if isinstance(payload, ReconciliationJournalPayloadV1):
-            legacy_replay = (
-                event.event_id in legacy_terminal_event_ids
-                and payload.legacy_without_evidence_state
-            )
+            legacy_replay = event.event_id in legacy_terminal_event_ids
             if legacy_replay and payload.outcome in {
                 ReconciliationOutcome.NOT_FOUND,
                 ReconciliationOutcome.UNKNOWN,
@@ -2559,8 +2612,26 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             if action == JournalSideEffect.ETF_MAKER:
                 if maker_filled > 0 and not balanced:
                     return LeveragedEtfPairState.STOCK_HEDGE_PENDING
-                if source == LeveragedEtfPairState.MAKER_CANCEL_PENDING and all_terminal and maker_filled == 0:
+                if (
+                    all_terminal
+                    and maker_filled == 0
+                    and cls._terminal_cancel_targets_maker_after(
+                        decoded,
+                        event,
+                        identity.intent_id,
+                        legacy_terminal_event_ids,
+                    )
+                ):
                     return LeveragedEtfPairState.ABORTED_NO_FILL
+                if cls._action_has_incomplete_intent_after(
+                    decoded,
+                    event,
+                    JournalSideEffect.CANCEL,
+                    legacy_terminal_event_ids,
+                ):
+                    if source in {LeveragedEtfPairState.RECONCILING, LeveragedEtfPairState.RECOVERY_REQUIRED}:
+                        return source
+                    return LeveragedEtfPairState.MAKER_CANCEL_PENDING
                 return LeveragedEtfPairState.MAKER_WORKING
             if action == JournalSideEffect.STOCK_HEDGE:
                 if balanced and all_terminal and completely_filled:
@@ -2574,6 +2645,10 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                     if balanced and all_terminal
                     else LeveragedEtfPairState.ETF_ROLLBACK_PENDING
                 )
+            if balanced and all_terminal and maker_filled == 0:
+                return LeveragedEtfPairState.ABORTED_NO_FILL
+            if source in {LeveragedEtfPairState.RECONCILING, LeveragedEtfPairState.RECOVERY_REQUIRED}:
+                return source
             return LeveragedEtfPairState.MAKER_CANCEL_PENDING
         raise JournalConflictError(f"unsupported authoritative reducer event {event.event_type.value}")
 
