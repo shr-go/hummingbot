@@ -17,6 +17,10 @@ from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor impo
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
+from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types import LeveragedEtfPairExecutorConfig
+from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.leveraged_etf_pair_executor import (
+    LeveragedEtfPairExecutor,
+)
 from hummingbot.strategy_v2.executors.lp_executor.lp_executor import LPExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
@@ -211,6 +215,7 @@ class ExecutorOrchestrator:
         "xemm_executor": XEMMExecutor,
         "order_executor": OrderExecutor,
         "lp_executor": LPExecutor,
+        "leveraged_etf_pair_executor": LeveragedEtfPairExecutor,
     }
 
     @classmethod
@@ -469,9 +474,14 @@ class ExecutorOrchestrator:
         controller_id = action.controller_id
         executor_config = action.executor_config
 
-        # For now, we replace the controller ID in the executor config with the actual controller object to mantain
-        # compa
-        executor_config.controller_id = controller_id
+        # Legacy executor configs are mutable.  The leveraged ETF pair config is
+        # deliberately frozen because it is persisted as a canonical F004 snapshot.
+        if isinstance(executor_config, LeveragedEtfPairExecutorConfig):
+            executor_config = executor_config.model_copy(update={"controller_id": controller_id})
+        else:
+            # For now, we replace the controller ID in the executor config with the actual controller object to mantain
+            # compa
+            executor_config.controller_id = controller_id
 
         executor_class = self._executor_mapping.get(executor_config.type)
         if executor_class is not None:

@@ -18,6 +18,12 @@ from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecut
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator, PositionHold
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
+from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types import (
+    LeverageReservationV1,
+    LeveragedEtfPairDirection,
+    LeveragedEtfPairExecutorConfig,
+    LeveragedEtfPairOperation,
+)
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
@@ -105,6 +111,62 @@ class TestExecutorOrchestrator(unittest.TestCase):
         ]
         self.orchestrator.execute_actions(actions)
         self.assertEqual(len(self.orchestrator.active_executors["test"]), 5)
+
+    def test_create_leveraged_etf_pair_executor_uses_runtime_mapping_without_mutating_frozen_config(self):
+        config = LeveragedEtfPairExecutorConfig(
+            id="f005-orchestrator-1",
+            timestamp=1721224862.0,
+            controller_id="controller-from-config",
+            schema_version=1,
+            pair_id="sndk_snxx",
+            nav_cycle_id="xnys-2026-07-17",
+            operation=LeveragedEtfPairOperation.OPEN,
+            direction=LeveragedEtfPairDirection.SHORT_ETF_LONG_STOCK,
+            etf_connector_name="binance_perpetual",
+            etf_trading_pair="SNXX-USDT",
+            stock_connector_name="binance_perpetual",
+            stock_trading_pair="SNDK-USDT",
+            s0="250",
+            l0="30",
+            h="0.24",
+            created_raw_bp="48.75",
+            created_net_bp="42.08",
+            target_gross_notional="10000",
+            etf_target_quantity="100",
+            stock_target_quantity="24",
+            leverage_reservation=LeverageReservationV1(
+                etf_quantity="100",
+                stock_quantity="24",
+                etf_leverage=20,
+                stock_leverage=20,
+                etf_notional_cap="1000000",
+                stock_notional_cap="1000000",
+            ),
+            config_hash="a" * 64,
+            created_at_utc="2026-07-17T14:01:02.000000Z",
+        )
+        executor_class = MagicMock()
+        executor_instance = executor_class.return_value
+
+        self.assertIn("leveraged_etf_pair_executor", ExecutorOrchestrator._executor_mapping)
+        with patch.dict(
+            ExecutorOrchestrator._executor_mapping,
+            {"leveraged_etf_pair_executor": executor_class},
+        ):
+            self.orchestrator.execute_action(
+                CreateExecutorAction(executor_config=config, controller_id="controller-from-action")
+            )
+
+        executor_class.assert_called_once()
+        created_config = executor_class.call_args.kwargs["config"]
+        self.assertEqual(config.controller_id, "controller-from-config")
+        self.assertEqual(created_config.controller_id, "controller-from-action")
+        self.assertIsNot(created_config, config)
+        executor_instance.start.assert_called_once()
+        self.assertEqual(
+            self.orchestrator.active_executors["controller-from-action"],
+            [executor_instance],
+        )
 
     def test_execute_actions_store_executor_active(self):
         position_executor = MagicMock(spec=PositionExecutor)
