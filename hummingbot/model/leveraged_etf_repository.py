@@ -2617,6 +2617,29 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except Exception as exception:
             raise AnchorIntegrityError(f"anchor {label} envelope integrity failure: {exception}") from exception
 
+    @staticmethod
+    def _revalidate_opaque_write_key(key: AnchorStorageKeyV2) -> AnchorStorageKeyV2:
+        if type(key) is not AnchorStorageKeyV2:
+            raise AnchorIntegrityError("pair-scoped anchor writes require an exact AnchorStorageKeyV2")
+        try:
+            if type(key.schema_version) is not int or key.schema_version != 2:
+                raise ValueError("anchor storage key schema_version must be the exact integer 2")
+            if type(key.pair_id) is not str:
+                raise ValueError("anchor storage key pair_id must be an exact string")
+            if type(key.cycle_id) is not str:
+                raise ValueError("anchor storage key cycle_id must be an exact string")
+            return AnchorStorageKeyV2.model_validate(
+                {
+                    "schema_version": key.schema_version,
+                    "pair_id": key.pair_id,
+                    "cycle_id": key.cycle_id,
+                }
+            )
+        except AnchorIntegrityError:
+            raise
+        except Exception as exception:
+            raise AnchorIntegrityError(f"anchor storage key integrity failure: {exception}") from exception
+
     @classmethod
     def _assert_key_matches(
         cls,
@@ -2626,10 +2649,18 @@ class PairScopedAnchorRepository(_TransactionalRepository):
             OpaqueAnchorFinalizedV2,
             OpaqueAnchorRevisionObservationV2,
         ],
-    ) -> None:
-        cls._require_key(key)
-        if state.key != key:
-            raise AnchorIntegrityError("anchor storage key does not match envelope pair/cycle identity")
+    ) -> AnchorStorageKeyV2:
+        supplied_key = cls._revalidate_opaque_write_key(key)
+        envelope_key = state.key
+        comparisons = (
+            (supplied_key.schema_version, envelope_key.schema_version),
+            (supplied_key.pair_id, envelope_key.pair_id),
+            (supplied_key.cycle_id, envelope_key.cycle_id),
+        )
+        for supplied_value, envelope_value in comparisons:
+            if type(supplied_value) is not type(envelope_value) or supplied_value != envelope_value:
+                raise AnchorIntegrityError("anchor storage key does not match envelope pair/cycle identity")
+        return envelope_key
 
     @staticmethod
     def _assert_anchor_identity(
@@ -2765,7 +2796,7 @@ class PairScopedAnchorRepository(_TransactionalRepository):
             OpaqueAnchorCheckpointV2,
             "checkpoint",
         )
-        self._assert_key_matches(key, checkpoint)
+        key = self._assert_key_matches(key, checkpoint)
         self._require_expected_revision(expected_revision, minimum=0)
         if checkpoint.revision != expected_revision + 1:
             raise AnchorRevisionConflict("checkpoint revision must be exactly expected_revision + 1")
@@ -2860,7 +2891,7 @@ class PairScopedAnchorRepository(_TransactionalRepository):
             OpaqueAnchorFinalizedV2,
             "finalized anchor",
         )
-        self._assert_key_matches(key, record)
+        key = self._assert_key_matches(key, record)
         self._require_expected_revision(expected_revision, minimum=1)
         if record.revision != expected_revision:
             raise AnchorRevisionConflict("final record revision must equal a positive expected checkpoint revision")
@@ -2939,7 +2970,7 @@ class PairScopedAnchorRepository(_TransactionalRepository):
             OpaqueAnchorRevisionObservationV2,
             "anchor revision observation",
         )
-        self._assert_key_matches(key, observation)
+        key = self._assert_key_matches(key, observation)
 
         def operation(connection: Connection) -> None:
             current = self._load_opaque_connection(connection, key)
