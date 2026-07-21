@@ -153,6 +153,37 @@ def _no_fill_proof(
     }
 
 
+def _downgrade_journal_to_20260721(db_path: Path, legacy_reconciliation_event_ids: set[str]) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER lepf_journal_no_update")
+        rows = connection.execute(
+            "SELECT event_id, payload_json FROM LeveragedEtfJournalEvent ORDER BY sequence"
+        ).fetchall()
+        for event_id, payload_json in rows:
+            mutation = json.loads(payload_json)
+            mutation.pop("reducer_semantics_version", None)
+            if event_id in legacy_reconciliation_event_ids:
+                legacy_payload = mutation["event"]["payload"]
+                legacy_payload.pop("evidence_state")
+                legacy_payload.pop("proven_no_fill")
+            rewritten_json, rewritten_hash = _canonical_json_hash(mutation)
+            connection.execute(
+                "UPDATE LeveragedEtfJournalEvent SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+                (rewritten_json, rewritten_hash, event_id),
+            )
+        connection.executescript(SQLITE_GUARD_DDL["lepf_journal_no_update"])
+        for trigger_name in (
+            "lepf_snapshot_episode_referenced_no_delete",
+            "lepf_episode_executor_fk_insert",
+            "lepf_episode_identity_insert",
+            "lepf_episode_no_update",
+            "lepf_episode_no_delete",
+        ):
+            connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+        connection.execute('DROP TABLE IF EXISTS "LeveragedEtfExposureEpisodeAudit"')
+        connection.execute("UPDATE Metadata SET value = '20260721' WHERE key = 'local_db_version'")
+
+
 def _require_reconciliation_contract():
     evidence_type = getattr(durable_contract, "ReconciliationEvidenceState", None)
     proof_type = getattr(durable_contract, "ProvenNoFillEvidenceV1", None)
@@ -651,6 +682,142 @@ def test_t005_proof_and_sweep_ids_cannot_be_reused_across_owner_scope(tmp_path: 
         manager.engine.dispose()
 
 
+def test_t005_sweep_id_cannot_be_reused_with_a_fresh_proof_id_and_no_exchange_order(tmp_path: Path):
+    manager = _open_manager(tmp_path / "sweep-owner-isolation.sqlite")
+    try:
+        repository = LeveragedEtfJournalRepository(manager)
+        first = _initial()
+        second_payload = _snapshot_for_executor(first, "exec-t005-sweep-second").model_dump(mode="json")
+        second_payload.update({"pair_id": "intc_intw", "nav_cycle_id": "xnys-2026-07-18"})
+        second = type(first).model_validate(second_payload)
+        repository.create_executor(first)
+        repository.create_executor(second)
+
+        first_current = _prepare_unknown(
+            repository,
+            first,
+            intent_id="intent-t005-sweep-first",
+            client_order_id="client-t005-sweep-first",
+            event_prefix="t005-sweep-first",
+        )
+        first_proof = _no_fill_proof(proof_id="proof-t005-sweep-first")
+        first_event = _reconciliation_event(
+            first,
+            "event-t005-sweep-first-reconciled",
+            outcome="CONSISTENT_NO_FILL",
+            intent_id="intent-t005-sweep-first",
+            client_order_id="client-t005-sweep-first",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=first_proof,
+        )
+        assert first_event.exchange_order_id is None
+        _append_fact(repository, first_current, first_event)
+
+        second_current = _prepare_unknown(
+            repository,
+            second,
+            intent_id="intent-t005-sweep-second",
+            client_order_id="client-t005-sweep-second",
+            event_prefix="t005-sweep-second",
+        )
+        second_proof = _no_fill_proof(proof_id="proof-t005-sweep-second")
+        second_proof["sweeps"][1]["sweep_id"] = "sweep-t005-second-unique"
+        reused_sweep = _reconciliation_event(
+            second,
+            "event-t005-sweep-second-reused",
+            outcome="CONSISTENT_NO_FILL",
+            intent_id="intent-t005-sweep-second",
+            client_order_id="client-t005-sweep-second",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=second_proof,
+        )
+        assert reused_sweep.exchange_order_id is None
+        _assert_fact_rejected_atomically(repository, second.executor_id, reused_sweep)
+        assert repository.load_snapshot(second.executor_id) == second_current
+    finally:
+        manager.engine.dispose()
+
+
+def test_t005_persisted_proof_collision_blocks_an_exact_idempotent_retry(tmp_path: Path):
+    db_path = tmp_path / "persisted-proof-collision.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    first = _initial()
+    second_payload = _snapshot_for_executor(first, "exec-t005-corrupt-second").model_dump(mode="json")
+    second_payload.update({"pair_id": "intc_intw", "nav_cycle_id": "xnys-2026-07-18"})
+    second = type(first).model_validate(second_payload)
+    repository.create_executor(first)
+    repository.create_executor(second)
+
+    first_current = _prepare_unknown(
+        repository,
+        first,
+        intent_id="intent-t005-corrupt-first",
+        client_order_id="client-t005-corrupt-first",
+        event_prefix="t005-corrupt-first",
+    )
+    first_event = _reconciliation_event(
+        first,
+        "event-t005-corrupt-first-reconciled",
+        outcome="CONSISTENT_NO_FILL",
+        intent_id="intent-t005-corrupt-first",
+        client_order_id="client-t005-corrupt-first",
+        evidence_state="PROVEN_NO_FILL",
+        proven_no_fill=_no_fill_proof(proof_id="proof-t005-corrupt-first"),
+    )
+    first_committed = repository.append_and_reduce(first.executor_id, first_event)
+    assert repository.load_snapshot(first.executor_id) != first_current
+
+    second_current = _prepare_unknown(
+        repository,
+        second,
+        intent_id="intent-t005-corrupt-second",
+        client_order_id="client-t005-corrupt-second",
+        event_prefix="t005-corrupt-second",
+    )
+    second_proof = _no_fill_proof(proof_id="proof-t005-corrupt-second")
+    second_proof["sweeps"][0]["sweep_id"] = "sweep-t005-corrupt-second-one"
+    second_proof["sweeps"][1]["sweep_id"] = "sweep-t005-corrupt-second-two"
+    second_event = _reconciliation_event(
+        second,
+        "event-t005-corrupt-second-reconciled",
+        outcome="CONSISTENT_NO_FILL",
+        intent_id="intent-t005-corrupt-second",
+        client_order_id="client-t005-corrupt-second",
+        evidence_state="PROVEN_NO_FILL",
+        proven_no_fill=second_proof,
+    )
+    _append_fact(repository, second_current, second_event)
+    manager.engine.dispose()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER lepf_journal_no_update")
+        payload_json = connection.execute(
+            "SELECT payload_json FROM LeveragedEtfJournalEvent WHERE event_id = ?",
+            (second_event.event_id,),
+        ).fetchone()[0]
+        mutation = json.loads(payload_json)
+        mutation["event"]["payload"]["proven_no_fill"]["proof_id"] = "proof-t005-corrupt-first"
+        rewritten_json, rewritten_hash = _canonical_json_hash(mutation)
+        connection.execute(
+            "UPDATE LeveragedEtfJournalEvent SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+            (rewritten_json, rewritten_hash, second_event.event_id),
+        )
+        connection.executescript(SQLITE_GUARD_DDL["lepf_journal_no_update"])
+        before_count = connection.execute("SELECT COUNT(*) FROM LeveragedEtfJournalEvent").fetchone()[0]
+
+    reopened = _open_manager(db_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="proof|global|owner"):
+            LeveragedEtfJournalRepository(reopened).append_and_reduce(first.executor_id, first_event)
+        with sqlite3.connect(db_path) as connection:
+            after_count = connection.execute("SELECT COUNT(*) FROM LeveragedEtfJournalEvent").fetchone()[0]
+        assert after_count == before_count
+        assert first_committed.event.event_id == first_event.event_id
+    finally:
+        reopened.engine.dispose()
+
+
 def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade(tmp_path: Path):
     db_path = tmp_path / "legacy-unproven-no-fill.sqlite"
     manager = _open_manager(db_path)
@@ -742,6 +909,166 @@ def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade
         assert repaired.etf_filled_quantity == Decimal("0.5")
     finally:
         reopened.engine.dispose()
+
+
+def test_t005_legacy_prefix_replays_a_later_same_quantity_intent(tmp_path: Path):
+    db_path = tmp_path / "legacy-prefix-next-intent.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial()
+    repository.create_executor(initial)
+    current = _prepare_unknown(repository, initial)
+    legacy_event_id = "event-t005-legacy-prefix-no-fill"
+    current = _append_fact(
+        repository,
+        current,
+        _reconciliation_event(
+            initial,
+            legacy_event_id,
+            outcome="CONSISTENT_NO_FILL",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=_no_fill_proof(proof_id="proof-t005-legacy-prefix"),
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            "event-t005-legacy-prefix-next-prepared",
+            logical_quantity="2",
+            attempt=2,
+            intent_id="intent-t005-legacy-prefix-next",
+            client_order_id="client-t005-legacy-prefix-next",
+            created_at_utc="2026-07-17T14:01:08.000000Z",
+        ),
+    )
+    assert current.state.value == "MAKER_SUBMITTING"
+    manager.engine.dispose()
+
+    _downgrade_journal_to_20260721(db_path, {legacy_event_id})
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        incomplete = reopened_repository.incomplete_intents(initial.executor_id)
+        assert tuple(value.intent_id for value in incomplete) == (
+            "intent-t005-unknown",
+            "intent-t005-legacy-prefix-next",
+        )
+    finally:
+        reopened.engine.dispose()
+
+
+def test_t005_authoritative_fill_reopens_legacy_aborted_no_fill_and_replays(tmp_path: Path):
+    db_path = tmp_path / "legacy-aborted-late-fill.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial()
+    repository.create_executor(initial)
+    current = _prepare_unknown(repository, initial)
+
+    cancel_identity = {
+        "logical_quantity": "2",
+        "action": "CANCEL",
+        "leg": "ETF",
+        "intent_id": "intent-t005-legacy-cancel",
+        "client_order_id": "client-t005-legacy-cancel",
+    }
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.PREPARED,
+            "event-t005-legacy-cancel-prepared",
+            created_at_utc="2026-07-17T14:01:04.100000Z",
+            **cancel_identity,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.CANCEL_REQUESTED,
+            "event-t005-legacy-cancel-requested",
+            order_cumulative_filled_quantity="0",
+            target_intent_id="intent-t005-unknown",
+            target_client_order_id="client-t005-unknown",
+            created_at_utc="2026-07-17T14:01:04.200000Z",
+            **cancel_identity,
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _fact_event(
+            initial,
+            JournalEventType.CANCEL_CONFIRMED,
+            "event-t005-legacy-cancel-confirmed",
+            order_cumulative_filled_quantity="0",
+            target_intent_id="intent-t005-unknown",
+            target_client_order_id="client-t005-unknown",
+            created_at_utc="2026-07-17T14:01:04.300000Z",
+            **cancel_identity,
+        ),
+    )
+    legacy_event_id = "event-t005-legacy-aborted-no-fill"
+    current = _append_fact(
+        repository,
+        current,
+        _reconciliation_event(
+            initial,
+            legacy_event_id,
+            outcome="CONSISTENT_NO_FILL",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=_no_fill_proof(proof_id="proof-t005-legacy-aborted"),
+        ),
+    )
+    assert current.state.value == "ABORTED_NO_FILL"
+    assert current.close_reason is not None
+    manager.engine.dispose()
+
+    _downgrade_journal_to_20260721(db_path, {legacy_event_id})
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert tuple(value.intent_id for value in reopened_repository.incomplete_intents(initial.executor_id)) == (
+            "intent-t005-unknown",
+        )
+        late_fill = _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-t005-legacy-aborted-late-fill",
+            logical_quantity="2",
+            intent_id="intent-t005-unknown",
+            client_order_id="client-t005-unknown",
+            exchange_order_id="exchange-t005-legacy-aborted-late",
+            exchange_trade_id="trade-t005-legacy-aborted-late",
+            fill_quantity="0.5",
+            order_cumulative_filled_quantity="0.5",
+            leg_cumulative_filled_quantity="0.5",
+            outcome="PARTIAL",
+            created_at_utc="2026-07-17T14:01:08.000000Z",
+        )
+        repaired = _append_fact(reopened_repository, current, late_fill)
+        assert repaired.state.value == "STOCK_HEDGE_PENDING"
+        assert repaired.close_reason is None
+    finally:
+        reopened.engine.dispose()
+
+    replayed = _open_manager(db_path)
+    try:
+        replayed_repository = LeveragedEtfJournalRepository(replayed)
+        assert replayed_repository.replay(initial.executor_id) == repaired
+        assert replayed_repository.load_snapshot(initial.executor_id) == repaired
+    finally:
+        replayed.engine.dispose()
 
 
 def _episode_record(
