@@ -34,6 +34,8 @@ _CANONICAL_UTC_PATTERN = re.compile(
 )
 _SESSION_DATE_PATTERN = re.compile(r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
+_ANCHOR_PAIR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+_ANCHOR_CYCLE_ID_PATTERN = re.compile(r"^xnys-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _TERMINAL_EXECUTOR_STATES = frozenset(
     {
         LeveragedEtfPairState.COMPLETED,
@@ -677,6 +679,195 @@ class AnchorRevisionObservationV1(BaseModel):
     @model_validator(mode="after")
     def validate_observed_time(self) -> AnchorRevisionObservationV1:
         _validate_utc_text(self.observed_at_utc, "observed_at_utc")
+        return self
+
+
+class CanonicalOpaqueAnchorPayloadV2(BaseModel):
+    """Canonical domain payload with an explicit, adapter-supplied version discriminator."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    kind: str = Field(min_length=1, max_length=64, pattern=r"^[A-Z][A-Z0-9_]*$")
+    contract_version_field: Literal["schema_version", "integrity_version", "evidence_version"]
+    contract_version: StrictInt = Field(ge=1)
+    payload_json: str
+    payload_hash: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_canonical_payload(self) -> CanonicalOpaqueAnchorPayloadV2:
+        value = _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
+        if not isinstance(value, Mapping):
+            raise ValueError("opaque anchor payload must be a JSON object")
+        declared_version = value.get(self.contract_version_field)
+        if (
+            not isinstance(declared_version, int)
+            or isinstance(declared_version, bool)
+            or declared_version != self.contract_version
+        ):
+            raise ValueError("opaque anchor payload contract version is invalid")
+        if "kind" in value and value["kind"] != self.kind:
+            raise ValueError("wrapper and embedded anchor payload kind must match exactly")
+        return self
+
+    @classmethod
+    def from_value(
+        cls,
+        *,
+        kind: str,
+        contract_version_field: str,
+        contract_version: int,
+        value: Any,
+    ) -> CanonicalOpaqueAnchorPayloadV2:
+        payload_json = _canonical_json(value)
+        return cls(
+            kind=kind,
+            contract_version_field=contract_version_field,
+            contract_version=contract_version,
+            payload_json=payload_json,
+            payload_hash=_sha256_text(payload_json),
+        )
+
+    @classmethod
+    def from_canonical_json(
+        cls,
+        *,
+        kind: str,
+        contract_version_field: str,
+        contract_version: int,
+        payload_json: str,
+        payload_hash: str,
+    ) -> CanonicalOpaqueAnchorPayloadV2:
+        return cls(
+            kind=kind,
+            contract_version_field=contract_version_field,
+            contract_version=contract_version,
+            payload_json=payload_json,
+            payload_hash=payload_hash,
+        )
+
+    def value(self) -> Mapping[str, Any]:
+        value = _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
+        if not isinstance(value, Mapping):
+            raise ValueError("opaque anchor payload must be a JSON object")
+        return value
+
+
+class AnchorStorageKeyV2(BaseModel):
+    """F004-owned opaque storage namespace; F006 maps the F003 key into this DTO."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    pair_id: str = Field(min_length=1, max_length=128)
+    cycle_id: str
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> AnchorStorageKeyV2:
+        if _ANCHOR_PAIR_ID_PATTERN.fullmatch(self.pair_id) is None:
+            raise ValueError("anchor pair_id must be a bounded canonical identifier")
+        if _ANCHOR_CYCLE_ID_PATTERN.fullmatch(self.cycle_id) is None:
+            raise ValueError("anchor cycle_id must be an XNYS cycle identifier")
+        return self
+
+
+def _validate_pair_scoped_payload_identity(
+    key: AnchorStorageKeyV2,
+    payload: CanonicalOpaqueAnchorPayloadV2,
+) -> Mapping[str, Any]:
+    value = payload.value()
+    if value.get("pair_id") != key.pair_id or value.get("cycle_id") != key.cycle_id:
+        raise AnchorIntegrityError("anchor storage key does not match payload pair/cycle identity")
+    return value
+
+
+class OpaqueAnchorCheckpointV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    key: AnchorStorageKeyV2
+    target_session_date: str
+    official_close_utc: str
+    deadline_utc: str
+    revision: StrictInt = Field(ge=1)
+    payload: CanonicalOpaqueAnchorPayloadV2
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> OpaqueAnchorCheckpointV2:
+        if _SESSION_DATE_PATTERN.fullmatch(self.target_session_date) is None:
+            raise ValueError("target_session_date is not canonical")
+        _validate_utc_text(self.official_close_utc, "anchor official_close_utc")
+        _validate_utc_text(self.deadline_utc, "anchor deadline_utc")
+        if self.payload.kind != "ANCHOR_CHECKPOINT":
+            raise ValueError("checkpoint payload kind must be ANCHOR_CHECKPOINT")
+        value = _validate_pair_scoped_payload_identity(self.key, self.payload)
+        comparisons = {
+            "target_session_date": self.target_session_date,
+            "official_close_utc": self.official_close_utc,
+            "deadline_utc": self.deadline_utc,
+            "revision": self.revision,
+        }
+        for field_name, expected in comparisons.items():
+            if value.get(field_name) != expected:
+                raise AnchorIntegrityError(f"anchor checkpoint {field_name} disagrees with envelope metadata")
+        return self
+
+
+class OpaqueAnchorFinalizedV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    key: AnchorStorageKeyV2
+    target_session_date: str
+    official_close_utc: str
+    deadline_utc: str
+    revision: StrictInt = Field(ge=1)
+    evidence_hash: Sha256Hex
+    payload: CanonicalOpaqueAnchorPayloadV2
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> OpaqueAnchorFinalizedV2:
+        if _SESSION_DATE_PATTERN.fullmatch(self.target_session_date) is None:
+            raise ValueError("target_session_date is not canonical")
+        _validate_utc_text(self.official_close_utc, "anchor official_close_utc")
+        _validate_utc_text(self.deadline_utc, "anchor deadline_utc")
+        if self.payload.kind != "ANCHOR_RECORD":
+            raise ValueError("finalized payload kind must be ANCHOR_RECORD")
+        value = _validate_pair_scoped_payload_identity(self.key, self.payload)
+        comparisons = {
+            "target_session_date": self.target_session_date,
+            "official_close_utc": self.official_close_utc,
+            "deadline_utc": self.deadline_utc,
+            "evidence_hash": self.evidence_hash,
+        }
+        for field_name, expected in comparisons.items():
+            if value.get(field_name) != expected:
+                raise AnchorIntegrityError(f"finalized anchor {field_name} disagrees with envelope metadata")
+        return self
+
+
+OpaqueAnchorStateV2 = Union[OpaqueAnchorCheckpointV2, OpaqueAnchorFinalizedV2]
+
+
+class OpaqueAnchorRevisionObservationV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    key: AnchorStorageKeyV2
+    evidence_hash: Sha256Hex
+    observed_at_utc: str
+    payload: CanonicalOpaqueAnchorPayloadV2
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> OpaqueAnchorRevisionObservationV2:
+        _validate_utc_text(self.observed_at_utc, "anchor revision observed_at_utc")
+        if self.payload.kind != "ANCHOR_REVISION_OBSERVATION":
+            raise ValueError("revision payload kind must be ANCHOR_REVISION_OBSERVATION")
+        value = _validate_pair_scoped_payload_identity(self.key, self.payload)
+        if value.get("evidence_hash") != self.evidence_hash:
+            raise AnchorIntegrityError("anchor revision evidence_hash disagrees with envelope metadata")
+        if value.get("observed_at_utc") != self.observed_at_utc:
+            raise AnchorIntegrityError("anchor revision observed_at_utc disagrees with envelope metadata")
         return self
 
 
@@ -2289,201 +2480,236 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
 
 
 class AnchorRepositoryV1(_TransactionalRepository):
-    """Sole synchronous anchor repository with typed-v1 wrappers over one opaque path."""
+    """Retired cycle-only runtime repository; historical V1 DTOs remain readable."""
+
+    @staticmethod
+    def _fail_closed() -> None:
+        raise AnchorIntegrityError(
+            "legacy cycle-only anchor repository is disabled; a pair-scoped storage key is required"
+        )
+
+    def load_opaque(self, cycle_id: str) -> None:
+        self._fail_closed()
+
+    def load(self, cycle_id: str) -> None:
+        self._fail_closed()
+
+    def compare_and_set_opaque_checkpoint(self, *args, **kwargs) -> None:
+        self._fail_closed()
+
+    def compare_and_set_checkpoint(self, *args, **kwargs) -> None:
+        self._fail_closed()
+
+    def finalize_opaque_if_absent(self, *args, **kwargs) -> None:
+        self._fail_closed()
+
+    def finalize_if_absent(self, *args, **kwargs) -> None:
+        self._fail_closed()
+
+    def append_revision_observation(self, *args, **kwargs) -> None:
+        self._fail_closed()
+
+    def revision_observations(self, *args, **kwargs) -> None:
+        self._fail_closed()
+
+
+class PairScopedAnchorRepository(_TransactionalRepository):
+    """Canonical pair/cycle-scoped opaque anchor repository."""
 
     _ANCHOR_SELECT = """
-        SELECT cycle_id, schema_version, state_kind, revision, target_session_date,
-               official_close_utc, deadline_utc, evidence_hash, payload_json,
-               payload_hash, created_at_utc, updated_at_utc
+        SELECT pair_id, cycle_id, schema_version, state_kind, revision,
+               target_session_date, official_close_utc, deadline_utc,
+               evidence_hash, payload_version_field, payload_contract_version,
+               payload_json, payload_hash, created_at_utc, updated_at_utc
         FROM LeveragedEtfAnchorState
-        WHERE cycle_id = :cycle_id
+        WHERE pair_id = :pair_id AND cycle_id = :cycle_id
+    """
+    _OBSERVATION_SELECT = """
+        SELECT pair_id, cycle_id, evidence_hash, observed_at_utc, schema_version,
+               payload_version_field, payload_contract_version, payload_json,
+               payload_hash
+        FROM LeveragedEtfAnchorRevisionObservation
     """
 
     @staticmethod
-    def _validate_opaque_metadata(
-        state: OpaqueAnchorStateV1,
-        official_close_override: Optional[str] = None,
-    ) -> None:
-        value = state.payload.value()
-        if not isinstance(value, Mapping):
-            raise AnchorIntegrityError("anchor payload must be a JSON object")
-        comparisons = {
-            "cycle_id": state.cycle_id,
-            "target_session_date": state.target_session_date,
-            "deadline_utc": state.model_dump(mode="json")["deadline_utc"],
-        }
-        if isinstance(state, OpaqueAnchorCheckpointV1):
-            comparisons["official_close_utc"] = state.model_dump(mode="json")["official_close_utc"]
-            comparisons["revision"] = state.revision
-        else:
-            comparisons["evidence_hash"] = state.evidence_hash
-            envelope_close = official_close_override or state.model_dump(mode="json")["official_close_utc"]
-            if "official_close_utc" in value:
-                if envelope_close is None:
-                    raise AnchorIntegrityError("anchor payload official_close_utc lacks a frozen envelope identity")
-                comparisons["official_close_utc"] = envelope_close
-        for key, expected in comparisons.items():
-            if key in value and value[key] != expected:
-                raise AnchorIntegrityError(f"anchor payload {key} disagrees with storage metadata")
+    def _require_key(key: AnchorStorageKeyV2) -> AnchorStorageKeyV2:
+        if not isinstance(key, AnchorStorageKeyV2):
+            raise AnchorIntegrityError("pair-scoped anchor operations require AnchorStorageKeyV2")
+        return key
 
     @staticmethod
-    def _assert_cycle_identity(
-        current: OpaqueAnchorStateV1,
-        proposed: OpaqueAnchorStateV1,
-        *,
-        inherit_missing_official_close: bool = False,
-    ) -> None:
-        current_json = current.model_dump(mode="json")
-        proposed_json = proposed.model_dump(mode="json")
-        if current.cycle_id != proposed.cycle_id:
-            raise AnchorIntegrityError("anchor cycle identity cannot change")
-        if current.target_session_date != proposed.target_session_date:
-            raise AnchorIntegrityError("anchor target session identity cannot change")
-        if current_json["deadline_utc"] != proposed_json["deadline_utc"]:
-            raise AnchorIntegrityError("anchor deadline identity cannot change")
-        proposed_close = proposed_json["official_close_utc"]
-        if inherit_missing_official_close and proposed_close is None:
-            proposed_close = current_json["official_close_utc"]
-        if current_json["official_close_utc"] != proposed_close:
-            raise AnchorIntegrityError("anchor official close identity cannot change")
+    def _require_expected_revision(expected_revision: int, *, minimum: int) -> int:
+        if type(expected_revision) is not int or expected_revision < minimum:
+            raise AnchorRevisionConflict(f"expected revision must be an integer of at least {minimum}")
+        return expected_revision
 
     @classmethod
-    def _decode_anchor_row(cls, row: Mapping[str, Any]) -> OpaqueAnchorStateV1:
-        if row["schema_version"] != 1:
-            raise AnchorIntegrityError("anchor storage schema version is unsupported")
+    def _assert_key_matches(
+        cls,
+        key: AnchorStorageKeyV2,
+        state: Union[
+            OpaqueAnchorCheckpointV2,
+            OpaqueAnchorFinalizedV2,
+            OpaqueAnchorRevisionObservationV2,
+        ],
+    ) -> None:
+        cls._require_key(key)
+        if state.key != key:
+            raise AnchorIntegrityError("anchor storage key does not match envelope pair/cycle identity")
+
+    @staticmethod
+    def _assert_anchor_identity(
+        current: OpaqueAnchorStateV2,
+        proposed: OpaqueAnchorStateV2,
+    ) -> None:
+        if current.key != proposed.key:
+            raise AnchorIntegrityError("anchor pair/cycle identity cannot change")
+        if current.target_session_date != proposed.target_session_date:
+            raise AnchorIntegrityError("anchor target session identity cannot change")
+        if current.official_close_utc != proposed.official_close_utc:
+            raise AnchorIntegrityError("anchor official close identity cannot change")
+        if current.deadline_utc != proposed.deadline_utc:
+            raise AnchorIntegrityError("anchor deadline identity cannot change")
+
+    @classmethod
+    def _decode_anchor_row(cls, row: Mapping[str, Any]) -> OpaqueAnchorStateV2:
         try:
-            value = _verify_canonical_json(row["payload_json"], row["payload_hash"], "anchor state")
-            if not isinstance(value, Mapping):
-                raise ValueError("anchor payload must be an object")
-            payload_version = value.get("schema_version")
-            if not isinstance(payload_version, int) or isinstance(payload_version, bool) or payload_version < 1:
-                raise ValueError("anchor payload schema_version is invalid")
+            if row["schema_version"] != 2:
+                raise ValueError("anchor storage schema version is unsupported")
+            key = AnchorStorageKeyV2(
+                pair_id=row["pair_id"],
+                cycle_id=row["cycle_id"],
+            )
             if row["state_kind"] == "CHECKPOINT":
-                if row["evidence_hash"] is not None or row["official_close_utc"] is None:
-                    raise ValueError("checkpoint storage metadata is invalid")
-                payload = CanonicalOpaquePayload.from_canonical_json(
-                    payload_version,
-                    "ANCHOR_CHECKPOINT",
-                    row["payload_json"],
-                    row["payload_hash"],
-                )
-                state: OpaqueAnchorStateV1 = OpaqueAnchorCheckpointV1(
-                    cycle_id=row["cycle_id"],
-                    target_session_date=row["target_session_date"],
-                    official_close_utc=row["official_close_utc"],
-                    deadline_utc=row["deadline_utc"],
-                    revision=row["revision"],
-                    payload=payload,
-                )
+                if row["evidence_hash"] is not None:
+                    raise ValueError("checkpoint storage metadata contains final evidence")
+                payload_kind = "ANCHOR_CHECKPOINT"
             elif row["state_kind"] == "FINALIZED":
                 if row["evidence_hash"] is None:
                     raise ValueError("finalized storage metadata lacks evidence hash")
-                payload = CanonicalOpaquePayload.from_canonical_json(
-                    payload_version,
-                    "ANCHOR_RECORD",
-                    row["payload_json"],
-                    row["payload_hash"],
-                )
-                state = OpaqueAnchorFinalizedV1(
-                    cycle_id=row["cycle_id"],
-                    target_session_date=row["target_session_date"],
-                    official_close_utc=row["official_close_utc"],
-                    deadline_utc=row["deadline_utc"],
-                    revision=row["revision"],
-                    evidence_hash=row["evidence_hash"],
-                    payload=payload,
-                )
+                payload_kind = "ANCHOR_RECORD"
             else:
                 raise ValueError("anchor state_kind is invalid")
-            cls._validate_opaque_metadata(state)
-            return state
+            payload = CanonicalOpaqueAnchorPayloadV2.from_canonical_json(
+                kind=payload_kind,
+                contract_version_field=row["payload_version_field"],
+                contract_version=row["payload_contract_version"],
+                payload_json=row["payload_json"],
+                payload_hash=row["payload_hash"],
+            )
+            common = {
+                "key": key,
+                "target_session_date": row["target_session_date"],
+                "official_close_utc": row["official_close_utc"],
+                "deadline_utc": row["deadline_utc"],
+                "revision": row["revision"],
+                "payload": payload,
+            }
+            if row["state_kind"] == "CHECKPOINT":
+                return OpaqueAnchorCheckpointV2(**common)
+            return OpaqueAnchorFinalizedV2(
+                **common,
+                evidence_hash=row["evidence_hash"],
+            )
         except AnchorIntegrityError:
             raise
         except Exception as exception:
-            raise AnchorIntegrityError(f"anchor state hash or payload integrity failure: {exception}") from exception
+            raise AnchorIntegrityError(
+                f"anchor state hash, version, or payload integrity failure: {exception}"
+            ) from exception
 
     @classmethod
-    def _load_opaque_connection(cls, connection: Connection, cycle_id: str) -> Optional[OpaqueAnchorStateV1]:
-        row = connection.execute(text(cls._ANCHOR_SELECT), {"cycle_id": cycle_id}).mappings().one_or_none()
-        return None if row is None else cls._decode_anchor_row(row)
-
-    def load_opaque(self, cycle_id: str) -> Optional[OpaqueAnchorStateV1]:
-        with self._sql_manager.engine.connect() as connection:
-            return self._load_opaque_connection(connection, cycle_id)
-
-    def load(self, cycle_id: str) -> Optional[AnchorStateV1]:
-        opaque = self.load_opaque(cycle_id)
-        if opaque is None:
-            return None
-        if opaque.payload.schema_version != 1:
-            raise AnchorIntegrityError(
-                f"anchor payload version {opaque.payload.schema_version} requires a downstream lossless adapter"
-            )
+    def _decode_observation_row(
+        cls,
+        row: Mapping[str, Any],
+    ) -> OpaqueAnchorRevisionObservationV2:
         try:
-            if isinstance(opaque, OpaqueAnchorCheckpointV1):
-                checkpoint = AnchorPollingCheckpointV1.model_validate(opaque.payload.value())
-                expected = (
-                    checkpoint.cycle_id,
-                    checkpoint.target_session_date,
-                    checkpoint.official_close_utc,
-                    checkpoint.deadline_utc,
-                    checkpoint.revision,
-                )
-                actual = (
-                    opaque.cycle_id,
-                    opaque.target_session_date,
-                    opaque.official_close_utc,
-                    opaque.deadline_utc,
-                    opaque.revision,
-                )
-                if expected != actual:
-                    raise AnchorIntegrityError("typed checkpoint metadata disagrees with stored envelope")
-                return checkpoint
-            record = AnchorRecordV1.model_validate(opaque.payload.value())
-            if (
-                record.cycle_id != opaque.cycle_id
-                or record.target_session_date != opaque.target_session_date
-                or record.deadline_utc != opaque.deadline_utc
-                or record.evidence_hash != opaque.evidence_hash
-            ):
-                raise AnchorIntegrityError("typed anchor metadata disagrees with stored envelope")
-            return record
+            if row["schema_version"] != 2:
+                raise ValueError("anchor observation storage schema version is unsupported")
+            payload = CanonicalOpaqueAnchorPayloadV2.from_canonical_json(
+                kind="ANCHOR_REVISION_OBSERVATION",
+                contract_version_field=row["payload_version_field"],
+                contract_version=row["payload_contract_version"],
+                payload_json=row["payload_json"],
+                payload_hash=row["payload_hash"],
+            )
+            return OpaqueAnchorRevisionObservationV2(
+                key=AnchorStorageKeyV2(
+                    pair_id=row["pair_id"],
+                    cycle_id=row["cycle_id"],
+                ),
+                evidence_hash=row["evidence_hash"],
+                observed_at_utc=row["observed_at_utc"],
+                payload=payload,
+            )
         except AnchorIntegrityError:
             raise
         except Exception as exception:
-            raise AnchorIntegrityError(f"malformed anchor v1 payload: {exception}") from exception
+            raise AnchorIntegrityError(
+                f"anchor observation hash, version, or payload integrity failure: {exception}"
+            ) from exception
+
+    @classmethod
+    def _load_opaque_connection(
+        cls,
+        connection: Connection,
+        key: AnchorStorageKeyV2,
+    ) -> Optional[OpaqueAnchorStateV2]:
+        cls._require_key(key)
+        row = (
+            connection.execute(
+                text(cls._ANCHOR_SELECT),
+                {"pair_id": key.pair_id, "cycle_id": key.cycle_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return None if row is None else cls._decode_anchor_row(row)
+
+    def load_opaque(self, key: AnchorStorageKeyV2) -> Optional[OpaqueAnchorStateV2]:
+        self._require_key(key)
+        with self._sql_manager.engine.connect() as connection:
+            return self._load_opaque_connection(connection, key)
+
+    @staticmethod
+    def _payload_parameters(payload: CanonicalOpaqueAnchorPayloadV2) -> dict[str, Any]:
+        return {
+            "payload_version_field": payload.contract_version_field,
+            "payload_contract_version": payload.contract_version,
+            "payload_json": payload.payload_json,
+            "payload_hash": payload.payload_hash,
+        }
 
     def compare_and_set_opaque_checkpoint(
         self,
-        checkpoint: OpaqueAnchorCheckpointV1,
+        key: AnchorStorageKeyV2,
+        checkpoint: OpaqueAnchorCheckpointV2,
         expected_revision: int,
-    ) -> OpaqueAnchorCheckpointV1:
-        if expected_revision < 0 or checkpoint.revision != expected_revision + 1:
+    ) -> OpaqueAnchorCheckpointV2:
+        self._assert_key_matches(key, checkpoint)
+        self._require_expected_revision(expected_revision, minimum=0)
+        if checkpoint.revision != expected_revision + 1:
             raise AnchorRevisionConflict("checkpoint revision must be exactly expected_revision + 1")
-        self._validate_opaque_metadata(checkpoint)
-        checkpoint_json = checkpoint.model_dump(mode="json")
         payload_value = checkpoint.payload.value()
-        updated_at_utc = (
-            payload_value.get("next_poll_utc", checkpoint_json["official_close_utc"])
-            if isinstance(payload_value, Mapping)
-            else checkpoint_json["official_close_utc"]
-        )
+        updated_at_utc = payload_value.get("next_poll_utc")
+        if not isinstance(updated_at_utc, str):
+            raise AnchorIntegrityError("checkpoint payload lacks canonical next_poll_utc")
         _validate_utc_text(updated_at_utc, "checkpoint updated_at_utc")
 
-        def operation(connection: Connection):
-            current = self._load_opaque_connection(connection, checkpoint.cycle_id)
+        def operation(connection: Connection) -> OpaqueAnchorCheckpointV2:
+            current = self._load_opaque_connection(connection, key)
             parameters = {
-                "cycle_id": checkpoint.cycle_id,
-                "schema_version": 1,
+                "pair_id": key.pair_id,
+                "cycle_id": key.cycle_id,
+                "schema_version": 2,
                 "state_kind": "CHECKPOINT",
                 "revision": checkpoint.revision,
                 "target_session_date": checkpoint.target_session_date,
-                "official_close_utc": checkpoint_json["official_close_utc"],
-                "deadline_utc": checkpoint_json["deadline_utc"],
-                "payload_json": checkpoint.payload.payload_json,
-                "payload_hash": checkpoint.payload.payload_hash,
+                "official_close_utc": checkpoint.official_close_utc,
+                "deadline_utc": checkpoint.deadline_utc,
                 "updated_at_utc": updated_at_utc,
                 "expected_revision": expected_revision,
+                **self._payload_parameters(checkpoint.payload),
             }
             if current is None:
                 if expected_revision != 0:
@@ -2491,23 +2717,25 @@ class AnchorRepositoryV1(_TransactionalRepository):
                 connection.execute(
                     text("""
                         INSERT INTO LeveragedEtfAnchorState (
-                            cycle_id, schema_version, state_kind, revision,
+                            pair_id, cycle_id, schema_version, state_kind, revision,
                             target_session_date, official_close_utc, deadline_utc,
-                            evidence_hash, payload_json, payload_hash,
+                            evidence_hash, payload_version_field,
+                            payload_contract_version, payload_json, payload_hash,
                             created_at_utc, updated_at_utc
                         ) VALUES (
-                            :cycle_id, :schema_version, :state_kind, :revision,
-                            :target_session_date, :official_close_utc, :deadline_utc,
-                            NULL, :payload_json, :payload_hash,
+                            :pair_id, :cycle_id, :schema_version, :state_kind,
+                            :revision, :target_session_date, :official_close_utc,
+                            :deadline_utc, NULL, :payload_version_field,
+                            :payload_contract_version, :payload_json, :payload_hash,
                             :updated_at_utc, :updated_at_utc
                         )
-                        """),
+                    """),
                     parameters,
                 )
                 return checkpoint
-            if not isinstance(current, OpaqueAnchorCheckpointV1):
+            if isinstance(current, OpaqueAnchorFinalizedV2):
                 raise AnchorIntegrityError("finalized anchor cannot be replaced by a checkpoint")
-            self._assert_cycle_identity(current, checkpoint)
+            self._assert_anchor_identity(current, checkpoint)
             if current.revision != expected_revision:
                 raise AnchorRevisionConflict(
                     f"checkpoint revision {current.revision} does not match expected {expected_revision}"
@@ -2519,13 +2747,16 @@ class AnchorRepositoryV1(_TransactionalRepository):
                         target_session_date = :target_session_date,
                         official_close_utc = :official_close_utc,
                         deadline_utc = :deadline_utc,
+                        payload_version_field = :payload_version_field,
+                        payload_contract_version = :payload_contract_version,
                         payload_json = :payload_json,
                         payload_hash = :payload_hash,
                         updated_at_utc = :updated_at_utc
-                    WHERE cycle_id = :cycle_id
+                    WHERE pair_id = :pair_id
+                      AND cycle_id = :cycle_id
                       AND state_kind = 'CHECKPOINT'
                       AND revision = :expected_revision
-                    """),
+                """),
                 parameters,
             )
             if updated.rowcount != 1:
@@ -2535,111 +2766,55 @@ class AnchorRepositoryV1(_TransactionalRepository):
         try:
             return self._write(operation)
         except IntegrityError as exception:
-            raise AnchorRevisionConflict("checkpoint compare-and-set violated storage identity") from exception
-
-    def compare_and_set_checkpoint(
-        self,
-        checkpoint: AnchorPollingCheckpointV1,
-        expected_revision: int,
-    ) -> AnchorStateV1:
-        serialized = checkpoint.model_dump(mode="json")
-        opaque = OpaqueAnchorCheckpointV1(
-            cycle_id=checkpoint.cycle_id,
-            target_session_date=checkpoint.target_session_date,
-            official_close_utc=serialized["official_close_utc"],
-            deadline_utc=serialized["deadline_utc"],
-            revision=checkpoint.revision,
-            payload=CanonicalOpaquePayload.from_value(1, "ANCHOR_CHECKPOINT", serialized),
-        )
-        self.compare_and_set_opaque_checkpoint(opaque, expected_revision)
-        return checkpoint
+            raise AnchorRevisionConflict(
+                "checkpoint compare-and-set violated pair-scoped storage identity"
+            ) from exception
 
     def finalize_opaque_if_absent(
         self,
-        record: OpaqueAnchorFinalizedV1,
+        key: AnchorStorageKeyV2,
+        record: OpaqueAnchorFinalizedV2,
         expected_revision: int,
-    ) -> OpaqueAnchorFinalizedV1:
-        if expected_revision < 0:
-            raise AnchorRevisionConflict("expected revision must be non-negative")
-        self._validate_opaque_metadata(record)
-        record_json = record.model_dump(mode="json")
+    ) -> OpaqueAnchorFinalizedV2:
+        self._assert_key_matches(key, record)
+        self._require_expected_revision(expected_revision, minimum=1)
+        if record.revision != expected_revision:
+            raise AnchorRevisionConflict("final record revision must equal a positive expected checkpoint revision")
         payload_value = record.payload.value()
-        updated_at_utc = (
-            payload_value.get("finalized_at_utc", record_json["deadline_utc"])
-            if isinstance(payload_value, Mapping)
-            else record_json["deadline_utc"]
-        )
+        updated_at_utc = payload_value.get("finalized_at_utc")
+        if not isinstance(updated_at_utc, str):
+            raise AnchorIntegrityError("finalized payload lacks canonical finalized_at_utc")
         _validate_utc_text(updated_at_utc, "anchor finalized_at_utc")
 
-        def operation(connection: Connection):
-            current = self._load_opaque_connection(connection, record.cycle_id)
-            if isinstance(current, OpaqueAnchorFinalizedV1):
-                self._validate_opaque_metadata(
-                    record,
-                    current.model_dump(mode="json")["official_close_utc"],
-                )
-                self._assert_cycle_identity(
-                    current,
-                    record,
-                    inherit_missing_official_close=True,
-                )
+        def operation(connection: Connection) -> OpaqueAnchorFinalizedV2:
+            current = self._load_opaque_connection(connection, key)
+            if isinstance(current, OpaqueAnchorFinalizedV2):
+                self._assert_anchor_identity(current, record)
                 if current.evidence_hash != record.evidence_hash:
                     raise AnchorIntegrityError("different final evidence cannot overwrite an anchor")
                 if current.payload != record.payload:
                     raise AnchorIntegrityError("same evidence hash has conflicting finalized payload")
                 return current
-            parameters = {
-                "cycle_id": record.cycle_id,
-                "schema_version": 1,
-                "state_kind": "FINALIZED",
-                "revision": record.revision,
-                "target_session_date": record.target_session_date,
-                "official_close_utc": record_json["official_close_utc"],
-                "deadline_utc": record_json["deadline_utc"],
-                "evidence_hash": record.evidence_hash,
-                "payload_json": record.payload.payload_json,
-                "payload_hash": record.payload.payload_hash,
-                "updated_at_utc": updated_at_utc,
-                "expected_revision": expected_revision,
-            }
             if current is None:
-                if expected_revision != 0 or record.revision != 1:
-                    raise AnchorRevisionConflict("absent anchor can only finalize from revision zero")
-                connection.execute(
-                    text("""
-                        INSERT INTO LeveragedEtfAnchorState (
-                            cycle_id, schema_version, state_kind, revision,
-                            target_session_date, official_close_utc, deadline_utc,
-                            evidence_hash, payload_json, payload_hash,
-                            created_at_utc, updated_at_utc
-                        ) VALUES (
-                            :cycle_id, :schema_version, :state_kind, :revision,
-                            :target_session_date, :official_close_utc, :deadline_utc,
-                            :evidence_hash, :payload_json, :payload_hash,
-                            :updated_at_utc, :updated_at_utc
-                        )
-                        """),
-                    parameters,
-                )
-                return record
-            if not isinstance(current, OpaqueAnchorCheckpointV1):
-                raise AnchorIntegrityError("anchor state kind is invalid")
-            self._validate_opaque_metadata(record, _utc_text(current.official_close_utc))
-            self._assert_cycle_identity(
-                current,
-                record,
-                inherit_missing_official_close=True,
-            )
+                raise AnchorRevisionConflict("anchor finalization requires an existing pair-scoped checkpoint")
+            self._assert_anchor_identity(current, record)
             if current.revision != expected_revision:
                 raise AnchorRevisionConflict(
                     f"checkpoint revision {current.revision} does not match expected {expected_revision}"
                 )
-            if record.revision != current.revision:
-                raise AnchorRevisionConflict("final record revision must match the checkpoint revision")
-            parameters["revision"] = current.revision
-            parameters["official_close_utc"] = record_json["official_close_utc"] or _utc_text(
-                current.official_close_utc
-            )
+            parameters = {
+                "pair_id": key.pair_id,
+                "cycle_id": key.cycle_id,
+                "state_kind": "FINALIZED",
+                "revision": current.revision,
+                "target_session_date": record.target_session_date,
+                "official_close_utc": record.official_close_utc,
+                "deadline_utc": record.deadline_utc,
+                "evidence_hash": record.evidence_hash,
+                "updated_at_utc": updated_at_utc,
+                "expected_revision": expected_revision,
+                **self._payload_parameters(record.payload),
+            }
             updated = connection.execute(
                 text("""
                     UPDATE LeveragedEtfAnchorState
@@ -2649,108 +2824,104 @@ class AnchorRepositoryV1(_TransactionalRepository):
                         official_close_utc = :official_close_utc,
                         deadline_utc = :deadline_utc,
                         evidence_hash = :evidence_hash,
+                        payload_version_field = :payload_version_field,
+                        payload_contract_version = :payload_contract_version,
                         payload_json = :payload_json,
                         payload_hash = :payload_hash,
                         updated_at_utc = :updated_at_utc
-                    WHERE cycle_id = :cycle_id
+                    WHERE pair_id = :pair_id
+                      AND cycle_id = :cycle_id
                       AND state_kind = 'CHECKPOINT'
                       AND revision = :expected_revision
-                    """),
+                """),
                 parameters,
             )
             if updated.rowcount != 1:
                 raise AnchorRevisionConflict("anchor finalization lost a concurrent race")
-            return OpaqueAnchorFinalizedV1.model_validate(
-                {
-                    **record_json,
-                    "revision": current.revision,
-                    "official_close_utc": parameters["official_close_utc"],
-                }
-            )
+            return record
 
         try:
             return self._write(operation)
         except IntegrityError as exception:
-            raise AnchorIntegrityError("anchor finalization violated immutable identity") from exception
+            raise AnchorIntegrityError("anchor finalization violated immutable pair-scoped identity") from exception
 
-    def finalize_if_absent(
+    def append_opaque_revision_observation(
         self,
-        record: AnchorRecordV1,
-        expected_revision: int,
-    ) -> AnchorRecordV1:
-        serialized = record.model_dump(mode="json")
-        opaque = OpaqueAnchorFinalizedV1(
-            cycle_id=record.cycle_id,
-            target_session_date=record.target_session_date,
-            official_close_utc=None,
-            deadline_utc=serialized["deadline_utc"],
-            revision=max(1, expected_revision),
-            evidence_hash=record.evidence_hash,
-            payload=CanonicalOpaquePayload.from_value(1, "ANCHOR_RECORD", serialized),
-        )
-        finalized = self.finalize_opaque_if_absent(opaque, expected_revision)
-        try:
-            return AnchorRecordV1.model_validate(finalized.payload.value())
-        except Exception as exception:
-            raise AnchorIntegrityError(f"finalized v1 record is malformed: {exception}") from exception
-
-    def append_revision_observation(
-        self,
-        cycle_id: str,
-        evidence_hash: str,
-        observed_at: str,
+        key: AnchorStorageKeyV2,
+        observation: OpaqueAnchorRevisionObservationV2,
     ) -> None:
-        observation = AnchorRevisionObservationV1(
-            cycle_id=cycle_id,
-            evidence_hash=evidence_hash,
-            observed_at_utc=observed_at,
-        )
+        self._assert_key_matches(key, observation)
 
-        def operation(connection: Connection):
-            current = self._load_opaque_connection(connection, cycle_id)
+        def operation(connection: Connection) -> None:
+            current = self._load_opaque_connection(connection, key)
             if current is None:
-                raise AnchorIntegrityError(f"anchor cycle {cycle_id} does not exist")
-            if not isinstance(current, OpaqueAnchorFinalizedV1):
+                raise AnchorIntegrityError(f"anchor pair/cycle {key.pair_id}/{key.cycle_id} does not exist")
+            if not isinstance(current, OpaqueAnchorFinalizedV2):
                 raise AnchorIntegrityError("revision observations require a finalized anchor")
-            existing = connection.execute(
-                text("""
-                    SELECT 1 FROM LeveragedEtfAnchorRevisionObservation
-                    WHERE cycle_id = :cycle_id
-                      AND evidence_hash = :evidence_hash
-                      AND observed_at_utc = :observed_at_utc
+            parameters = {
+                "pair_id": key.pair_id,
+                "cycle_id": key.cycle_id,
+                "evidence_hash": observation.evidence_hash,
+                "observed_at_utc": observation.observed_at_utc,
+                "schema_version": 2,
+                **self._payload_parameters(observation.payload),
+            }
+            existing = (
+                connection.execute(
+                    text(self._OBSERVATION_SELECT + """
+                      WHERE pair_id = :pair_id
+                        AND cycle_id = :cycle_id
+                        AND evidence_hash = :evidence_hash
+                        AND observed_at_utc = :observed_at_utc
                     """),
-                observation.model_dump(mode="json"),
-            ).one_or_none()
+                    parameters,
+                )
+                .mappings()
+                .one_or_none()
+            )
             if existing is not None:
+                persisted = self._decode_observation_row(existing)
+                if persisted != observation:
+                    raise AnchorIntegrityError("anchor revision identity has conflicting immutable payload")
                 return None
             connection.execute(
                 text("""
                     INSERT INTO LeveragedEtfAnchorRevisionObservation (
-                        cycle_id, evidence_hash, observed_at_utc
-                    ) VALUES (:cycle_id, :evidence_hash, :observed_at_utc)
-                    """),
-                observation.model_dump(mode="json"),
+                        pair_id, cycle_id, evidence_hash, observed_at_utc,
+                        schema_version, payload_version_field,
+                        payload_contract_version, payload_json, payload_hash
+                    ) VALUES (
+                        :pair_id, :cycle_id, :evidence_hash, :observed_at_utc,
+                        :schema_version, :payload_version_field,
+                        :payload_contract_version, :payload_json, :payload_hash
+                    )
+                """),
+                parameters,
             )
             return None
 
         try:
             self._write(operation)
         except IntegrityError as exception:
-            raise AnchorIntegrityError("anchor revision observation violated append-only identity") from exception
+            raise AnchorIntegrityError(
+                "anchor revision observation violated append-only pair-scoped identity"
+            ) from exception
 
-    def revision_observations(self, cycle_id: str) -> Tuple[AnchorRevisionObservationV1, ...]:
+    def opaque_revision_observations(
+        self,
+        key: AnchorStorageKeyV2,
+    ) -> Tuple[OpaqueAnchorRevisionObservationV2, ...]:
+        self._require_key(key)
         with self._sql_manager.engine.connect() as connection:
             rows = (
                 connection.execute(
-                    text("""
-                    SELECT cycle_id, evidence_hash, observed_at_utc
-                    FROM LeveragedEtfAnchorRevisionObservation
-                    WHERE cycle_id = :cycle_id
-                    ORDER BY observed_at_utc, evidence_hash
-                    """),
-                    {"cycle_id": cycle_id},
+                    text(self._OBSERVATION_SELECT + """
+                          WHERE pair_id = :pair_id AND cycle_id = :cycle_id
+                          ORDER BY observed_at_utc, evidence_hash
+                        """),
+                    {"pair_id": key.pair_id, "cycle_id": key.cycle_id},
                 )
                 .mappings()
                 .all()
             )
-        return tuple(AnchorRevisionObservationV1.model_validate(dict(row)) for row in rows)
+        return tuple(self._decode_observation_row(row) for row in rows)

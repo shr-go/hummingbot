@@ -2,7 +2,10 @@ from sqlalchemy import Column, Integer, Text
 
 from hummingbot.model.db_migration.base_transformation import DatabaseTransformation
 from hummingbot.model.decimal_type_decorator import SqliteDecimal
-from hummingbot.model.leveraged_etf_persistence import ensure_leveraged_etf_persistence_schema
+from hummingbot.model.leveraged_etf_persistence import (
+    ensure_leveraged_etf_persistence_schema,
+    rebuild_empty_intermediate_anchor_schema,
+)
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 
 
@@ -169,3 +172,24 @@ class AddLeveragedEtfPersistence(DatabaseTransformation):
     @property
     def to_version(self):
         return 20260719
+
+
+class UpgradeEmptyLeveragedEtfAnchorPairScope(DatabaseTransformation):
+    """Reject ambiguous intermediate rows; rebuild only a proven-empty anchor surface."""
+
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        with db_handle.engine.begin() as connection:
+            rebuild_empty_intermediate_anchor_schema(connection)
+        return db_handle
+
+    @property
+    def name(self):
+        return "UpgradeEmptyLeveragedEtfAnchorPairScope"
+
+    @property
+    def from_version(self):
+        return 20260719
+
+    @property
+    def to_version(self):
+        return 20260721

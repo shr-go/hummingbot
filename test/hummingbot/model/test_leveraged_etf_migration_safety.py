@@ -27,7 +27,7 @@ from hummingbot.model.leveraged_etf_persistence import (
 )
 from hummingbot.model.sql_connection_manager import DatabaseMigrationError, SQLConnectionManager, SQLConnectionType
 
-TARGET_VERSION = "20260719"
+TARGET_VERSION = "20260721"
 LEGACY_VERSION = "20230516"
 LEGACY_FIXTURE = Path(__file__).with_name("fixtures") / "leveraged_etf_legacy_20230516.sql"
 HASH_A = "a" * 64
@@ -464,13 +464,17 @@ def _seed_protected_rows(manager: SQLConnectionManager) -> None:
         connection.execute(
             text("""
                 INSERT INTO LeveragedEtfAnchorState (
-                    cycle_id, schema_version, state_kind, revision, target_session_date,
-                    official_close_utc, deadline_utc, evidence_hash, payload_json,
-                    payload_hash, created_at_utc, updated_at_utc
+                    pair_id, cycle_id, schema_version, state_kind, revision,
+                    target_session_date, official_close_utc, deadline_utc,
+                    evidence_hash, payload_version_field,
+                    payload_contract_version, payload_json, payload_hash,
+                    created_at_utc, updated_at_utc
                 ) VALUES (
-                    'xnys-2026-07-17', 1, 'FINALIZED', 2, '2026-07-17', NULL,
+                    'sndk_snxx', 'xnys-2026-07-17', 2, 'FINALIZED', 2,
+                    '2026-07-17', '2026-07-17T20:00:00.000000Z',
                     '2026-07-17T20:10:00.000000Z', :evidence_hash,
-                    'original', :payload_hash, :created_at, :updated_at
+                    'evidence_version', 3, 'original', :payload_hash,
+                    :created_at, :updated_at
                 )
                 """),
             {
@@ -483,10 +487,19 @@ def _seed_protected_rows(manager: SQLConnectionManager) -> None:
         connection.execute(
             text("""
                 INSERT INTO LeveragedEtfAnchorRevisionObservation (
-                    cycle_id, evidence_hash, observed_at_utc
-                ) VALUES ('xnys-2026-07-17', :evidence_hash, :observed_at)
+                    pair_id, cycle_id, evidence_hash, observed_at_utc,
+                    schema_version, payload_version_field,
+                    payload_contract_version, payload_json, payload_hash
+                ) VALUES (
+                    'sndk_snxx', 'xnys-2026-07-17', :evidence_hash, :observed_at,
+                    2, 'schema_version', 2, 'original', :payload_hash
+                )
                 """),
-            {"evidence_hash": HASH_C, "observed_at": UPDATED_AT},
+            {
+                "evidence_hash": HASH_C,
+                "observed_at": UPDATED_AT,
+                "payload_hash": HASH_A,
+            },
         )
 
 
@@ -1600,41 +1613,50 @@ OR_REPLACE_CASES = [
         "reservation-1",
     ),
     (
-        "anchor_cycle_id",
+        "anchor_pair_cycle_id",
         """
         INSERT OR REPLACE INTO LeveragedEtfAnchorState (
-            cycle_id, schema_version, state_kind, revision, target_session_date,
-            official_close_utc, deadline_utc, evidence_hash, payload_json,
-            payload_hash, created_at_utc, updated_at_utc
-        ) VALUES ('xnys-2026-07-17', 1, 'FINALIZED', 3, '2026-07-17', NULL,
-                  '2026-07-17T20:10:00.000000Z', :hash_c, 'replaced',
-                  :hash_a, :created_at, :updated_at)
+            pair_id, cycle_id, schema_version, state_kind, revision,
+            target_session_date, official_close_utc, deadline_utc,
+            evidence_hash, payload_version_field, payload_contract_version,
+            payload_json, payload_hash, created_at_utc, updated_at_utc
+        ) VALUES ('sndk_snxx', 'xnys-2026-07-17', 2, 'FINALIZED', 3,
+                  '2026-07-17', '2026-07-17T20:00:00.000000Z',
+                  '2026-07-17T20:10:00.000000Z', :hash_c,
+                  'evidence_version', 3, 'replaced', :hash_a,
+                  :created_at, :updated_at)
         """,
-        "SELECT payload_json FROM LeveragedEtfAnchorState WHERE cycle_id = 'xnys-2026-07-17'",
+        "SELECT payload_json FROM LeveragedEtfAnchorState WHERE pair_id = 'sndk_snxx' AND cycle_id = 'xnys-2026-07-17'",
         "original",
     ),
     (
         "anchor_evidence_hash",
         """
         INSERT OR REPLACE INTO LeveragedEtfAnchorState (
-            cycle_id, schema_version, state_kind, revision, target_session_date,
-            official_close_utc, deadline_utc, evidence_hash, payload_json,
-            payload_hash, created_at_utc, updated_at_utc
-        ) VALUES ('xnys-2026-07-18', 1, 'FINALIZED', 1, '2026-07-18', NULL,
-                  '2026-07-18T20:10:00.000000Z', :hash_b, 'replaced',
-                  :hash_a, :created_at, :updated_at)
+            pair_id, cycle_id, schema_version, state_kind, revision,
+            target_session_date, official_close_utc, deadline_utc,
+            evidence_hash, payload_version_field, payload_contract_version,
+            payload_json, payload_hash, created_at_utc, updated_at_utc
+        ) VALUES ('sndk_snxx', 'xnys-2026-07-18', 2, 'FINALIZED', 1,
+                  '2026-07-18', '2026-07-18T20:00:00.000000Z',
+                  '2026-07-18T20:10:00.000000Z', :hash_b,
+                  'evidence_version', 3, 'replaced', :hash_a,
+                  :created_at, :updated_at)
         """,
-        "SELECT cycle_id FROM LeveragedEtfAnchorState WHERE evidence_hash = :hash_b",
+        "SELECT cycle_id FROM LeveragedEtfAnchorState WHERE pair_id = 'sndk_snxx' AND evidence_hash = :hash_b",
         "xnys-2026-07-17",
     ),
     (
         "anchor_observation_primary_key",
         """
         INSERT OR REPLACE INTO LeveragedEtfAnchorRevisionObservation (
-            cycle_id, evidence_hash, observed_at_utc
-        ) VALUES ('xnys-2026-07-17', :hash_c, :updated_at)
+            pair_id, cycle_id, evidence_hash, observed_at_utc,
+            schema_version, payload_version_field, payload_contract_version,
+            payload_json, payload_hash
+        ) VALUES ('sndk_snxx', 'xnys-2026-07-17', :hash_c, :updated_at,
+                  2, 'schema_version', 2, 'replaced', :hash_a)
         """,
-        "SELECT count(*) FROM LeveragedEtfAnchorRevisionObservation WHERE cycle_id = 'xnys-2026-07-17' AND evidence_hash = :hash_c AND observed_at_utc = :updated_at",
+        "SELECT count(*) FROM LeveragedEtfAnchorRevisionObservation WHERE pair_id = 'sndk_snxx' AND cycle_id = 'xnys-2026-07-17' AND evidence_hash = :hash_c AND observed_at_utc = :updated_at",
         1,
     ),
 ]
@@ -1811,26 +1833,33 @@ BAD_HASH_INSERTS = {
     """,
     "anchor_payload_hash": """
         INSERT INTO LeveragedEtfAnchorState (
-            cycle_id, schema_version, state_kind, revision, target_session_date,
-            official_close_utc, deadline_utc, evidence_hash, payload_json,
-            payload_hash, created_at_utc, updated_at_utc
-        ) VALUES ('xnys-2026-07-18', 1, 'CHECKPOINT', 1, '2026-07-18',
+            pair_id, cycle_id, schema_version, state_kind, revision,
+            target_session_date, official_close_utc, deadline_utc,
+            evidence_hash, payload_version_field, payload_contract_version,
+            payload_json, payload_hash, created_at_utc, updated_at_utc
+        ) VALUES ('intc_intw', 'xnys-2026-07-18', 2, 'CHECKPOINT', 1, '2026-07-18',
                   '2026-07-18T20:00:00.000000Z', '2026-07-18T20:10:00.000000Z',
-                  NULL, '{}', :bad_hash, :created_at, :updated_at)
+                  NULL, 'integrity_version', 3, '{}', :bad_hash,
+                  :created_at, :updated_at)
     """,
     "anchor_evidence_hash": """
         INSERT INTO LeveragedEtfAnchorState (
-            cycle_id, schema_version, state_kind, revision, target_session_date,
-            official_close_utc, deadline_utc, evidence_hash, payload_json,
-            payload_hash, created_at_utc, updated_at_utc
-        ) VALUES ('xnys-2026-07-18', 1, 'FINALIZED', 1, '2026-07-18', NULL,
-                  '2026-07-18T20:10:00.000000Z', :bad_hash, '{}', :hash_a,
+            pair_id, cycle_id, schema_version, state_kind, revision,
+            target_session_date, official_close_utc, deadline_utc,
+            evidence_hash, payload_version_field, payload_contract_version,
+            payload_json, payload_hash, created_at_utc, updated_at_utc
+        ) VALUES ('intc_intw', 'xnys-2026-07-18', 2, 'FINALIZED', 1, '2026-07-18',
+                  '2026-07-18T20:00:00.000000Z', '2026-07-18T20:10:00.000000Z',
+                  :bad_hash, 'evidence_version', 3, '{}', :hash_a,
                   :created_at, :updated_at)
     """,
     "anchor_observation_hash": """
         INSERT INTO LeveragedEtfAnchorRevisionObservation (
-            cycle_id, evidence_hash, observed_at_utc
-        ) VALUES ('xnys-2026-07-17', :bad_hash, :updated_at)
+            pair_id, cycle_id, evidence_hash, observed_at_utc,
+            schema_version, payload_version_field, payload_contract_version,
+            payload_json, payload_hash
+        ) VALUES ('sndk_snxx', 'xnys-2026-07-17', :bad_hash, :updated_at,
+                  2, 'schema_version', 2, '{}', :hash_a)
     """,
 }
 
@@ -1872,11 +1901,14 @@ def _seed_round4_hash_prerequisites(manager: SQLConnectionManager) -> None:
         connection.execute(
             text("""
                 INSERT INTO LeveragedEtfAnchorState (
-                    cycle_id, schema_version, state_kind, revision, target_session_date,
-                    official_close_utc, deadline_utc, evidence_hash, payload_json,
-                    payload_hash, created_at_utc, updated_at_utc
-                ) VALUES ('xnys-2026-07-17', 1, 'FINALIZED', 1, '2026-07-17', NULL,
-                          '2026-07-17T20:10:00.000000Z', :hash_b, '{}', :hash_a,
+                    pair_id, cycle_id, schema_version, state_kind, revision,
+                    target_session_date, official_close_utc, deadline_utc,
+                    evidence_hash, payload_version_field, payload_contract_version,
+                    payload_json, payload_hash, created_at_utc, updated_at_utc
+                ) VALUES ('sndk_snxx', 'xnys-2026-07-17', 2, 'FINALIZED', 1,
+                          '2026-07-17', '2026-07-17T20:00:00.000000Z',
+                          '2026-07-17T20:10:00.000000Z', :hash_b,
+                          'evidence_version', 3, '{}', :hash_a,
                           :created_at, :updated_at)
                 """),
             {
@@ -2029,11 +2061,14 @@ def test_all_hash_constraints_reject_lowercase_non_hex_text(
             connection.execute(
                 text("""
                     INSERT INTO LeveragedEtfAnchorState (
-                        cycle_id, schema_version, state_kind, revision, target_session_date,
-                        official_close_utc, deadline_utc, evidence_hash, payload_json,
-                        payload_hash, created_at_utc, updated_at_utc
-                    ) VALUES ('xnys-2026-07-17', 1, 'FINALIZED', 1, '2026-07-17', NULL,
-                              '2026-07-17T20:10:00.000000Z', :hash_b, '{}', :hash_a,
+                        pair_id, cycle_id, schema_version, state_kind, revision,
+                        target_session_date, official_close_utc, deadline_utc,
+                        evidence_hash, payload_version_field, payload_contract_version,
+                        payload_json, payload_hash, created_at_utc, updated_at_utc
+                    ) VALUES ('sndk_snxx', 'xnys-2026-07-17', 2, 'FINALIZED', 1,
+                              '2026-07-17', '2026-07-17T20:00:00.000000Z',
+                              '2026-07-17T20:10:00.000000Z', :hash_b,
+                              'evidence_version', 3, '{}', :hash_a,
                               :created_at, :updated_at)
                     """),
                 {
@@ -2072,11 +2107,14 @@ def test_all_hash_constraints_reject_embedded_nul_suffix(
             connection.execute(
                 text("""
                     INSERT INTO LeveragedEtfAnchorState (
-                        cycle_id, schema_version, state_kind, revision, target_session_date,
-                        official_close_utc, deadline_utc, evidence_hash, payload_json,
-                        payload_hash, created_at_utc, updated_at_utc
-                    ) VALUES ('xnys-2026-07-17', 1, 'FINALIZED', 1, '2026-07-17', NULL,
-                              '2026-07-17T20:10:00.000000Z', :hash_b, '{}', :hash_a,
+                        pair_id, cycle_id, schema_version, state_kind, revision,
+                        target_session_date, official_close_utc, deadline_utc,
+                        evidence_hash, payload_version_field, payload_contract_version,
+                        payload_json, payload_hash, created_at_utc, updated_at_utc
+                    ) VALUES ('sndk_snxx', 'xnys-2026-07-17', 2, 'FINALIZED', 1,
+                              '2026-07-17', '2026-07-17T20:00:00.000000Z',
+                              '2026-07-17T20:10:00.000000Z', :hash_b,
+                              'evidence_version', 3, '{}', :hash_a,
                               :created_at, :updated_at)
                     """),
                 {

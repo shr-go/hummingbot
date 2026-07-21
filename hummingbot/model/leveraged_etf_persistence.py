@@ -8,8 +8,10 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
+    MetaData,
     Text,
     UniqueConstraint,
     event,
@@ -64,6 +66,26 @@ def _canonical_nonnegative_decimal_check(column_name: str) -> str:
 
 def _canonical_positive_decimal_check(column_name: str) -> str:
     return f"({column_name} <> '0') AND ({_canonical_nonnegative_decimal_check(column_name)})"
+
+
+def _canonical_pair_id_check(column_name: str) -> str:
+    return (
+        f"typeof({column_name}) = 'text' "
+        f"AND instr({column_name}, char(0)) = 0 "
+        f"AND length({column_name}) BETWEEN 1 AND 128 "
+        f"AND substr({column_name}, 1, 1) GLOB '[a-z0-9]' "
+        f"AND {column_name} NOT GLOB '*[^a-z0-9_.-]*'"
+    )
+
+
+def _canonical_cycle_id_check(column_name: str) -> str:
+    return (
+        f"typeof({column_name}) = 'text' "
+        f"AND instr({column_name}, char(0)) = 0 "
+        f"AND length({column_name}) = 15 "
+        f"AND {column_name} GLOB "
+        "'xnys-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
+    )
 
 
 class LeveragedEtfExecutorSnapshot(HummingbotBase):
@@ -197,16 +219,23 @@ class LeveragedEtfStrategyReservation(HummingbotBase):
 class LeveragedEtfAnchorState(HummingbotBase):
     __tablename__ = "LeveragedEtfAnchorState"
     __table_args__ = (
-        CheckConstraint("schema_version = 1", name="ck_lepf_anchor_schema_version"),
+        CheckConstraint("schema_version = 2", name="ck_lepf_anchor_schema_version"),
+        CheckConstraint(_canonical_pair_id_check("pair_id"), name="ck_lepf_anchor_pair_id"),
+        CheckConstraint(_canonical_cycle_id_check("cycle_id"), name="ck_lepf_anchor_cycle_id"),
         CheckConstraint("state_kind IN ('CHECKPOINT', 'FINALIZED')", name="ck_lepf_anchor_state_kind"),
         CheckConstraint("revision >= 1", name="ck_lepf_anchor_revision"),
+        CheckConstraint("payload_contract_version >= 1", name="ck_lepf_anchor_payload_contract_version"),
+        CheckConstraint(
+            "payload_version_field IN ('schema_version', 'integrity_version', 'evidence_version')",
+            name="ck_lepf_anchor_payload_version_field",
+        ),
         CheckConstraint(
             "(state_kind = 'CHECKPOINT' AND evidence_hash IS NULL) OR "
             "(state_kind = 'FINALIZED' AND evidence_hash IS NOT NULL)",
             name="ck_lepf_anchor_evidence_state",
         ),
         CheckConstraint(
-            "state_kind = 'FINALIZED' OR official_close_utc IS NOT NULL",
+            "official_close_utc IS NOT NULL",
             name="ck_lepf_anchor_official_close_state",
         ),
         CheckConstraint(
@@ -214,19 +243,23 @@ class LeveragedEtfAnchorState(HummingbotBase):
             name="ck_lepf_anchor_evidence_hash",
         ),
         CheckConstraint(_sha256_check("payload_hash"), name="ck_lepf_anchor_payload_hash"),
-        UniqueConstraint("evidence_hash", name="uq_lepf_anchor_evidence_hash"),
-        Index("lepf_anchor_deadline_state", "deadline_utc", "state_kind"),
-        Index("lepf_anchor_session_date", "target_session_date"),
+        UniqueConstraint("pair_id", "evidence_hash", name="uq_lepf_anchor_pair_evidence_hash"),
+        Index("lepf_anchor_pair_deadline_state", "pair_id", "deadline_utc", "state_kind"),
+        Index("lepf_anchor_pair_session", "pair_id", "target_session_date"),
+        Index("lepf_anchor_pair_cycle", "pair_id", "cycle_id"),
     )
 
+    pair_id = Column(Text, primary_key=True, nullable=False)
     cycle_id = Column(Text, primary_key=True, nullable=False)
     schema_version = Column(Integer, nullable=False)
     state_kind = Column(Text, nullable=False)
     revision = Column(Integer, nullable=False)
     target_session_date = Column(Text, nullable=False)
-    official_close_utc = Column(Text, nullable=True)
+    official_close_utc = Column(Text, nullable=False)
     deadline_utc = Column(Text, nullable=False)
     evidence_hash = Column(Text, nullable=True)
+    payload_version_field = Column(Text, nullable=False)
+    payload_contract_version = Column(Integer, nullable=False)
     payload_json = Column(Text, nullable=False)
     payload_hash = Column(Text, nullable=False)
     created_at_utc = Column(Text, nullable=False)
@@ -236,22 +269,51 @@ class LeveragedEtfAnchorState(HummingbotBase):
 class LeveragedEtfAnchorRevisionObservation(HummingbotBase):
     __tablename__ = "LeveragedEtfAnchorRevisionObservation"
     __table_args__ = (
+        CheckConstraint("schema_version = 2", name="ck_lepf_anchor_observation_schema_version"),
+        CheckConstraint(
+            _canonical_pair_id_check("pair_id"),
+            name="ck_lepf_anchor_observation_pair_id",
+        ),
+        CheckConstraint(
+            _canonical_cycle_id_check("cycle_id"),
+            name="ck_lepf_anchor_observation_cycle_id",
+        ),
         CheckConstraint(_sha256_check("evidence_hash"), name="ck_lepf_anchor_observation_hash"),
-        Index("lepf_anchor_observation_cycle_time", "cycle_id", "observed_at_utc"),
-    )
-
-    cycle_id = Column(
-        Text,
-        ForeignKey(
-            "LeveragedEtfAnchorState.cycle_id",
-            name="fk_lepf_anchor_observation_cycle",
+        CheckConstraint(
+            "payload_contract_version >= 1",
+            name="ck_lepf_anchor_observation_payload_contract_version",
+        ),
+        CheckConstraint(
+            "payload_version_field IN ('schema_version', 'integrity_version', 'evidence_version')",
+            name="ck_lepf_anchor_observation_payload_version_field",
+        ),
+        CheckConstraint(
+            _sha256_check("payload_hash"),
+            name="ck_lepf_anchor_observation_payload_hash",
+        ),
+        ForeignKeyConstraint(
+            ("pair_id", "cycle_id"),
+            ("LeveragedEtfAnchorState.pair_id", "LeveragedEtfAnchorState.cycle_id"),
+            name="fk_lepf_anchor_observation_pair_cycle",
             ondelete="RESTRICT",
         ),
-        primary_key=True,
-        nullable=False,
+        Index(
+            "lepf_anchor_observation_pair_cycle_time",
+            "pair_id",
+            "cycle_id",
+            "observed_at_utc",
+        ),
     )
+
+    pair_id = Column(Text, primary_key=True, nullable=False)
+    cycle_id = Column(Text, primary_key=True, nullable=False)
     evidence_hash = Column(Text, primary_key=True, nullable=False)
     observed_at_utc = Column(Text, primary_key=True, nullable=False)
+    schema_version = Column(Integer, nullable=False)
+    payload_version_field = Column(Text, nullable=False)
+    payload_contract_version = Column(Integer, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    payload_hash = Column(Text, nullable=False)
 
 
 LEVERAGED_ETF_PERSISTENCE_TABLES: Tuple[Table, ...] = (
@@ -437,10 +499,12 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         FOR EACH ROW
         WHEN NOT EXISTS (
             SELECT 1 FROM LeveragedEtfAnchorState
-            WHERE cycle_id = NEW.cycle_id
+            WHERE pair_id = NEW.pair_id
+              AND cycle_id = NEW.cycle_id
+              AND state_kind = 'FINALIZED'
         )
         BEGIN
-            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation cycle_id does not exist');
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation finalized pair/cycle does not exist');
         END
     """,
     "lepf_anchor_observation_identity_insert": """
@@ -449,7 +513,8 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         FOR EACH ROW
         WHEN EXISTS (
             SELECT 1 FROM LeveragedEtfAnchorRevisionObservation
-            WHERE cycle_id = NEW.cycle_id
+            WHERE pair_id = NEW.pair_id
+              AND cycle_id = NEW.cycle_id
               AND evidence_hash = NEW.evidence_hash
               AND observed_at_utc = NEW.observed_at_utc
         )
@@ -500,9 +565,13 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         FOR EACH ROW
         WHEN EXISTS (
             SELECT 1 FROM LeveragedEtfAnchorState
-            WHERE cycle_id = NEW.cycle_id
+            WHERE (
+                    pair_id = NEW.pair_id
+                    AND cycle_id = NEW.cycle_id
+                  )
                OR (
                     NEW.evidence_hash IS NOT NULL
+                    AND pair_id = NEW.pair_id
                     AND evidence_hash = NEW.evidence_hash
                )
         )
@@ -510,11 +579,14 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
             SELECT RAISE(ABORT, 'LeveragedEtfAnchorState identity already exists');
         END
     """,
-    "lepf_anchor_cycle_id_no_update": """
-        CREATE TRIGGER IF NOT EXISTS lepf_anchor_cycle_id_no_update
-        BEFORE UPDATE OF cycle_id ON LeveragedEtfAnchorState
+    "lepf_anchor_pair_cycle_no_update": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_pair_cycle_no_update
+        BEFORE UPDATE OF pair_id, cycle_id ON LeveragedEtfAnchorState
+        FOR EACH ROW
+        WHEN NEW.pair_id <> OLD.pair_id
+          OR NEW.cycle_id <> OLD.cycle_id
         BEGIN
-            SELECT RAISE(ABORT, 'LeveragedEtfAnchorState cycle_id is stable');
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorState pair/cycle identity is stable');
         END
     """,
     "lepf_anchor_state_no_delete": """
@@ -1371,7 +1443,7 @@ def _validate_table_shape(connection: Connection, table: Table) -> Tuple[str, ..
 
 
 def validate_leveraged_etf_persistence_schema(connection: Connection) -> None:
-    """Validate the complete SQLite v1 schema without mutating it."""
+    """Validate the complete canonical pair-scoped SQLite schema without mutating it."""
 
     if connection.dialect.name != "sqlite":
         raise RuntimeError("leveraged ETF persistence supports SQLite only")
@@ -1429,7 +1501,7 @@ def ensure_leveraged_etf_order_ownership_guards(connection: Connection) -> None:
 
 
 def ensure_leveraged_etf_persistence_schema(connection: Connection) -> None:
-    """Create missing v1 SQLite objects, then validate their exact definitions."""
+    """Create missing pair-scoped SQLite objects, then validate their exact definitions."""
 
     if connection.dialect.name != "sqlite":
         raise RuntimeError("leveraged ETF persistence supports SQLite only")
@@ -1443,3 +1515,251 @@ def ensure_leveraged_etf_persistence_schema(connection: Connection) -> None:
         connection.execute(text(statement))
 
     validate_leveraged_etf_persistence_schema(connection)
+
+
+def _intermediate_20260719_anchor_tables() -> Tuple[Table, Table]:
+    """Describe the undeployed cycle-only input solely for exact migration recognition."""
+
+    metadata = MetaData()
+    state = Table(
+        "LeveragedEtfAnchorState",
+        metadata,
+        Column("cycle_id", Text, primary_key=True, nullable=False),
+        Column("schema_version", Integer, nullable=False),
+        Column("state_kind", Text, nullable=False),
+        Column("revision", Integer, nullable=False),
+        Column("target_session_date", Text, nullable=False),
+        Column("official_close_utc", Text, nullable=True),
+        Column("deadline_utc", Text, nullable=False),
+        Column("evidence_hash", Text, nullable=True),
+        Column("payload_json", Text, nullable=False),
+        Column("payload_hash", Text, nullable=False),
+        Column("created_at_utc", Text, nullable=False),
+        Column("updated_at_utc", Text, nullable=False),
+        CheckConstraint("schema_version = 1", name="ck_lepf_anchor_schema_version"),
+        CheckConstraint(
+            "state_kind IN ('CHECKPOINT', 'FINALIZED')",
+            name="ck_lepf_anchor_state_kind",
+        ),
+        CheckConstraint("revision >= 1", name="ck_lepf_anchor_revision"),
+        CheckConstraint(
+            "(state_kind = 'CHECKPOINT' AND evidence_hash IS NULL) OR "
+            "(state_kind = 'FINALIZED' AND evidence_hash IS NOT NULL)",
+            name="ck_lepf_anchor_evidence_state",
+        ),
+        CheckConstraint(
+            "state_kind = 'FINALIZED' OR official_close_utc IS NOT NULL",
+            name="ck_lepf_anchor_official_close_state",
+        ),
+        CheckConstraint(
+            f"evidence_hash IS NULL OR ({_sha256_check('evidence_hash')})",
+            name="ck_lepf_anchor_evidence_hash",
+        ),
+        CheckConstraint(_sha256_check("payload_hash"), name="ck_lepf_anchor_payload_hash"),
+        UniqueConstraint("evidence_hash", name="uq_lepf_anchor_evidence_hash"),
+        Index("lepf_anchor_deadline_state", "deadline_utc", "state_kind"),
+        Index("lepf_anchor_session_date", "target_session_date"),
+    )
+    observation = Table(
+        "LeveragedEtfAnchorRevisionObservation",
+        metadata,
+        Column(
+            "cycle_id",
+            Text,
+            ForeignKey(
+                "LeveragedEtfAnchorState.cycle_id",
+                name="fk_lepf_anchor_observation_cycle",
+            ),
+            primary_key=True,
+            nullable=False,
+        ),
+        Column("evidence_hash", Text, primary_key=True, nullable=False),
+        Column("observed_at_utc", Text, primary_key=True, nullable=False),
+        CheckConstraint(
+            _sha256_check("evidence_hash"),
+            name="ck_lepf_anchor_observation_hash",
+        ),
+        Index("lepf_anchor_observation_cycle_time", "cycle_id", "observed_at_utc"),
+    )
+    return state, observation
+
+
+_INTERMEDIATE_20260719_ANCHOR_GUARD_DDL: Mapping[str, str] = {
+    "lepf_anchor_observation_cycle_fk_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_observation_cycle_fk_insert
+        BEFORE INSERT ON LeveragedEtfAnchorRevisionObservation
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1 FROM LeveragedEtfAnchorState
+            WHERE cycle_id = NEW.cycle_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation cycle_id does not exist');
+        END
+    """,
+    "lepf_anchor_observation_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_observation_identity_insert
+        BEFORE INSERT ON LeveragedEtfAnchorRevisionObservation
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfAnchorRevisionObservation
+            WHERE cycle_id = NEW.cycle_id
+              AND evidence_hash = NEW.evidence_hash
+              AND observed_at_utc = NEW.observed_at_utc
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation identity already exists');
+        END
+    """,
+    "lepf_anchor_observation_no_update": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_observation_no_update
+        BEFORE UPDATE ON LeveragedEtfAnchorRevisionObservation
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation is append-only');
+        END
+    """,
+    "lepf_anchor_observation_no_delete": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_observation_no_delete
+        BEFORE DELETE ON LeveragedEtfAnchorRevisionObservation
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation is append-only');
+        END
+    """,
+    "lepf_anchor_finalized_no_update": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_finalized_no_update
+        BEFORE UPDATE ON LeveragedEtfAnchorState
+        FOR EACH ROW
+        WHEN OLD.state_kind = 'FINALIZED'
+        BEGIN
+            SELECT RAISE(ABORT, 'finalized LeveragedEtfAnchorState is immutable');
+        END
+    """,
+    "lepf_anchor_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_identity_insert
+        BEFORE INSERT ON LeveragedEtfAnchorState
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfAnchorState
+            WHERE cycle_id = NEW.cycle_id
+               OR (
+                    NEW.evidence_hash IS NOT NULL
+                    AND evidence_hash = NEW.evidence_hash
+               )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorState identity already exists');
+        END
+    """,
+    "lepf_anchor_cycle_id_no_update": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_cycle_id_no_update
+        BEFORE UPDATE OF cycle_id ON LeveragedEtfAnchorState
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorState cycle_id is stable');
+        END
+    """,
+    "lepf_anchor_state_no_delete": """
+        CREATE TRIGGER IF NOT EXISTS lepf_anchor_state_no_delete
+        BEFORE DELETE ON LeveragedEtfAnchorState
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfAnchorState is durable');
+        END
+    """,
+}
+
+
+def _validate_intermediate_20260719_anchor_schema(connection: Connection) -> Tuple[str, ...]:
+    errors: List[str] = []
+    intermediate_tables = _intermediate_20260719_anchor_tables()
+    for table in intermediate_tables:
+        errors.extend(_validate_table_shape(connection, table))
+
+    foreign_keys = tuple(
+        tuple(row)
+        for row in connection.exec_driver_sql(
+            'PRAGMA foreign_key_list("LeveragedEtfAnchorRevisionObservation")'
+        ).fetchall()
+    )
+    if len(foreign_keys) != 1 or tuple(str(value).lower() for value in foreign_keys[0][2:8]) != (
+        "leveragedetfanchorstate",
+        "cycle_id",
+        "cycle_id",
+        "no action",
+        "restrict",
+        "none",
+    ):
+        errors.append("20260719 intermediate anchor foreign key is incompatible")
+
+    table_names = {table.name for table in intermediate_tables}
+    actual_triggers = {
+        str(row[0]): (str(row[1]), row[2])
+        for row in connection.execute(
+            text(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name IN (:state_table, :observation_table)"
+            ),
+            {
+                "state_table": LeveragedEtfAnchorState.__tablename__,
+                "observation_table": LeveragedEtfAnchorRevisionObservation.__tablename__,
+            },
+        )
+    }
+    expected_names = set(_INTERMEDIATE_20260719_ANCHOR_GUARD_DDL)
+    for unexpected_name in sorted(set(actual_triggers) - expected_names):
+        errors.append(f"20260719 intermediate anchor trigger {unexpected_name} is unexpected")
+    for name, expected_sql in _INTERMEDIATE_20260719_ANCHOR_GUARD_DDL.items():
+        actual = actual_triggers.get(name)
+        if actual is None:
+            errors.append(f"20260719 intermediate anchor trigger {name} is missing")
+            continue
+        expected_target = _sqlite_trigger_target(expected_sql)
+        if actual[0].lower() != expected_target or actual[0] not in table_names:
+            errors.append(f"20260719 intermediate anchor trigger {name} has incompatible target")
+        if _normalize_trigger_sql(actual[1]) != _normalize_trigger_sql(expected_sql):
+            errors.append(f"20260719 intermediate anchor trigger {name} has incompatible definition")
+    return tuple(errors)
+
+
+def rebuild_empty_intermediate_anchor_schema(connection: Connection) -> None:
+    """Atomically replace only a proven-empty 20260719 cycle-only anchor schema."""
+
+    if connection.dialect.name != "sqlite":
+        raise RuntimeError("leveraged ETF persistence supports SQLite only")
+
+    actual_tables = set(inspect(connection).get_table_names())
+    required = {
+        LeveragedEtfAnchorState.__tablename__,
+        LeveragedEtfAnchorRevisionObservation.__tablename__,
+    }
+    if not required <= actual_tables:
+        raise RuntimeError("20260719 intermediate anchor schema is incomplete")
+
+    def column_names(table_name: str) -> Tuple[str, ...]:
+        return tuple(
+            str(row[1])
+            for row in connection.execute(
+                text("SELECT cid, name FROM pragma_table_xinfo(:table_name) ORDER BY cid"),
+                {"table_name": table_name},
+            )
+        )
+
+    state_columns = column_names(LeveragedEtfAnchorState.__tablename__)
+    observation_columns = column_names(LeveragedEtfAnchorRevisionObservation.__tablename__)
+    final_state_columns = tuple(column.name for column in LeveragedEtfAnchorState.__table__.columns)
+    final_observation_columns = tuple(column.name for column in LeveragedEtfAnchorRevisionObservation.__table__.columns)
+    if state_columns == final_state_columns and observation_columns == final_observation_columns:
+        validate_leveraged_etf_persistence_schema(connection)
+        return
+    errors = _validate_intermediate_20260719_anchor_schema(connection)
+    if errors:
+        raise RuntimeError("20260719 intermediate anchor schema shape is incompatible: " + "; ".join(errors))
+
+    state_count = connection.execute(text('SELECT COUNT(*) FROM "LeveragedEtfAnchorState"')).scalar_one()
+    observation_count = connection.execute(
+        text('SELECT COUNT(*) FROM "LeveragedEtfAnchorRevisionObservation"')
+    ).scalar_one()
+    if state_count != 0 or observation_count != 0:
+        raise RuntimeError("non-empty 20260719 cycle-only anchor schema is ambiguous and cannot be migrated")
+
+    connection.exec_driver_sql('DROP TABLE "LeveragedEtfAnchorRevisionObservation"')
+    connection.exec_driver_sql('DROP TABLE "LeveragedEtfAnchorState"')
+    ensure_leveraged_etf_persistence_schema(connection)

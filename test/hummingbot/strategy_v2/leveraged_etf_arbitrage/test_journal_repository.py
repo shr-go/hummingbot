@@ -20,6 +20,9 @@ from hummingbot.model.leveraged_etf_repository import (
     AnchorRecordV1,
     AnchorRepositoryV1,
     AnchorRevisionConflict,
+    AnchorRevisionObservationV1,
+    AnchorStorageKeyV2,
+    CanonicalOpaqueAnchorPayloadV2,
     CanonicalOpaquePayload,
     JournalConflictError,
     JournalEventType,
@@ -27,7 +30,11 @@ from hummingbot.model.leveraged_etf_repository import (
     JournalIntegrityError,
     LeveragedEtfJournalRepository,
     OpaqueAnchorCheckpointV1,
+    OpaqueAnchorCheckpointV2,
     OpaqueAnchorFinalizedV1,
+    OpaqueAnchorFinalizedV2,
+    OpaqueAnchorRevisionObservationV2,
+    PairScopedAnchorRepository,
     StrategyReservationV1,
 )
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
@@ -91,6 +98,186 @@ def manager(tmp_path: Path):
         yield value
     finally:
         value.engine.dispose()
+
+
+class _V1WireAnchorStorageAdapter:
+    """Test-only bridge proving historical V1 DTOs over the canonical pair-scoped store."""
+
+    def __init__(self, manager: SQLConnectionManager, pair_id: str = "sndk_snxx"):
+        self.repository = PairScopedAnchorRepository(manager)
+        self.pair_id = pair_id
+
+    def _key(self, cycle_id: str) -> AnchorStorageKeyV2:
+        return AnchorStorageKeyV2(pair_id=self.pair_id, cycle_id=cycle_id)
+
+    def _payload(self, payload: CanonicalOpaquePayload) -> CanonicalOpaqueAnchorPayloadV2:
+        value = {**payload.value(), "pair_id": self.pair_id}
+        return CanonicalOpaqueAnchorPayloadV2.from_value(
+            kind=payload.kind,
+            contract_version_field="schema_version",
+            contract_version=payload.schema_version,
+            value=value,
+        )
+
+    @staticmethod
+    def _legacy_payload(payload: CanonicalOpaqueAnchorPayloadV2) -> CanonicalOpaquePayload:
+        value = dict(payload.value())
+        value.pop("pair_id")
+        if payload.kind == "ANCHOR_RECORD" and "yahoo_stock_symbol" in value:
+            value.pop("official_close_utc", None)
+        return CanonicalOpaquePayload.from_value(
+            schema_version=payload.contract_version,
+            kind=payload.kind,
+            value=value,
+        )
+
+    def compare_and_set_opaque_checkpoint(
+        self,
+        checkpoint: OpaqueAnchorCheckpointV1,
+        expected_revision: int,
+    ) -> OpaqueAnchorCheckpointV1:
+        key = self._key(checkpoint.cycle_id)
+        stored = OpaqueAnchorCheckpointV2(
+            key=key,
+            target_session_date=checkpoint.target_session_date,
+            official_close_utc=checkpoint.model_dump(mode="json")["official_close_utc"],
+            deadline_utc=checkpoint.model_dump(mode="json")["deadline_utc"],
+            revision=checkpoint.revision,
+            payload=self._payload(checkpoint.payload),
+        )
+        self.repository.compare_and_set_opaque_checkpoint(key, stored, expected_revision)
+        return checkpoint
+
+    def compare_and_set_checkpoint(
+        self,
+        checkpoint: AnchorPollingCheckpointV1,
+        expected_revision: int,
+    ) -> AnchorPollingCheckpointV1:
+        serialized = checkpoint.model_dump(mode="json")
+        opaque = OpaqueAnchorCheckpointV1(
+            cycle_id=checkpoint.cycle_id,
+            target_session_date=checkpoint.target_session_date,
+            official_close_utc=serialized["official_close_utc"],
+            deadline_utc=serialized["deadline_utc"],
+            revision=checkpoint.revision,
+            payload=CanonicalOpaquePayload.from_value(1, "ANCHOR_CHECKPOINT", serialized),
+        )
+        self.compare_and_set_opaque_checkpoint(opaque, expected_revision)
+        return checkpoint
+
+    def finalize_opaque_if_absent(
+        self,
+        record: OpaqueAnchorFinalizedV1,
+        expected_revision: int,
+    ) -> OpaqueAnchorFinalizedV1:
+        key = self._key(record.cycle_id)
+        serialized = record.model_dump(mode="json")
+        stored = OpaqueAnchorFinalizedV2(
+            key=key,
+            target_session_date=record.target_session_date,
+            official_close_utc=serialized["official_close_utc"],
+            deadline_utc=serialized["deadline_utc"],
+            revision=record.revision,
+            evidence_hash=record.evidence_hash,
+            payload=self._payload(record.payload),
+        )
+        finalized = self.repository.finalize_opaque_if_absent(key, stored, expected_revision)
+        return OpaqueAnchorFinalizedV1(
+            cycle_id=record.cycle_id,
+            target_session_date=finalized.target_session_date,
+            official_close_utc=finalized.official_close_utc,
+            deadline_utc=finalized.deadline_utc,
+            revision=finalized.revision,
+            evidence_hash=finalized.evidence_hash,
+            payload=self._legacy_payload(finalized.payload),
+        )
+
+    def finalize_if_absent(
+        self,
+        record: AnchorRecordV1,
+        expected_revision: int,
+    ) -> AnchorRecordV1:
+        serialized = record.model_dump(mode="json")
+        current = self.repository.load_opaque(self._key(record.cycle_id))
+        if current is None:
+            raise AnchorRevisionConflict("historical V1 finalization requires a stored checkpoint")
+        finalized = self.finalize_opaque_if_absent(
+            OpaqueAnchorFinalizedV1(
+                cycle_id=record.cycle_id,
+                target_session_date=record.target_session_date,
+                official_close_utc=current.official_close_utc,
+                deadline_utc=serialized["deadline_utc"],
+                revision=expected_revision,
+                evidence_hash=record.evidence_hash,
+                payload=CanonicalOpaquePayload.from_value(
+                    1,
+                    "ANCHOR_RECORD",
+                    {**serialized, "official_close_utc": current.official_close_utc},
+                ),
+            ),
+            expected_revision,
+        )
+        return AnchorRecordV1.model_validate(finalized.payload.value())
+
+    def load_opaque(self, cycle_id: str):
+        stored = self.repository.load_opaque(self._key(cycle_id))
+        if stored is None:
+            return None
+        common = {
+            "cycle_id": cycle_id,
+            "target_session_date": stored.target_session_date,
+            "official_close_utc": stored.official_close_utc,
+            "deadline_utc": stored.deadline_utc,
+            "revision": stored.revision,
+            "payload": self._legacy_payload(stored.payload),
+        }
+        if isinstance(stored, OpaqueAnchorCheckpointV2):
+            return OpaqueAnchorCheckpointV1(**common)
+        return OpaqueAnchorFinalizedV1(**common, evidence_hash=stored.evidence_hash)
+
+    def load(self, cycle_id: str):
+        stored = self.load_opaque(cycle_id)
+        if stored is None:
+            return None
+        value = stored.payload.value()
+        if isinstance(stored, OpaqueAnchorCheckpointV1):
+            return AnchorPollingCheckpointV1.model_validate(value)
+        return AnchorRecordV1.model_validate(value)
+
+    def append_revision_observation(self, cycle_id: str, evidence_hash: str, observed_at: str) -> None:
+        key = self._key(cycle_id)
+        value = {
+            "schema_version": 1,
+            "pair_id": self.pair_id,
+            "cycle_id": cycle_id,
+            "evidence_hash": evidence_hash,
+            "observed_at_utc": observed_at,
+        }
+        self.repository.append_opaque_revision_observation(
+            key,
+            OpaqueAnchorRevisionObservationV2(
+                key=key,
+                evidence_hash=evidence_hash,
+                observed_at_utc=observed_at,
+                payload=CanonicalOpaqueAnchorPayloadV2.from_value(
+                    kind="ANCHOR_REVISION_OBSERVATION",
+                    contract_version_field="schema_version",
+                    contract_version=1,
+                    value=value,
+                ),
+            ),
+        )
+
+    def revision_observations(self, cycle_id: str):
+        values = self.repository.opaque_revision_observations(self._key(cycle_id))
+        return tuple(
+            AnchorRevisionObservationV1(
+                cycle_id=cycle_id,
+                evidence_hash=value.evidence_hash,
+                observed_at_utc=value.observed_at_utc,
+            )
+            for value in values
+        )
 
 
 def _initial_snapshot(vectors: dict) -> LeveragedEtfPairExecutorSnapshotV1:
@@ -806,7 +993,7 @@ def test_journal_replay_detects_hash_corruption_after_reopen(tmp_path: Path, vec
 
 
 def test_anchor_checkpoint_cas_and_hash_integrity(manager: SQLConnectionManager, vectors: dict):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
     confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
 
@@ -827,13 +1014,18 @@ def test_anchor_checkpoint_cas_and_hash_integrity(manager: SQLConnectionManager,
 
 
 def test_anchor_opaque_versioned_checkpoint_round_trip_and_cas(manager: SQLConnectionManager):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     payload = CanonicalOpaquePayload.from_value(
         schema_version=2,
         kind="ANCHOR_CHECKPOINT",
         value={
             "schema_version": 2,
             "cycle_id": "xnys-2026-07-18",
+            "target_session_date": "2026-07-18",
+            "official_close_utc": "2026-07-18T20:00:00.000000Z",
+            "deadline_utc": "2026-07-18T20:10:00.000000Z",
+            "next_poll_utc": "2026-07-18T20:00:00.000000Z",
+            "revision": 1,
             "provider_state": {"cursor": "opaque", "samples": ["250", "30"]},
         },
     )
@@ -853,7 +1045,11 @@ def test_anchor_opaque_versioned_checkpoint_round_trip_and_cas(manager: SQLConne
     updated_payload = CanonicalOpaquePayload.from_value(
         schema_version=2,
         kind="ANCHOR_CHECKPOINT",
-        value={**payload.value(), "provider_state": {"cursor": "next", "samples": ["250", "30"]}},
+        value={
+            **payload.value(),
+            "revision": 2,
+            "provider_state": {"cursor": "next", "samples": ["250", "30"]},
+        },
     )
     updated = OpaqueAnchorCheckpointV1.model_validate(
         {**checkpoint.model_dump(mode="json"), "revision": 2, "payload": updated_payload.model_dump(mode="json")}
@@ -867,7 +1063,7 @@ def test_anchor_opaque_versioned_checkpoint_round_trip_and_cas(manager: SQLConne
 def test_anchor_finalize_is_idempotent_and_conflict_is_immutable_after_reopen(tmp_path: Path, vectors: dict):
     db_path = tmp_path / "anchor.sqlite"
     manager = _open_manager(db_path)
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
     record = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record"])
     conflict = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record_conflict"])
@@ -886,7 +1082,7 @@ def test_anchor_finalize_is_idempotent_and_conflict_is_immutable_after_reopen(tm
 
     reopened = _open_manager(db_path)
     try:
-        assert AnchorRepositoryV1(reopened).load(record.cycle_id) == record
+        assert _V1WireAnchorStorageAdapter(reopened).load(record.cycle_id) == record
     finally:
         reopened.engine.dispose()
 
@@ -895,7 +1091,7 @@ def test_anchor_revision_observations_append_without_mutating_final_record(
     manager: SQLConnectionManager,
     vectors: dict,
 ):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
     confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
     record = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record"])
@@ -913,6 +1109,173 @@ def test_anchor_revision_observations_append_without_mutating_final_record(
         ("5" * 64, "2026-07-17T20:05:00.000000Z"),
         ("6" * 64, "2026-07-17T20:06:00.000000Z"),
     )
+
+
+def _pair_scoped_checkpoint(pair_id: str, revision: int) -> tuple[AnchorStorageKeyV2, OpaqueAnchorCheckpointV2]:
+    cycle_id = "xnys-2026-07-18"
+    key = AnchorStorageKeyV2(pair_id=pair_id, cycle_id=cycle_id)
+    fields = {
+        "integrity_version": 3,
+        "pair_id": pair_id,
+        "cycle_id": cycle_id,
+        "target_session_date": "2026-07-18",
+        "official_close_utc": "2026-07-18T20:00:00.000000Z",
+        "deadline_utc": "2026-07-18T20:10:00.000000Z",
+        "next_poll_utc": f"2026-07-18T20:00:0{revision - 1}.000000Z",
+        "revision": revision,
+    }
+    return key, OpaqueAnchorCheckpointV2(
+        key=key,
+        target_session_date=fields["target_session_date"],
+        official_close_utc=fields["official_close_utc"],
+        deadline_utc=fields["deadline_utc"],
+        revision=revision,
+        payload=CanonicalOpaqueAnchorPayloadV2.from_value(
+            kind="ANCHOR_CHECKPOINT",
+            contract_version_field="integrity_version",
+            contract_version=3,
+            value=fields,
+        ),
+    )
+
+
+def _pair_scoped_final(
+    key: AnchorStorageKeyV2,
+    revision: int,
+    evidence_hash: str,
+) -> OpaqueAnchorFinalizedV2:
+    fields = {
+        "evidence_version": 3,
+        "pair_id": key.pair_id,
+        "cycle_id": key.cycle_id,
+        "target_session_date": "2026-07-18",
+        "official_close_utc": "2026-07-18T20:00:00.000000Z",
+        "deadline_utc": "2026-07-18T20:10:00.000000Z",
+        "finalized_at_utc": "2026-07-18T20:02:00.000000Z",
+        "evidence_hash": evidence_hash,
+    }
+    return OpaqueAnchorFinalizedV2(
+        key=key,
+        target_session_date=fields["target_session_date"],
+        official_close_utc=fields["official_close_utc"],
+        deadline_utc=fields["deadline_utc"],
+        revision=revision,
+        evidence_hash=evidence_hash,
+        payload=CanonicalOpaqueAnchorPayloadV2.from_value(
+            kind="ANCHOR_RECORD",
+            contract_version_field="evidence_version",
+            contract_version=3,
+            value=fields,
+        ),
+    )
+
+
+def _pair_scoped_revision(
+    key: AnchorStorageKeyV2,
+    evidence_hash: str,
+    observed_at_utc: str,
+) -> OpaqueAnchorRevisionObservationV2:
+    fields = {
+        "schema_version": 2,
+        "pair_id": key.pair_id,
+        "cycle_id": key.cycle_id,
+        "evidence_hash": evidence_hash,
+        "observed_at_utc": observed_at_utc,
+    }
+    return OpaqueAnchorRevisionObservationV2(
+        key=key,
+        evidence_hash=evidence_hash,
+        observed_at_utc=observed_at_utc,
+        payload=CanonicalOpaqueAnchorPayloadV2.from_value(
+            kind="ANCHOR_REVISION_OBSERVATION",
+            contract_version_field="schema_version",
+            contract_version=2,
+            value=fields,
+        ),
+    )
+
+
+def test_pair_scoped_concurrent_cas_finalization_and_revisions_are_isolated(
+    manager: SQLConnectionManager,
+):
+    repository = PairScopedAnchorRepository(manager)
+    initial = tuple(_pair_scoped_checkpoint(pair_id, revision=1) for pair_id in ("sndk_snxx", "intc_intw"))
+
+    def create(item):
+        key, checkpoint = item
+        return PairScopedAnchorRepository(manager).compare_and_set_opaque_checkpoint(
+            key,
+            checkpoint,
+            expected_revision=0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert tuple(executor.map(create, initial)) == tuple(checkpoint for _, checkpoint in initial)
+
+    updated = tuple(_pair_scoped_checkpoint(key.pair_id, revision=2) for key, _ in initial)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert tuple(
+            executor.map(
+                lambda item: PairScopedAnchorRepository(manager).compare_and_set_opaque_checkpoint(
+                    item[0], item[1], expected_revision=1
+                ),
+                updated,
+            )
+        ) == tuple(checkpoint for _, checkpoint in updated)
+
+    finalized = tuple(
+        (key, _pair_scoped_final(key, revision=2, evidence_hash=str(index) * 64))
+        for index, (key, _) in enumerate(updated, start=1)
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert tuple(
+            executor.map(
+                lambda item: PairScopedAnchorRepository(manager).finalize_opaque_if_absent(
+                    item[0], item[1], expected_revision=2
+                ),
+                finalized,
+            )
+        ) == tuple(record for _, record in finalized)
+
+    revisions = tuple(
+        (
+            key,
+            _pair_scoped_revision(
+                key,
+                evidence_hash=character * 64,
+                observed_at_utc=f"2026-07-18T20:0{index + 2}:00.000000Z",
+            ),
+        )
+        for index, ((key, _), character) in enumerate(zip(finalized, ("a", "b")))
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tuple(
+            executor.map(
+                lambda item: PairScopedAnchorRepository(manager).append_opaque_revision_observation(item[0], item[1]),
+                revisions,
+            )
+        )
+
+    for (key, record), (_, revision) in zip(finalized, revisions):
+        assert repository.load_opaque(key) == record
+        assert repository.opaque_revision_observations(key) == (revision,)
+
+
+@pytest.mark.parametrize("invalid_expected_revision", [False, 0.0, "0", None])
+def test_pair_scoped_cas_rejects_non_integer_expected_revision(
+    manager: SQLConnectionManager,
+    invalid_expected_revision,
+):
+    repository = PairScopedAnchorRepository(manager)
+    key, checkpoint = _pair_scoped_checkpoint("sndk_snxx", revision=1)
+
+    with pytest.raises(AnchorRevisionConflict, match="revision|integer"):
+        repository.compare_and_set_opaque_checkpoint(
+            key,
+            checkpoint,
+            expected_revision=invalid_expected_revision,
+        )
+    assert repository.load_opaque(key) is None
 
 
 def _terminal_snapshot(
@@ -1648,7 +2011,7 @@ def test_matching_opaque_anchor_versions_round_trip_after_reopen(
 ):
     db_path = tmp_path / f"opaque-{schema_version}-{state_kind.lower()}.sqlite"
     manager = _open_manager(db_path)
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     cycle_id = f"xnys-2026-07-{18 + schema_version}"
     target_session_date = f"2026-07-{18 + schema_version}"
     official_close_utc = f"2026-07-{18 + schema_version}T20:00:00.000000Z"
@@ -1663,6 +2026,7 @@ def test_matching_opaque_anchor_versions_round_trip_after_reopen(
                 "target_session_date": target_session_date,
                 "official_close_utc": official_close_utc,
                 "deadline_utc": deadline_utc,
+                "next_poll_utc": official_close_utc,
                 "revision": 1,
                 "provider_state": {"cursor": f"v{schema_version}"},
             },
@@ -1678,6 +2042,31 @@ def test_matching_opaque_anchor_versions_round_trip_after_reopen(
         repository.compare_and_set_opaque_checkpoint(state, expected_revision=0)
     else:
         evidence_hash = str(schema_version) * 64
+        checkpoint_payload = CanonicalOpaquePayload.from_value(
+            schema_version,
+            "ANCHOR_CHECKPOINT",
+            {
+                "schema_version": schema_version,
+                "cycle_id": cycle_id,
+                "target_session_date": target_session_date,
+                "official_close_utc": official_close_utc,
+                "deadline_utc": deadline_utc,
+                "next_poll_utc": official_close_utc,
+                "revision": 1,
+                "provider_state": {"cursor": f"v{schema_version}"},
+            },
+        )
+        repository.compare_and_set_opaque_checkpoint(
+            OpaqueAnchorCheckpointV1(
+                cycle_id=cycle_id,
+                target_session_date=target_session_date,
+                official_close_utc=official_close_utc,
+                deadline_utc=deadline_utc,
+                revision=1,
+                payload=checkpoint_payload,
+            ),
+            expected_revision=0,
+        )
         payload = CanonicalOpaquePayload.from_value(
             schema_version,
             "ANCHOR_RECORD",
@@ -1701,11 +2090,11 @@ def test_matching_opaque_anchor_versions_round_trip_after_reopen(
             evidence_hash=evidence_hash,
             payload=payload,
         )
-        repository.finalize_opaque_if_absent(state, expected_revision=0)
+        repository.finalize_opaque_if_absent(state, expected_revision=1)
     manager.engine.dispose()
     reopened = _open_manager(db_path)
     try:
-        assert AnchorRepositoryV1(reopened).load_opaque(cycle_id) == state
+        assert _V1WireAnchorStorageAdapter(reopened).load_opaque(cycle_id) == state
     finally:
         reopened.engine.dispose()
 
@@ -1724,7 +2113,7 @@ def test_anchor_checkpoint_cycle_identity_is_frozen_without_mutation(
     field_name: str,
     replacement: str,
 ):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
     confirmed_data = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"]).model_dump(
         mode="json"
@@ -1753,7 +2142,7 @@ def test_anchor_typed_finalization_preserves_checkpoint_identity_after_reopen(
 ):
     db_path = tmp_path / f"anchor-final-{field_name}.sqlite"
     manager = _open_manager(db_path)
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
     confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
     repository.compare_and_set_checkpoint(empty, expected_revision=0)
@@ -1761,7 +2150,7 @@ def test_anchor_typed_finalization_preserves_checkpoint_identity_after_reopen(
     manager.engine.dispose()
     reopened = _open_manager(db_path)
     try:
-        reopened_repository = AnchorRepositoryV1(reopened)
+        reopened_repository = _V1WireAnchorStorageAdapter(reopened)
         record_data = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record"]).model_dump(mode="json")
         record_data[field_name] = replacement
         changed_record = AnchorRecordV1.model_validate(record_data)
@@ -1773,7 +2162,7 @@ def test_anchor_typed_finalization_preserves_checkpoint_identity_after_reopen(
 
 
 def test_anchor_opaque_finalization_preserves_official_close(manager: SQLConnectionManager, vectors: dict):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
     confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
     record = AnchorRecordV1.model_validate(vectors["fixtures"]["anchor_record"])
@@ -1798,7 +2187,7 @@ def test_anchor_concurrent_valid_and_identity_conflicting_cas_keeps_valid_state(
     manager: SQLConnectionManager,
     vectors: dict,
 ):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     empty = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_empty"])
     confirmed = AnchorPollingCheckpointV1.model_validate(vectors["fixtures"]["checkpoint_confirmed"])
     invalid = AnchorPollingCheckpointV1.model_validate(
@@ -1808,7 +2197,10 @@ def test_anchor_concurrent_valid_and_identity_conflicting_cas_keeps_valid_state(
 
     def update(checkpoint: AnchorPollingCheckpointV1):
         try:
-            return AnchorRepositoryV1(manager).compare_and_set_checkpoint(checkpoint, expected_revision=1)
+            return _V1WireAnchorStorageAdapter(manager).compare_and_set_checkpoint(
+                checkpoint,
+                expected_revision=1,
+            )
         except (AnchorIntegrityError, AnchorRevisionConflict) as exception:
             return exception
 
@@ -3431,8 +3823,37 @@ def _opaque_final_anchor(
     )
 
 
+def _seed_checkpoint_for_opaque_final(
+    repository: _V1WireAnchorStorageAdapter,
+    final: OpaqueAnchorFinalizedV1,
+) -> None:
+    repository.compare_and_set_opaque_checkpoint(
+        OpaqueAnchorCheckpointV1(
+            cycle_id=final.cycle_id,
+            target_session_date=final.target_session_date,
+            official_close_utc=final.model_dump(mode="json")["official_close_utc"],
+            deadline_utc=final.model_dump(mode="json")["deadline_utc"],
+            revision=1,
+            payload=CanonicalOpaquePayload.from_value(
+                2,
+                "ANCHOR_CHECKPOINT",
+                {
+                    "schema_version": 2,
+                    "cycle_id": final.cycle_id,
+                    "target_session_date": final.target_session_date,
+                    "official_close_utc": final.model_dump(mode="json")["official_close_utc"],
+                    "deadline_utc": final.model_dump(mode="json")["deadline_utc"],
+                    "next_poll_utc": final.model_dump(mode="json")["official_close_utc"],
+                    "revision": 1,
+                },
+            ),
+        ),
+        expected_revision=0,
+    )
+
+
 def test_opaque_anchor_rejects_official_close_mismatch_on_absent_insert(manager: SQLConnectionManager):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     mismatched = _opaque_final_anchor(
         official_close_utc="2026-07-21T20:00:00.000000Z",
         payload_official_close_utc="2026-07-21T20:01:00.000000Z",
@@ -3446,7 +3867,7 @@ def test_opaque_anchor_rejects_official_close_mismatch_on_absent_insert(manager:
 def test_opaque_anchor_rejects_official_close_mismatch_when_finalizing_checkpoint(
     manager: SQLConnectionManager,
 ):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     final = _opaque_final_anchor(
         official_close_utc="2026-07-21T20:00:00.000000Z",
         payload_official_close_utc="2026-07-21T20:01:00.000000Z",
@@ -3466,6 +3887,7 @@ def test_opaque_anchor_rejects_official_close_mismatch_when_finalizing_checkpoin
                 "target_session_date": final.target_session_date,
                 "official_close_utc": "2026-07-21T20:00:00.000000Z",
                 "deadline_utc": "2026-07-21T20:10:00.000000Z",
+                "next_poll_utc": "2026-07-21T20:00:00.000000Z",
                 "revision": 1,
             },
         ),
@@ -3480,31 +3902,33 @@ def test_opaque_anchor_rejects_official_close_mismatch_when_finalizing_checkpoin
 def test_opaque_anchor_rejects_official_close_mismatch_on_idempotent_retry(
     manager: SQLConnectionManager,
 ):
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     valid = _opaque_final_anchor(
         official_close_utc="2026-07-21T20:00:00.000000Z",
         payload_official_close_utc="2026-07-21T20:00:00.000000Z",
     )
-    repository.finalize_opaque_if_absent(valid, expected_revision=0)
+    _seed_checkpoint_for_opaque_final(repository, valid)
+    repository.finalize_opaque_if_absent(valid, expected_revision=1)
     mismatched = _opaque_final_anchor(
         official_close_utc="2026-07-21T20:00:00.000000Z",
         payload_official_close_utc="2026-07-21T20:01:00.000000Z",
     )
 
     with pytest.raises(AnchorIntegrityError, match="official|close|identity|metadata"):
-        repository.finalize_opaque_if_absent(mismatched, expected_revision=0)
+        repository.finalize_opaque_if_absent(mismatched, expected_revision=1)
     assert repository.load_opaque(valid.cycle_id) == valid
 
 
 def test_opaque_anchor_reopen_rejects_persisted_official_close_mismatch(tmp_path: Path):
     db_path = tmp_path / "anchor-close-corruption.sqlite"
     manager = _open_manager(db_path)
-    repository = AnchorRepositoryV1(manager)
+    repository = _V1WireAnchorStorageAdapter(manager)
     valid = _opaque_final_anchor(
         official_close_utc="2026-07-21T20:00:00.000000Z",
         payload_official_close_utc="2026-07-21T20:00:00.000000Z",
     )
-    repository.finalize_opaque_if_absent(valid, expected_revision=0)
+    _seed_checkpoint_for_opaque_final(repository, valid)
+    repository.finalize_opaque_if_absent(valid, expected_revision=1)
     manager.engine.dispose()
 
     with sqlite3.connect(db_path) as connection:
@@ -3521,6 +3945,6 @@ def test_opaque_anchor_reopen_rejects_persisted_official_close_mismatch(tmp_path
     reopened = _open_manager(db_path)
     try:
         with pytest.raises(AnchorIntegrityError, match="official|close|identity|metadata"):
-            AnchorRepositoryV1(reopened).load_opaque(valid.cycle_id)
+            _V1WireAnchorStorageAdapter(reopened).load_opaque(valid.cycle_id)
     finally:
         reopened.engine.dispose()

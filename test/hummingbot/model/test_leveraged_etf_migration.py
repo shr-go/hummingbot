@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -9,9 +10,9 @@ from sqlalchemy.exc import IntegrityError
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+from hummingbot.model.sql_connection_manager import DatabaseMigrationError, SQLConnectionManager, SQLConnectionType
 
-TARGET_VERSION = "20260719"
+TARGET_VERSION = "20260721"
 TARGET_TABLES = {
     "LeveragedEtfAnchorRevisionObservation",
     "LeveragedEtfAnchorState",
@@ -121,6 +122,147 @@ INSERT INTO LeveragedEtfExecutorSnapshot (
 """
 
 
+INTERMEDIATE_20260719_ANCHOR_SQL = """
+CREATE TABLE LeveragedEtfAnchorState (
+    cycle_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    state_kind TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    target_session_date TEXT NOT NULL,
+    official_close_utc TEXT,
+    deadline_utc TEXT NOT NULL,
+    evidence_hash TEXT,
+    payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    PRIMARY KEY (cycle_id),
+    CONSTRAINT ck_lepf_anchor_schema_version CHECK (schema_version = 1),
+    CONSTRAINT ck_lepf_anchor_state_kind CHECK (state_kind IN ('CHECKPOINT', 'FINALIZED')),
+    CONSTRAINT ck_lepf_anchor_revision CHECK (revision >= 1),
+    CONSTRAINT ck_lepf_anchor_evidence_state CHECK (
+        (state_kind = 'CHECKPOINT' AND evidence_hash IS NULL)
+        OR (state_kind = 'FINALIZED' AND evidence_hash IS NOT NULL)
+    ),
+    CONSTRAINT ck_lepf_anchor_official_close_state CHECK (
+        state_kind = 'FINALIZED' OR official_close_utc IS NOT NULL
+    ),
+    CONSTRAINT ck_lepf_anchor_evidence_hash CHECK (
+        evidence_hash IS NULL OR (
+            typeof(evidence_hash) = 'text'
+            AND instr(evidence_hash, char(0)) = 0
+            AND length(evidence_hash) = 64
+            AND evidence_hash = lower(evidence_hash)
+            AND evidence_hash NOT GLOB '*[^0123456789abcdef]*'
+        )
+    ),
+    CONSTRAINT ck_lepf_anchor_payload_hash CHECK (
+        typeof(payload_hash) = 'text'
+        AND instr(payload_hash, char(0)) = 0
+        AND length(payload_hash) = 64
+        AND payload_hash = lower(payload_hash)
+        AND payload_hash NOT GLOB '*[^0123456789abcdef]*'
+    ),
+    CONSTRAINT uq_lepf_anchor_evidence_hash UNIQUE (evidence_hash)
+);
+
+CREATE INDEX lepf_anchor_deadline_state
+    ON LeveragedEtfAnchorState (deadline_utc, state_kind);
+CREATE INDEX lepf_anchor_session_date
+    ON LeveragedEtfAnchorState (target_session_date);
+
+CREATE TABLE LeveragedEtfAnchorRevisionObservation (
+    cycle_id TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    observed_at_utc TEXT NOT NULL,
+    PRIMARY KEY (cycle_id, evidence_hash, observed_at_utc),
+    CONSTRAINT ck_lepf_anchor_observation_hash CHECK (
+        typeof(evidence_hash) = 'text'
+        AND instr(evidence_hash, char(0)) = 0
+        AND length(evidence_hash) = 64
+        AND evidence_hash = lower(evidence_hash)
+        AND evidence_hash NOT GLOB '*[^0123456789abcdef]*'
+    ),
+    CONSTRAINT fk_lepf_anchor_observation_cycle FOREIGN KEY (cycle_id)
+        REFERENCES LeveragedEtfAnchorState (cycle_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX lepf_anchor_observation_cycle_time
+    ON LeveragedEtfAnchorRevisionObservation (cycle_id, observed_at_utc);
+
+CREATE TRIGGER lepf_anchor_observation_cycle_fk_insert
+BEFORE INSERT ON LeveragedEtfAnchorRevisionObservation
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM LeveragedEtfAnchorState
+    WHERE cycle_id = NEW.cycle_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation cycle_id does not exist');
+END;
+
+CREATE TRIGGER lepf_anchor_observation_identity_insert
+BEFORE INSERT ON LeveragedEtfAnchorRevisionObservation
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM LeveragedEtfAnchorRevisionObservation
+    WHERE cycle_id = NEW.cycle_id
+      AND evidence_hash = NEW.evidence_hash
+      AND observed_at_utc = NEW.observed_at_utc
+)
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation identity already exists');
+END;
+
+CREATE TRIGGER lepf_anchor_observation_no_update
+BEFORE UPDATE ON LeveragedEtfAnchorRevisionObservation
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation is append-only');
+END;
+
+CREATE TRIGGER lepf_anchor_observation_no_delete
+BEFORE DELETE ON LeveragedEtfAnchorRevisionObservation
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorRevisionObservation is append-only');
+END;
+
+CREATE TRIGGER lepf_anchor_finalized_no_update
+BEFORE UPDATE ON LeveragedEtfAnchorState
+FOR EACH ROW
+WHEN OLD.state_kind = 'FINALIZED'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized LeveragedEtfAnchorState is immutable');
+END;
+
+CREATE TRIGGER lepf_anchor_identity_insert
+BEFORE INSERT ON LeveragedEtfAnchorState
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM LeveragedEtfAnchorState
+    WHERE cycle_id = NEW.cycle_id
+       OR (
+            NEW.evidence_hash IS NOT NULL
+            AND evidence_hash = NEW.evidence_hash
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorState identity already exists');
+END;
+
+CREATE TRIGGER lepf_anchor_cycle_id_no_update
+BEFORE UPDATE OF cycle_id ON LeveragedEtfAnchorState
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorState cycle_id is stable');
+END;
+
+CREATE TRIGGER lepf_anchor_state_no_delete
+BEFORE DELETE ON LeveragedEtfAnchorState
+BEGIN
+    SELECT RAISE(ABORT, 'LeveragedEtfAnchorState is durable');
+END;
+"""
+
+
 def _client_config() -> ClientConfigAdapter:
     return ClientConfigAdapter(ClientConfigMap())
 
@@ -131,6 +273,39 @@ def _materialize_legacy_database(tmp_path: Path, extra_sql: str = "") -> Path:
         connection.executescript(LEGACY_FIXTURE.read_text(encoding="utf-8"))
         if extra_sql:
             connection.executescript(extra_sql)
+    return db_path
+
+
+def _materialize_intermediate_20260719_database(tmp_path: Path, *, populated: bool) -> Path:
+    db_path = _materialize_legacy_database(tmp_path)
+    manager = _open_manager(db_path)
+    manager.engine.dispose()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE LeveragedEtfAnchorRevisionObservation")
+        connection.execute("DROP TABLE LeveragedEtfAnchorState")
+        connection.executescript(INTERMEDIATE_20260719_ANCHOR_SQL)
+        connection.execute("UPDATE Metadata SET value = '20260719' WHERE key = 'local_db_version'")
+        if populated:
+            connection.execute(
+                """
+                INSERT INTO LeveragedEtfAnchorState (
+                    cycle_id, schema_version, state_kind, revision,
+                    target_session_date, official_close_utc, deadline_utc,
+                    evidence_hash, payload_json, payload_hash,
+                    created_at_utc, updated_at_utc
+                ) VALUES (?, 1, 'FINALIZED', 3, '2026-07-17', NULL, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "xnys-2026-07-17",
+                    "2026-07-17T20:10:00.000000Z",
+                    HASH_B,
+                    '{"legacy":"ambiguous"}',
+                    HASH_A,
+                    CREATED_AT,
+                    UPDATED_AT,
+                ),
+            )
     return db_path
 
 
@@ -149,6 +324,38 @@ def _database_version(manager: SQLConnectionManager) -> str:
 
 def _table_names(manager: SQLConnectionManager) -> set[str]:
     return set(inspect(manager.engine).get_table_names())
+
+
+def _assert_only_canonical_anchor_schema(manager: SQLConnectionManager) -> None:
+    inspector = inspect(manager.engine)
+    anchor_tables = {
+        table_name for table_name in inspector.get_table_names() if table_name.startswith("LeveragedEtfAnchor")
+    }
+    assert anchor_tables == {
+        "LeveragedEtfAnchorRevisionObservation",
+        "LeveragedEtfAnchorState",
+    }
+    assert [column["name"] for column in inspector.get_columns("LeveragedEtfAnchorState")] == [
+        "pair_id",
+        "cycle_id",
+        "schema_version",
+        "state_kind",
+        "revision",
+        "target_session_date",
+        "official_close_utc",
+        "deadline_utc",
+        "evidence_hash",
+        "payload_version_field",
+        "payload_contract_version",
+        "payload_json",
+        "payload_hash",
+        "created_at_utc",
+        "updated_at_utc",
+    ]
+    assert inspector.get_pk_constraint("LeveragedEtfAnchorState")["constrained_columns"] == [
+        "pair_id",
+        "cycle_id",
+    ]
 
 
 def _insert_snapshot(connection, executor_id: str = "executor-1") -> None:
@@ -240,6 +447,7 @@ def test_fresh_database_registers_versioned_tables_constraints_and_indexes(tmp_p
         assert manager.LOCAL_DB_VERSION_VALUE == TARGET_VERSION
         assert _database_version(manager) == TARGET_VERSION
         assert TARGET_TABLES.issubset(_table_names(manager))
+        _assert_only_canonical_anchor_schema(manager)
 
         snapshot_columns = {column["name"]: column for column in inspector.get_columns("LeveragedEtfExecutorSnapshot")}
         assert snapshot_columns["executor_id"]["nullable"] is False
@@ -266,7 +474,22 @@ def test_fresh_database_registers_versioned_tables_constraints_and_indexes(tmp_p
         anchor_checks = {
             constraint["name"] for constraint in inspector.get_check_constraints("LeveragedEtfAnchorState")
         }
-        assert "ck_lepf_anchor_official_close_state" in anchor_checks
+        assert {
+            "ck_lepf_anchor_official_close_state",
+            "ck_lepf_anchor_pair_id",
+            "ck_lepf_anchor_cycle_id",
+            "ck_lepf_anchor_payload_contract_version",
+        }.issubset(anchor_checks)
+        assert inspector.get_pk_constraint("LeveragedEtfAnchorState")["constrained_columns"] == [
+            "pair_id",
+            "cycle_id",
+        ]
+        anchor_indexes = {index["name"] for index in inspector.get_indexes("LeveragedEtfAnchorState")}
+        assert {
+            "lepf_anchor_pair_cycle",
+            "lepf_anchor_pair_deadline_state",
+            "lepf_anchor_pair_session",
+        }.issubset(anchor_indexes)
 
         journal_indexes = {index["name"] for index in inspector.get_indexes("LeveragedEtfJournalEvent")}
         assert {
@@ -283,6 +506,8 @@ def test_fresh_database_registers_versioned_tables_constraints_and_indexes(tmp_p
         assert reservation_foreign_keys[0]["referred_table"] == "LeveragedEtfExecutorSnapshot"
         observation_foreign_keys = inspector.get_foreign_keys("LeveragedEtfAnchorRevisionObservation")
         assert observation_foreign_keys[0]["referred_table"] == "LeveragedEtfAnchorState"
+        assert observation_foreign_keys[0]["constrained_columns"] == ["pair_id", "cycle_id"]
+        assert observation_foreign_keys[0]["referred_columns"] == ["pair_id", "cycle_id"]
     finally:
         manager.engine.dispose()
 
@@ -294,6 +519,7 @@ def test_real_legacy_database_migrates_without_data_loss_and_reopens(tmp_path: P
     try:
         assert _database_version(manager) == TARGET_VERSION
         assert TARGET_TABLES.issubset(_table_names(manager))
+        _assert_only_canonical_anchor_schema(manager)
         with manager.engine.connect() as connection:
             assert (
                 connection.execute(text("SELECT value FROM Metadata WHERE key = 'legacy_sentinel'")).scalar_one()
@@ -317,6 +543,83 @@ def test_real_legacy_database_migrates_without_data_loss_and_reopens(tmp_path: P
             assert connection.execute(text("SELECT count(*) FROM Executors")).scalar_one() == 1
     finally:
         reopened.engine.dispose()
+
+
+def test_empty_20260719_intermediate_anchor_schema_rebuilds_atomically_and_idempotently(
+    tmp_path: Path,
+):
+    db_path = _materialize_intermediate_20260719_database(tmp_path, populated=False)
+
+    manager = _open_manager(db_path)
+    try:
+        assert _database_version(manager) == TARGET_VERSION
+        _assert_only_canonical_anchor_schema(manager)
+        with manager.engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT value FROM Metadata WHERE key = 'legacy_sentinel'")).scalar_one()
+                == "preserve-me"
+            )
+            assert connection.execute(text("SELECT count(*) FROM Executors")).scalar_one() == 1
+            assert connection.execute(text("SELECT count(*) FROM LeveragedEtfAnchorState")).scalar_one() == 0
+            assert connection.execute(text("PRAGMA integrity_check")).scalar_one() == "ok"
+    finally:
+        manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        assert _database_version(reopened) == TARGET_VERSION
+        _assert_only_canonical_anchor_schema(reopened)
+        with reopened.engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM Executors")).scalar_one() == 1
+            assert connection.execute(text("PRAGMA integrity_check")).scalar_one() == "ok"
+    finally:
+        reopened.engine.dispose()
+
+
+def test_nonempty_20260719_intermediate_anchor_schema_fails_without_mutating_source(
+    tmp_path: Path,
+):
+    db_path = _materialize_intermediate_20260719_database(tmp_path, populated=True)
+    original_digest = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    with pytest.raises(
+        DatabaseMigrationError,
+        match="non-empty 20260719 cycle-only anchor schema is ambiguous",
+    ):
+        _open_manager(db_path)
+
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == original_digest
+    assert not tuple(tmp_path.glob(f".{db_path.name}.migration-*.sqlite"))
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT value FROM Metadata WHERE key = 'local_db_version'").fetchone() == (
+            "20260719",
+        )
+        assert connection.execute(
+            "SELECT cycle_id, revision, evidence_hash, payload_json " "FROM LeveragedEtfAnchorState"
+        ).fetchall() == [("xnys-2026-07-17", 3, HASH_B, '{"legacy":"ambiguous"}')]
+        assert connection.execute("SELECT value FROM Metadata WHERE key = 'legacy_sentinel'").fetchone() == (
+            "preserve-me",
+        )
+
+
+def test_drifted_20260719_intermediate_shape_fails_without_mutating_source(tmp_path: Path):
+    db_path = _materialize_intermediate_20260719_database(tmp_path, populated=False)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP INDEX lepf_anchor_session_date")
+    original_digest = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    with pytest.raises(
+        DatabaseMigrationError,
+        match="20260719 intermediate anchor schema shape is incompatible",
+    ):
+        _open_manager(db_path)
+
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == original_digest
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT value FROM Metadata WHERE key = 'local_db_version'").fetchone() == (
+            "20260719",
+        )
+        assert connection.execute("SELECT count(*) FROM LeveragedEtfAnchorState").fetchone() == (0,)
 
 
 def test_partial_schema_and_repeated_migration_are_idempotent(tmp_path: Path):
@@ -443,10 +746,19 @@ def test_constraints_reject_duplicate_stable_ids_invalid_foreign_keys_and_null_p
                 connection.execute(
                     text("""
                         INSERT INTO LeveragedEtfAnchorRevisionObservation (
-                            cycle_id, evidence_hash, observed_at_utc
-                        ) VALUES ('missing-cycle', :evidence_hash, :observed_at)
+                            pair_id, cycle_id, evidence_hash, observed_at_utc,
+                            schema_version, payload_version_field,
+                            payload_contract_version, payload_json, payload_hash
+                        ) VALUES (
+                            'sndk_snxx', 'xnys-2026-07-18', :evidence_hash, :observed_at,
+                            2, 'schema_version', 2, '{}', :payload_hash
+                        )
                         """),
-                    {"evidence_hash": HASH_B, "observed_at": UPDATED_AT},
+                    {
+                        "evidence_hash": HASH_B,
+                        "observed_at": UPDATED_AT,
+                        "payload_hash": HASH_A,
+                    },
                 )
 
         with pytest.raises(IntegrityError):
@@ -454,12 +766,15 @@ def test_constraints_reject_duplicate_stable_ids_invalid_foreign_keys_and_null_p
                 connection.execute(
                     text("""
                         INSERT INTO LeveragedEtfAnchorState (
-                            cycle_id, schema_version, state_kind, revision, target_session_date,
-                            official_close_utc, deadline_utc, evidence_hash, payload_json,
-                            payload_hash, created_at_utc, updated_at_utc
+                            pair_id, cycle_id, schema_version, state_kind, revision,
+                            target_session_date, official_close_utc, deadline_utc,
+                            evidence_hash, payload_version_field,
+                            payload_contract_version, payload_json, payload_hash,
+                            created_at_utc, updated_at_utc
                         ) VALUES (
-                            'checkpoint-without-close', 1, 'CHECKPOINT', 1, '2026-07-17',
-                            NULL, '2026-07-17T20:10:00.000000Z', NULL, '{}',
+                            'sndk_snxx', 'xnys-2026-07-17', 2, 'CHECKPOINT', 1,
+                            '2026-07-17', NULL, '2026-07-17T20:10:00.000000Z',
+                            NULL, 'integrity_version', 3, '{}',
                             :payload_hash, :created_at, :updated_at
                         )
                         """),
@@ -479,12 +794,16 @@ def test_append_only_guards_survive_database_reopen(tmp_path: Path):
             connection.execute(
                 text("""
                     INSERT INTO LeveragedEtfAnchorState (
-                        cycle_id, schema_version, state_kind, revision, target_session_date,
-                        official_close_utc, deadline_utc, evidence_hash, payload_json,
-                        payload_hash, created_at_utc, updated_at_utc
+                        pair_id, cycle_id, schema_version, state_kind, revision,
+                        target_session_date, official_close_utc, deadline_utc,
+                        evidence_hash, payload_version_field,
+                        payload_contract_version, payload_json, payload_hash,
+                        created_at_utc, updated_at_utc
                     ) VALUES (
-                        'XNYS-2026-07-17', 1, 'FINALIZED', 2, '2026-07-17',
-                        NULL, '2026-07-17T20:10:00.000000Z', :evidence_hash, '{}',
+                        'sndk_snxx', 'xnys-2026-07-17', 2, 'FINALIZED', 2,
+                        '2026-07-17', '2026-07-17T20:00:00.000000Z',
+                        '2026-07-17T20:10:00.000000Z', :evidence_hash,
+                        'evidence_version', 3, '{}',
                         :payload_hash, :created_at, :updated_at
                     )
                     """),
@@ -498,10 +817,19 @@ def test_append_only_guards_survive_database_reopen(tmp_path: Path):
             connection.execute(
                 text("""
                     INSERT INTO LeveragedEtfAnchorRevisionObservation (
-                        cycle_id, evidence_hash, observed_at_utc
-                    ) VALUES ('XNYS-2026-07-17', :evidence_hash, :observed_at)
+                        pair_id, cycle_id, evidence_hash, observed_at_utc,
+                        schema_version, payload_version_field,
+                        payload_contract_version, payload_json, payload_hash
+                    ) VALUES (
+                        'sndk_snxx', 'xnys-2026-07-17', :evidence_hash, :observed_at,
+                        2, 'schema_version', 2, '{}', :payload_hash
+                    )
                     """),
-                {"evidence_hash": HASH_A, "observed_at": UPDATED_AT},
+                {
+                    "evidence_hash": HASH_A,
+                    "observed_at": UPDATED_AT,
+                    "payload_hash": HASH_B,
+                },
             )
     finally:
         manager.engine.dispose()
@@ -519,14 +847,14 @@ def test_append_only_guards_survive_database_reopen(tmp_path: Path):
         with pytest.raises(IntegrityError):
             with reopened.engine.begin() as connection:
                 connection.execute(
-                    text("DELETE FROM LeveragedEtfAnchorRevisionObservation " "WHERE cycle_id = 'XNYS-2026-07-17'")
+                    text("DELETE FROM LeveragedEtfAnchorRevisionObservation " "WHERE cycle_id = 'xnys-2026-07-17'")
                 )
         with pytest.raises(IntegrityError):
             with reopened.engine.begin() as connection:
                 connection.execute(
                     text(
                         "UPDATE LeveragedEtfAnchorState SET evidence_hash = :evidence_hash "
-                        "WHERE cycle_id = 'XNYS-2026-07-17'"
+                        "WHERE pair_id = 'sndk_snxx' AND cycle_id = 'xnys-2026-07-17'"
                     ),
                     {"evidence_hash": "c" * 64},
                 )
