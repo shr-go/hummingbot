@@ -13,7 +13,10 @@ from controllers.generic.equity_leveraged_etf_arbitrage.controller import (
     PairEpochFacts,
     ReservationConflict,
 )
-from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
+from controllers.generic.equity_leveraged_etf_arbitrage.reservations import (
+    F004ReservationStore,
+)
+from hummingbot.model.leveraged_etf_repository import LeveragedEtfJournalRepository
 from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types import (
     LeveragedEtfPairExecutorConfig,
 )
@@ -26,7 +29,10 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.allocator import (
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import StrategyConfig
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import ArbitrageDirection
-from hummingbot.strategy_v2.leveraged_etf_arbitrage.risk import LeverageBracket, LeverageSchedule
+from hummingbot.strategy_v2.leveraged_etf_arbitrage.risk import (
+    LeverageBracket,
+    LeverageSchedule,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
@@ -68,7 +74,9 @@ class _ActiveReservation:
 
 
 class _ReservationStore:
-    def __init__(self, active: Iterable[_ActiveReservation] = (), *, reject: bool = False):
+    def __init__(
+        self, active: Iterable[_ActiveReservation] = (), *, reject: bool = False
+    ):
         self.active_records = list(active)
         self.reject = reject
         self.reserve_calls: list[LeveragedEtfPairExecutorConfig] = []
@@ -86,7 +94,10 @@ class _ReservationStore:
                 current.trading_pair,
             ) in {
                 (executor_config.etf_connector_name, executor_config.etf_trading_pair),
-                (executor_config.stock_connector_name, executor_config.stock_trading_pair),
+                (
+                    executor_config.stock_connector_name,
+                    executor_config.stock_trading_pair,
+                ),
             }:
                 raise ReservationConflict("symbol is already reserved")
         self.reserve_calls.append(executor_config)
@@ -109,7 +120,38 @@ class _ReservationStore:
 
     def release(self, executor_id: str, released_at_utc: str):
         self.released_executor_ids.append(executor_id)
-        self.active_records = [record for record in self.active_records if record.executor_id != executor_id]
+        self.active_records = [
+            record
+            for record in self.active_records
+            if record.executor_id != executor_id
+        ]
+
+
+class _F004Repository(LeveragedEtfJournalRepository):
+    """Narrow in-memory F004 boundary double that preserves the real type."""
+
+    def __init__(self, events: list[str]):
+        self.events = events
+        self.records = []
+
+    def active_reservations(self, executor_id=None):
+        records = self.records
+        if executor_id is not None:
+            records = [
+                record for record in records if record.executor_id == executor_id
+            ]
+        return tuple(records)
+
+    def reserve(self, reservation):
+        self.events.append(f"reserve:{reservation.leg}")
+        self.records.append(reservation)
+        return reservation
+
+    def release_reservation(self, reservation_id: str, released_at_utc: str):
+        self.events.append(f"release:{reservation_id}")
+        return next(
+            record for record in self.records if record.reservation_id == reservation_id
+        )
 
 
 class _MarketDataProvider:
@@ -128,7 +170,9 @@ class _Connector:
 
     async def strict_account_preflight(self, **kwargs):
         self.preflight_calls.append(kwargs)
-        value = self.preflights[min(len(self.preflight_calls) - 1, len(self.preflights) - 1)]
+        value = self.preflights[
+            min(len(self.preflight_calls) - 1, len(self.preflights) - 1)
+        ]
         if isinstance(value, Exception):
             raise value
         return value
@@ -137,7 +181,9 @@ class _Connector:
         self.leverage_calls.append((trading_pair, leverage))
         if self.leverage_result is not None:
             return self.leverage_result(trading_pair, leverage)
-        return SimpleNamespace(symbol=trading_pair, leverage=leverage, max_notional_value=D("1000000"))
+        return SimpleNamespace(
+            symbol=trading_pair, leverage=leverage, max_notional_value=D("1000000")
+        )
 
 
 class _EpochSource:
@@ -146,7 +192,9 @@ class _EpochSource:
         self.calls = []
 
     async def build_epoch(self, preflight, configured_pairs, active_reservations):
-        self.calls.append((preflight, tuple(configured_pairs), tuple(active_reservations)))
+        self.calls.append(
+            (preflight, tuple(configured_pairs), tuple(active_reservations))
+        )
         return self.epochs[min(len(self.calls) - 1, len(self.epochs) - 1)]
 
 
@@ -279,7 +327,11 @@ def _anchor(pair: FrozenPair) -> AnchorFacts:
     )
 
 
-def _epoch(*pairs: FrozenPair, account: AccountRiskSnapshot | None = None, stale_account: bool = False) -> ControllerEpoch:
+def _epoch(
+    *pairs: FrozenPair,
+    account: AccountRiskSnapshot | None = None,
+    stale_account: bool = False,
+) -> ControllerEpoch:
     return ControllerEpoch(
         account=account or _account(),
         account_data_fresh=not stale_account,
@@ -330,7 +382,9 @@ def _actions(controller):
     return asyncio.run(run())
 
 
-def _executor_info(config, status: RunnableStatus, *, custom_state: str | None = None) -> ExecutorInfo:
+def _executor_info(
+    config, status: RunnableStatus, *, custom_state: str | None = None
+) -> ExecutorInfo:
     custom_info = {} if custom_state is None else {"state": custom_state}
     return ExecutorInfo(
         id=config.id,
@@ -352,7 +406,11 @@ def _executor_info(config, status: RunnableStatus, *, custom_state: str | None =
 def _created_config(configured: _ConfiguredPair) -> LeveragedEtfPairExecutorConfig:
     controller, _ = _controller((configured,), (_epoch(_frozen_pair(configured)),))
     actions = _actions(controller)
-    return next(action.executor_config for action in actions if isinstance(action, CreateExecutorAction))
+    return next(
+        action.executor_config
+        for action in actions
+        if isinstance(action, CreateExecutorAction)
+    )
 
 
 def test_registers_one_to_four_pairs_and_isolates_pair_local_market_failure():
@@ -366,12 +424,19 @@ def test_registers_one_to_four_pairs_and_isolates_pair_local_market_failure():
         market_data_fresh=False,
         failure_reason="stock order book unavailable",
     )
-    controller, connector = _controller(configured, (replace(epoch, pairs=epoch.pairs[:2] + (unavailable,) + epoch.pairs[3:]),))
+    controller, connector = _controller(
+        configured,
+        (replace(epoch, pairs=epoch.pairs[:2] + (unavailable,) + epoch.pairs[3:]),),
+    )
 
     actions = _actions(controller)
 
     creates = [action for action in actions if isinstance(action, CreateExecutorAction)]
-    assert {action.executor_config.pair_id for action in creates} == {"pair1", "pair2", "pair4"}
+    assert {action.executor_config.pair_id for action in creates} == {
+        "pair1",
+        "pair2",
+        "pair4",
+    }
     assert connector.preflight_calls[0]["trading_pairs"] == (
         "ETF1-USDT",
         "ETF2-USDT",
@@ -389,17 +454,32 @@ def test_stale_account_or_book_fails_closed(stale_account: bool, stale_book: boo
     configured = _configured_pair(1)
     epoch = _epoch(_frozen_pair(configured), stale_account=stale_account)
     if stale_book:
-        epoch = replace(epoch, pairs=(replace(epoch.pairs[0], market_data_fresh=False),))
+        epoch = replace(
+            epoch, pairs=(replace(epoch.pairs[0], market_data_fresh=False),)
+        )
     controller, connector = _controller((configured,), (epoch,))
 
     assert _actions(controller) == []
     assert connector.leverage_calls == []
 
 
+@pytest.mark.parametrize("data_time", (float("nan"), _NOW - 6))
+def test_invalid_or_stale_preflight_timestamp_fails_closed(data_time: float):
+    configured = _configured_pair(1)
+    connector = _Connector((_preflight(data_time=data_time),))
+    controller, _ = _controller(
+        (configured,), (_epoch(_frozen_pair(configured)),), connector=connector
+    )
+
+    assert _actions(controller) == []
+
+
 def test_unknown_related_position_preflight_error_fails_closed():
     configured = _configured_pair(1)
     connector = _Connector((RuntimeError("unknown related position"),))
-    controller, _ = _controller((configured,), (_epoch(_frozen_pair(configured)),), connector=connector)
+    controller, _ = _controller(
+        (configured,), (_epoch(_frozen_pair(configured)),), connector=connector
+    )
 
     assert _actions(controller) == []
 
@@ -407,7 +487,11 @@ def test_unknown_related_position_preflight_error_fails_closed():
 def test_restart_with_durable_symbol_reservation_blocks_duplicate_executor():
     configured = _configured_pair(1)
     reservations = _ReservationStore(
-        (_ActiveReservation("prior-executor", "binance_perpetual", configured.etf_trading_pair),)
+        (
+            _ActiveReservation(
+                "prior-executor", "binance_perpetual", configured.etf_trading_pair
+            ),
+        )
     )
     controller, connector = _controller(
         (configured,),
@@ -416,8 +500,29 @@ def test_restart_with_durable_symbol_reservation_blocks_duplicate_executor():
     )
 
     assert _actions(controller) == []
-    assert connector.preflight_calls[0]["known_position_trading_pairs"] == (configured.etf_trading_pair,)
+    assert connector.preflight_calls[0]["known_position_trading_pairs"] == (
+        configured.etf_trading_pair,
+    )
     assert reservations.reserve_calls == []
+
+
+def test_f004_adapter_bootstraps_then_locks_both_symbols_and_rejects_duplicate():
+    configured = _configured_pair(1)
+    config = _created_config(configured)
+    events: list[str] = []
+    repository = _F004Repository(events)
+    store = F004ReservationStore(
+        repository, lambda created: events.append(f"ensure:{created.id}")
+    )
+
+    persisted = store.reserve(config)
+
+    assert [reservation.leg for reservation in persisted] == ["ETF", "STOCK"]
+    assert events == [f"ensure:{config.id}", "reserve:ETF", "reserve:STOCK"]
+    duplicate = config.model_copy(update={"id": "portfolio-controller:pair1:duplicate"})
+    with pytest.raises(ReservationConflict, match="already reserved"):
+        store.reserve(duplicate)
+    assert events == [f"ensure:{config.id}", "reserve:ETF", "reserve:STOCK"]
 
 
 @pytest.mark.parametrize(
@@ -431,7 +536,9 @@ def test_every_non_done_executor_blocks_pair_replacement(status, custom_state):
     configured = _configured_pair(1)
     config = _created_config(configured)
     controller, _ = _controller((configured,), (_epoch(_frozen_pair(configured)),))
-    controller.executors_info = [_executor_info(config, status, custom_state=custom_state)]
+    controller.executors_info = [
+        _executor_info(config, status, custom_state=custom_state)
+    ]
 
     actions = _actions(controller)
 
@@ -446,7 +553,9 @@ def test_every_non_done_executor_blocks_pair_replacement(status, custom_state):
         (ArbitrageDirection.LONG_ETF_SHORT_STOCK, D("1")),
     ),
 )
-def test_target_decrease_or_direction_flip_stops_existing_executor(direction, target_ratio):
+def test_target_decrease_or_direction_flip_stops_existing_executor(
+    direction, target_ratio
+):
     configured = _configured_pair(1)
     config = _created_config(configured)
     current_pair = _frozen_pair(
@@ -461,7 +570,38 @@ def test_target_decrease_or_direction_flip_stops_existing_executor(direction, ta
 
     actions = _actions(controller)
 
-    assert actions == [StopExecutorAction(controller_id="portfolio-controller", executor_id=config.id, keep_position=True)]
+    assert actions == [
+        StopExecutorAction(
+            controller_id="portfolio-controller",
+            executor_id=config.id,
+            keep_position=True,
+        )
+    ]
+
+
+def test_direction_flip_creates_only_a_close_after_the_old_executor_is_done():
+    configured = _configured_pair(1)
+    config = _created_config(configured)
+    current_pair = _frozen_pair(
+        configured,
+        direction=ArbitrageDirection.LONG_ETF_SHORT_STOCK,
+        target_ratio=D("1"),
+        current_etf=-config.etf_target_quantity,
+        current_stock=config.stock_target_quantity,
+    )
+    reservations = _ReservationStore()
+    controller, _ = _controller(
+        (configured,), (_epoch(current_pair),), reservations=reservations
+    )
+
+    actions = _actions(controller)
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], CreateExecutorAction)
+    assert actions[0].executor_config.operation.value == "CLOSE"
+    assert actions[0].executor_config.direction.value == "SHORT_ETF_LONG_STOCK"
+    assert actions[0].executor_config.target_gross_notional == D("0")
+    assert reservations.reserve_calls == []
 
 
 def test_leverage_response_mismatch_never_reserves_or_creates():
@@ -501,8 +641,15 @@ def test_terminal_executor_is_stored_and_its_reservation_is_released():
     config = _created_config(configured)
     reservations = _ReservationStore(
         (
-            _ActiveReservation(config.id, config.etf_connector_name, config.etf_trading_pair),
-            _ActiveReservation(config.id, config.stock_connector_name, config.stock_trading_pair, "STOCK"),
+            _ActiveReservation(
+                config.id, config.etf_connector_name, config.etf_trading_pair
+            ),
+            _ActiveReservation(
+                config.id,
+                config.stock_connector_name,
+                config.stock_trading_pair,
+                "STOCK",
+            ),
         )
     )
     unavailable = PairEpochFacts(
@@ -513,17 +660,27 @@ def test_terminal_executor_is_stored_and_its_reservation_is_released():
         bracket_data_fresh=False,
         failure_reason="book unavailable",
     )
-    controller, _ = _controller(
+    controller, connector = _controller(
         (configured,),
-        (ControllerEpoch(account=_account(), account_data_fresh=True, pairs=(unavailable,)),),
+        (
+            ControllerEpoch(
+                account=_account(), account_data_fresh=True, pairs=(unavailable,)
+            ),
+        ),
         reservations=reservations,
     )
     controller.executors_info = [_executor_info(config, RunnableStatus.TERMINATED)]
 
     actions = _actions(controller)
 
-    assert actions == [StoreExecutorAction(controller_id="portfolio-controller", executor_id=config.id)]
+    assert actions == [
+        StoreExecutorAction(controller_id="portfolio-controller", executor_id=config.id)
+    ]
     assert reservations.released_executor_ids == [config.id]
+    assert connector.preflight_calls[0]["known_position_trading_pairs"] == (
+        config.etf_trading_pair,
+        config.stock_trading_pair,
+    )
 
 
 def test_removed_pair_requests_stop_without_reconstructing_an_active_executor():
@@ -540,14 +697,22 @@ def test_removed_pair_requests_stop_without_reconstructing_an_active_executor():
     )
     controller, _ = _controller(
         (retained,),
-        (ControllerEpoch(account=_account(), account_data_fresh=True, pairs=(unavailable,)),),
+        (
+            ControllerEpoch(
+                account=_account(), account_data_fresh=True, pairs=(unavailable,)
+            ),
+        ),
     )
     controller.executors_info = [_executor_info(removed_config, RunnableStatus.RUNNING)]
 
     actions = _actions(controller)
 
     assert actions == [
-        StopExecutorAction(controller_id="portfolio-controller", executor_id=removed_config.id, keep_position=True)
+        StopExecutorAction(
+            controller_id="portfolio-controller",
+            executor_id=removed_config.id,
+            keep_position=True,
+        )
     ]
 
 
