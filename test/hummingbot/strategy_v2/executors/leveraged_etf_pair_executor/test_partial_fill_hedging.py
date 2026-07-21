@@ -423,6 +423,62 @@ async def test_stock_creation_submits_hedge_fills_deferred_while_the_prior_nativ
 
 
 @pytest.mark.asyncio
+async def test_stock_fill_before_created_submits_the_deferred_increment_once_without_a_late_created_duplicate():
+    executor, connector, _, _ = _executor()
+    await executor.control_task()
+
+    for trade_id, amount in (("etf-fill-before-created-1", "10"), ("etf-fill-before-created-2", "5")):
+        executor.process_order_filled_event(
+            MarketEvent.OrderFilled.value,
+            connector,
+            _fill_event(
+                executor.maker_client_order_id,
+                trade_id,
+                amount,
+                timestamp=1.0,
+                trading_pair="SNXX-USDT",
+                side=TradeType.SELL,
+            ),
+        )
+
+    stock_orders = [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"]
+    assert [order["amount"] for order in stock_orders] == [Decimal("9.6")]
+    first_stock_order_id = stock_orders[0]["client_order_id"]
+
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            first_stock_order_id,
+            "stock-fill-before-created-1",
+            "9.6",
+            timestamp=2.0,
+            trading_pair="SNDK-USDT",
+            side=TradeType.BUY,
+        ),
+    )
+
+    stock_orders = [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"]
+    assert [order["amount"] for order in stock_orders] == [Decimal("9.6"), Decimal("4.8")]
+
+    executor.process_order_created_event(
+        MarketEvent.BuyOrderCreated.value,
+        connector,
+        _created_event(
+            first_stock_order_id,
+            trading_pair="SNDK-USDT",
+            side=TradeType.BUY,
+            exchange_order_id="20001",
+        ),
+    )
+
+    assert [order["amount"] for order in connector.orders if order["trading_pair"] == "SNDK-USDT"] == [
+        Decimal("9.6"),
+        Decimal("4.8"),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operation",
     [
