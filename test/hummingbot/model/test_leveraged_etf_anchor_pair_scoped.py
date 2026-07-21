@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import inspect
 
 from hummingbot.client.config.client_config_map import ClientConfigMap
@@ -35,6 +40,117 @@ def _open_manager(db_path: Path) -> SQLConnectionManager:
     )
 
 
+class _RevisionInt(int):
+    pass
+
+
+def _checkpoint_fields(revision: Any) -> dict[str, Any]:
+    return {
+        "integrity_version": 3,
+        "pair_id": "sndk_snxx",
+        "cycle_id": "xnys-2026-07-17",
+        "target_session_date": "2026-07-17",
+        "official_close_utc": "2026-07-17T20:00:00.000000Z",
+        "deadline_utc": "2026-07-17T20:10:00.000000Z",
+        "next_poll_utc": "2026-07-17T20:00:00.000000Z",
+        "revision": revision,
+    }
+
+
+def _canonical_json_hash(value: dict[str, Any]) -> tuple[str, str]:
+    payload_json = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return payload_json, hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_payload_from_value(revision: Any):
+    return durable_contract.CanonicalOpaqueAnchorPayloadV2.from_value(
+        kind="ANCHOR_CHECKPOINT",
+        contract_version_field="integrity_version",
+        contract_version=3,
+        value=_checkpoint_fields(revision),
+    )
+
+
+def _checkpoint_envelope(payload, revision: int = 1):
+    fields = _checkpoint_fields(revision)
+    return durable_contract.OpaqueAnchorCheckpointV2(
+        key=durable_contract.AnchorStorageKeyV2(
+            pair_id=fields["pair_id"],
+            cycle_id=fields["cycle_id"],
+        ),
+        target_session_date=fields["target_session_date"],
+        official_close_utc=fields["official_close_utc"],
+        deadline_utc=fields["deadline_utc"],
+        revision=revision,
+        payload=payload,
+    )
+
+
+class _CaptureMappings:
+    @staticmethod
+    def one_or_none():
+        return None
+
+
+class _CaptureResult:
+    rowcount = 1
+
+    @staticmethod
+    def mappings():
+        return _CaptureMappings()
+
+
+class _CaptureTransaction:
+    def __init__(self):
+        self.is_active = True
+
+    def commit(self):
+        self.is_active = False
+
+    def rollback(self):
+        self.is_active = False
+
+
+class _CaptureConnection:
+    def __init__(self):
+        self.insert_parameters: list[dict[str, Any]] = []
+
+    @staticmethod
+    def begin():
+        return _CaptureTransaction()
+
+    @staticmethod
+    def exec_driver_sql(_statement: str):
+        return None
+
+    def execute(self, statement, parameters=None):
+        sql = str(statement)
+        if "SELECT pair_id, cycle_id" in sql:
+            return _CaptureResult()
+        if "INSERT INTO LeveragedEtfAnchorState" in sql:
+            self.insert_parameters.append(dict(parameters))
+            return _CaptureResult()
+        raise AssertionError(f"unexpected capture SQL: {sql}")
+
+    @staticmethod
+    def close():
+        return None
+
+
+class _CaptureEngine:
+    def __init__(self, connection: _CaptureConnection):
+        self._connection = connection
+
+    def connect(self):
+        return self._connection
+
+
 @pytest.fixture
 def manager(tmp_path: Path):
     value = _open_manager(tmp_path / "pair-scoped-anchor.sqlite")
@@ -42,6 +158,109 @@ def manager(tmp_path: Path):
         yield value
     finally:
         value.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "invalid_revision",
+    [True, 1.0, Decimal("1"), "1", _RevisionInt(1)],
+    ids=("bool", "float", "decimal", "string", "int-subclass"),
+)
+def test_checkpoint_payload_from_value_requires_exact_builtin_revision(invalid_revision: Any):
+    with pytest.raises((TypeError, ValueError, ValidationError), match="revision|JSON serializable"):
+        _checkpoint_payload_from_value(invalid_revision)
+
+
+@pytest.mark.parametrize(
+    "invalid_revision",
+    [True, 1.0, "1"],
+    ids=("bool", "float", "string"),
+)
+def test_checkpoint_payload_from_canonical_json_requires_exact_builtin_revision(invalid_revision: Any):
+    payload_json, payload_hash = _canonical_json_hash(_checkpoint_fields(invalid_revision))
+
+    with pytest.raises((ValueError, ValidationError), match="revision"):
+        durable_contract.CanonicalOpaqueAnchorPayloadV2.from_canonical_json(
+            kind="ANCHOR_CHECKPOINT",
+            contract_version_field="integrity_version",
+            contract_version=3,
+            payload_json=payload_json,
+            payload_hash=payload_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_revision",
+    [True, 1.0, "1"],
+    ids=("bool", "float", "string"),
+)
+def test_checkpoint_row_reload_rejects_noncanonical_payload_revision(invalid_revision: Any):
+    fields = _checkpoint_fields(invalid_revision)
+    payload_json, payload_hash = _canonical_json_hash(fields)
+    row = {
+        "pair_id": fields["pair_id"],
+        "cycle_id": fields["cycle_id"],
+        "schema_version": 2,
+        "state_kind": "CHECKPOINT",
+        "revision": 1,
+        "target_session_date": fields["target_session_date"],
+        "official_close_utc": fields["official_close_utc"],
+        "deadline_utc": fields["deadline_utc"],
+        "evidence_hash": None,
+        "payload_version_field": "integrity_version",
+        "payload_contract_version": 3,
+        "payload_json": payload_json,
+        "payload_hash": payload_hash,
+        "created_at_utc": fields["next_poll_utc"],
+        "updated_at_utc": fields["next_poll_utc"],
+    }
+
+    with pytest.raises(AnchorIntegrityError, match="revision|payload integrity"):
+        durable_contract.PairScopedAnchorRepository._decode_anchor_row(row)
+
+
+@pytest.mark.parametrize(
+    "invalid_revision",
+    [True, 1.0, Decimal("1"), "1", _RevisionInt(1)],
+    ids=("bool", "float", "decimal", "string", "int-subclass"),
+)
+def test_repository_write_path_never_binds_noncanonical_payload_revision(invalid_revision: Any):
+    connection = _CaptureConnection()
+    repository = durable_contract.PairScopedAnchorRepository(
+        SimpleNamespace(engine=_CaptureEngine(connection))
+    )
+    rejection = None
+
+    try:
+        payload = _checkpoint_payload_from_value(invalid_revision)
+        checkpoint = _checkpoint_envelope(payload)
+        repository.compare_and_set_opaque_checkpoint(
+            checkpoint.key,
+            checkpoint,
+            expected_revision=0,
+        )
+    except (TypeError, ValueError, ValidationError, AnchorIntegrityError) as exception:
+        rejection = exception
+
+    assert rejection is not None
+    assert connection.insert_parameters == []
+
+
+def test_exact_builtin_checkpoint_revision_round_trips_and_cas(
+    manager: SQLConnectionManager,
+):
+    repository = durable_contract.PairScopedAnchorRepository(manager)
+    first = _checkpoint_envelope(_checkpoint_payload_from_value(1), revision=1)
+
+    assert repository.compare_and_set_opaque_checkpoint(first.key, first, expected_revision=0) == first
+    loaded = repository.load_opaque(first.key)
+    assert loaded == first
+    assert type(loaded.payload.value()["revision"]) is int
+
+    second = _checkpoint_envelope(_checkpoint_payload_from_value(2), revision=2)
+    assert repository.compare_and_set_opaque_checkpoint(second.key, second, expected_revision=1) == second
+    reloaded = repository.load_opaque(second.key)
+    assert reloaded == second
+    assert type(reloaded.payload.value()["revision"]) is int
 
 
 class _F003OpaqueAdapter:
