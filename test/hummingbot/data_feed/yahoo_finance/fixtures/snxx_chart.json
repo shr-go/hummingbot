@@ -1,0 +1,36 @@
+{
+  "chart": {
+    "result": [
+      {
+        "meta": {
+          "currency": "USD",
+          "symbol": "SNXX",
+          "exchangeName": "PCX",
+          "instrumentType": "ETF",
+          "regularMarketPrice": 88.5,
+          "regularMarketTime": 1784317631,
+          "exchangeTimezoneName": "America/New_York"
+        },
+        "timestamp": [1784208600, 1784295000],
+        "events": {},
+        "indicators": {
+          "quote": [
+            {
+              "open": [29.125, 29.75],
+              "high": [29.875, 30.25],
+              "low": [28.875, 29.5],
+              "close": [29.5, 30.0625],
+              "volume": [45000, 12000]
+            }
+          ],
+          "adjclose": [
+            {
+              "adjclose": [129.5, 130.0625]
+            }
+          ]
+        }
+      }
+    ],
+    "error": null
+  }
+}

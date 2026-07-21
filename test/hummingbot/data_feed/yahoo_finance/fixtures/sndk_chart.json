@@ -1,0 +1,43 @@
+{
+  "chart": {
+    "result": [
+      {
+        "meta": {
+          "currency": "USD",
+          "symbol": "SNDK",
+          "exchangeName": "NMS",
+          "instrumentType": "EQUITY",
+          "regularMarketPrice": 999.875,
+          "regularMarketTime": 1784318398,
+          "exchangeTimezoneName": "America/New_York"
+        },
+        "timestamp": [1784208600, 1784295000],
+        "events": {
+          "dividends": {
+            "1784208600": {
+              "amount": 0.25,
+              "date": 1784208600
+            }
+          }
+        },
+        "indicators": {
+          "quote": [
+            {
+              "open": [246.25, 248.5],
+              "high": [249.75, 251.25],
+              "low": [245.5, 247.875],
+              "close": [248.25, 250.125],
+              "volume": [1200000, 1350000]
+            }
+          ],
+          "adjclose": [
+            {
+              "adjclose": [748.25, 750.125]
+            }
+          ]
+        }
+      }
+    ],
+    "error": null
+  }
+}

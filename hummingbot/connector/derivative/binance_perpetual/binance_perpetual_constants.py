@@ -35,18 +35,28 @@ SERVER_TIME_PATH_URL = "v1/time"
 
 # Private API v1 Endpoints
 ORDER_URL = "v1/order"
+OPEN_ORDERS_URL = "v1/openOrders"
 CANCEL_ALL_OPEN_ORDERS_URL = "v1/allOpenOrders"
 ACCOUNT_TRADE_LIST_URL = "v1/userTrades"
 SET_LEVERAGE_URL = "v1/leverage"
 GET_INCOME_HISTORY_URL = "v1/income"
 CHANGE_POSITION_MODE_URL = "v1/positionSide/dual"
+LEVERAGE_BRACKET_URL = "v1/leverageBracket"
+MULTI_ASSETS_MODE_URL = "v1/multiAssetsMargin"
+ACCOUNT_CONFIG_URL = "v1/accountConfig"
+SYMBOL_CONFIG_URL = "v1/symbolConfig"
 
 POST_POSITION_MODE_LIMIT_ID = f"POST{CHANGE_POSITION_MODE_URL}"
 GET_POSITION_MODE_LIMIT_ID = f"GET{CHANGE_POSITION_MODE_URL}"
+GET_ORDER_LIMIT_ID = f"GET{ORDER_URL}"
 
 # Private API v2 Endpoints
 ACCOUNT_INFO_URL = "v2/account"
 POSITION_INFORMATION_URL = "v2/positionRisk"
+
+# Private API v3 Endpoints
+ACCOUNT_INFO_V3_URL = "v3/account"
+POSITION_INFORMATION_V3_URL = "v3/positionRisk"
 
 # Private API Endpoints
 BINANCE_USER_STREAM_ENDPOINT = "v1/listenKey"
@@ -109,6 +119,10 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1),
                              LinkedLimitWeightPair(ORDERS_1MIN, weight=1),
                              LinkedLimitWeightPair(ORDERS_1SEC, weight=1)]),
+    RateLimit(limit_id=GET_ORDER_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
+    RateLimit(limit_id=OPEN_ORDERS_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
     RateLimit(limit_id=CANCEL_ALL_OPEN_ORDERS_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
     RateLimit(limit_id=ACCOUNT_TRADE_LIST_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
@@ -121,9 +135,21 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
     RateLimit(limit_id=GET_POSITION_MODE_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=30)]),
+    RateLimit(limit_id=LEVERAGE_BRACKET_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),
+    RateLimit(limit_id=MULTI_ASSETS_MODE_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=30)]),
+    RateLimit(limit_id=ACCOUNT_CONFIG_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
+    RateLimit(limit_id=SYMBOL_CONFIG_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
     RateLimit(limit_id=ACCOUNT_INFO_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
     RateLimit(limit_id=POSITION_INFORMATION_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE, weight=5,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
+    RateLimit(limit_id=ACCOUNT_INFO_V3_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
+    RateLimit(limit_id=POSITION_INFORMATION_V3_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE, weight=5,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=5)]),
     RateLimit(limit_id=MARK_PRICE_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE, weight=1,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1)]),

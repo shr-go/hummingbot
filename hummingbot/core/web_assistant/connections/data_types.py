@@ -133,6 +133,23 @@ class RESTResponse:
         text_ = await self._aiohttp_response.text()
         return text_
 
+    async def read_limited(self, max_bytes: int) -> bytes:
+        """Read a response without allowing an unbounded in-memory body."""
+
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer")
+        chunks = bytearray()
+        async for chunk in self._aiohttp_response.content.iter_chunked(min(max_bytes + 1, 64 * 1024)):
+            chunks.extend(chunk)
+            if len(chunks) > max_bytes:
+                raise ValueError(f"response body exceeds {max_bytes} bytes")
+        return bytes(chunks)
+
+    def release(self) -> None:
+        """Release the underlying aiohttp response back to its connection pool."""
+
+        self._aiohttp_response.release()
+
 
 class WSRequest(ABC):
     @abstractmethod
