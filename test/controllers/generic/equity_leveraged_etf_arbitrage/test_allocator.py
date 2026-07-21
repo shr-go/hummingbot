@@ -136,12 +136,16 @@ def _snapshot(
     *pairs: FrozenPair,
     account: AccountRiskSnapshot | None = None,
     max_total_notional_ratio: str = "32",
+    execution_costs: object | None = None,
 ) -> FrozenAllocationSnapshot:
-    return FrozenAllocationSnapshot(
-        account=account or _account(),
-        pairs=tuple(pairs),
-        max_total_notional_ratio=D(max_total_notional_ratio),
-    )
+    values = {
+        "account": account or _account(),
+        "pairs": tuple(pairs),
+        "max_total_notional_ratio": D(max_total_notional_ratio),
+    }
+    if execution_costs is not None:
+        values["execution_costs"] = execution_costs
+    return FrozenAllocationSnapshot(**values)
 
 
 def _pair_result(result, pair_id: str):
@@ -544,3 +548,37 @@ def test_ask_side_vwap_can_meet_min_notional_above_best_ask() -> None:
     assert candidate.canonical_etf_slice_quantity == D("1")
     assert candidate.canonical_stock_slice_quantity == D("1")
     assert candidate.stock_vwap == D("190")
+
+
+def test_configured_costs_can_block_an_unsupported_entry_tier() -> None:
+    from hummingbot.strategy_v2.leveraged_etf_arbitrage.allocator import FrozenExecutionCosts
+
+    pair = _pair(
+        "configured-costs",
+        requested_ratio="0.32",
+        tiers=(
+            AllocationTier(minimum_net_bp=D("0"), target_ratio=D("0")),
+            AllocationTier(minimum_net_bp=D("600"), target_ratio=D("0.32")),
+        ),
+    )
+
+    default_result = PortfolioAllocator().allocate(_snapshot(pair))
+    expensive_result = PortfolioAllocator().allocate(
+        _snapshot(
+            pair,
+            execution_costs=FrozenExecutionCosts(
+                maker_fee_bp=D("100"),
+                taker_fee_bp=D("100"),
+                maker_slippage_bp_per_fill=D("100"),
+            ),
+        )
+    )
+    default_candidate = _pair_result(default_result, "configured-costs")
+    expensive_candidate = _pair_result(expensive_result, "configured-costs")
+
+    assert default_result.status is AllocationStatus.ALLOCATED
+    assert default_candidate.executable_net_bp > D("600")
+    assert default_candidate.target_gross_notional > D("0")
+    assert expensive_result.status is AllocationStatus.ALLOCATED
+    assert expensive_candidate.canonical_etf_slice_quantity == D("0")
+    assert expensive_candidate.target_gross_notional == D("0")
