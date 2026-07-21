@@ -557,6 +557,16 @@ def test_t008_value_revalidation_redacts_secret_input():
 @pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
 def test_t008_envelope_revalidation_redacts_secret_input(surface: str):
     _, envelope = _t008_forged_envelope(surface)
+    primitive = envelope.model_dump(mode="python", round_trip=True, warnings="error")
+
+    model_error = _t008_capture_secret_rejection(
+        lambda: type(envelope).model_validate(primitive)
+    )
+    _t008_assert_secret_safe(model_error, envelope.payload.payload_json)
+    json_error = _t008_capture_secret_rejection(
+        lambda: type(envelope).model_validate_json(envelope.model_dump_json())
+    )
+    _t008_assert_secret_safe(json_error, envelope.payload.payload_json)
 
     error = _t008_capture_secret_rejection(
         lambda: PairScopedAnchorRepository._revalidate_opaque_write_envelope(

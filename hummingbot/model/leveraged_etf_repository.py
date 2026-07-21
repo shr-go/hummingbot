@@ -9,7 +9,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Annotated, Any, Literal, NamedTuple, Optional, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
@@ -118,6 +118,74 @@ class AnchorRevisionConflict(RuntimeError):
 
 class AnchorIntegrityError(RuntimeError):
     pass
+
+
+class _OpaqueAnchorSecretFieldError(ValueError):
+    def __init__(self):
+        super().__init__("secret-bearing fields are not permitted in opaque anchor payload")
+
+
+def _redacted_opaque_anchor_validation_error(error: ValidationError) -> ValidationError:
+    sanitized_errors = []
+    for line_error in error.errors(include_url=False, include_input=False):
+        context = line_error.get("ctx")
+        context_error = context.get("error") if isinstance(context, Mapping) else None
+        if isinstance(context_error, _OpaqueAnchorSecretFieldError):
+            sanitized_context_error = _OpaqueAnchorSecretFieldError()
+        else:
+            message = str(line_error.get("msg", "opaque anchor validation failed"))
+            if message.startswith("Value error, "):
+                message = message.removeprefix("Value error, ")
+            sanitized_context_error = ValueError(message)
+        sanitized_errors.append(
+            {
+                "type": "value_error",
+                "loc": ("opaque_anchor",),
+                "ctx": {"error": sanitized_context_error},
+            }
+        )
+    return ValidationError.from_exception_data(
+        title=error.title,
+        line_errors=sanitized_errors,
+        hide_input=True,
+    )
+
+
+class _SecretSafeOpaqueAnchorModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+
+def _secret_safe_opaque_anchor_model_validation(value: Any, handler):
+    redacted_error = None
+    try:
+        return handler(value)
+    except ValidationError as error:
+        redacted_error = _redacted_opaque_anchor_validation_error(error)
+    raise redacted_error
+
+
+def _contains_opaque_anchor_secret_rejection(error: BaseException) -> bool:
+    pending = [error]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, _OpaqueAnchorSecretFieldError):
+            return True
+        if isinstance(candidate, ValidationError):
+            for line_error in candidate.errors(include_url=False, include_input=False):
+                context = line_error.get("ctx")
+                context_error = context.get("error") if isinstance(context, Mapping) else None
+                if isinstance(context_error, _OpaqueAnchorSecretFieldError):
+                    return True
+        pending.extend((candidate.__cause__, candidate.__context__))
+    return False
+
+
+def _redacted_anchor_integrity_error(label: str) -> AnchorIntegrityError:
+    return AnchorIntegrityError(f"anchor {label} integrity failure: secret-bearing opaque payload rejected")
 
 
 class CanonicalOpaquePayload(BaseModel):
@@ -875,7 +943,7 @@ def _reject_opaque_anchor_secret_bearing_fields(value: Any) -> None:
                     normalized_key.endswith(secret_name)
                     for secret_name in _OPAQUE_ANCHOR_SECRET_FIELD_NAMES
                 ):
-                    raise ValueError(f"secret-bearing field is not permitted in opaque anchor payload: {key}")
+                    raise _OpaqueAnchorSecretFieldError()
                 pending.append(nested_value)
         elif isinstance(candidate, (list, tuple)):
             if id(candidate) in visited_containers:
@@ -924,10 +992,8 @@ def _validate_canonical_anchor_payload_v2(
     return value
 
 
-class CanonicalOpaqueAnchorPayloadV2(BaseModel):
+class CanonicalOpaqueAnchorPayloadV2(_SecretSafeOpaqueAnchorModel):
     """Canonical domain payload with an explicit, adapter-supplied version discriminator."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal[2] = 2
     kind: str = Field(min_length=1, max_length=64, pattern=r"^[A-Z][A-Z0-9_]*$")
@@ -947,6 +1013,11 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
             payload_hash=self.payload_hash,
         )
         return self
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def redact_validation_errors(cls, value: Any, handler):
+        return _secret_safe_opaque_anchor_model_validation(value, handler)
 
     @classmethod
     def from_value(
@@ -1030,9 +1101,7 @@ def _validate_pair_scoped_payload_identity(
     return value
 
 
-class OpaqueAnchorCheckpointV2(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
+class OpaqueAnchorCheckpointV2(_SecretSafeOpaqueAnchorModel):
     schema_version: Literal[2] = 2
     key: AnchorStorageKeyV2
     target_session_date: str
@@ -1062,10 +1131,13 @@ class OpaqueAnchorCheckpointV2(BaseModel):
                 raise AnchorIntegrityError(f"anchor checkpoint {field_name} disagrees with envelope metadata")
         return self
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def redact_validation_errors(cls, value: Any, handler):
+        return _secret_safe_opaque_anchor_model_validation(value, handler)
 
-class OpaqueAnchorFinalizedV2(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
+class OpaqueAnchorFinalizedV2(_SecretSafeOpaqueAnchorModel):
     schema_version: Literal[2] = 2
     key: AnchorStorageKeyV2
     target_session_date: str
@@ -1096,13 +1168,16 @@ class OpaqueAnchorFinalizedV2(BaseModel):
                 raise AnchorIntegrityError(f"finalized anchor {field_name} disagrees with envelope metadata")
         return self
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def redact_validation_errors(cls, value: Any, handler):
+        return _secret_safe_opaque_anchor_model_validation(value, handler)
+
 
 OpaqueAnchorStateV2 = Union[OpaqueAnchorCheckpointV2, OpaqueAnchorFinalizedV2]
 
 
-class OpaqueAnchorRevisionObservationV2(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
+class OpaqueAnchorRevisionObservationV2(_SecretSafeOpaqueAnchorModel):
     schema_version: Literal[2] = 2
     key: AnchorStorageKeyV2
     evidence_hash: Sha256Hex
@@ -1124,6 +1199,11 @@ class OpaqueAnchorRevisionObservationV2(BaseModel):
             if type(actual) is not type(expected) or actual != expected:
                 raise AnchorIntegrityError(f"anchor revision {field_name} disagrees with envelope metadata")
         return self
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def redact_validation_errors(cls, value: Any, handler):
+        return _secret_safe_opaque_anchor_model_validation(value, handler)
 
 
 class _DecodedJournalMutation(NamedTuple):
@@ -3459,6 +3539,7 @@ class PairScopedAnchorRepository(_TransactionalRepository):
     def _revalidate_opaque_write_envelope(envelope: Any, envelope_type: type[BaseModel], label: str) -> Any:
         if type(envelope) is not envelope_type:
             raise AnchorIntegrityError(f"{label} writes require an exact {envelope_type.__name__} envelope")
+        redacted_error = None
         try:
             envelope.validate_metadata()
             primitive = envelope.model_dump(mode="python", round_trip=True, warnings="error")
@@ -3466,7 +3547,11 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except AnchorIntegrityError:
             raise
         except Exception as exception:
-            raise AnchorIntegrityError(f"anchor {label} envelope integrity failure: {exception}") from exception
+            if _contains_opaque_anchor_secret_rejection(exception):
+                redacted_error = _redacted_anchor_integrity_error(f"{label} envelope")
+            else:
+                raise AnchorIntegrityError(f"anchor {label} envelope integrity failure: {exception}") from exception
+        raise redacted_error
 
     @staticmethod
     def _revalidate_opaque_write_key(key: AnchorStorageKeyV2) -> AnchorStorageKeyV2:
@@ -3529,6 +3614,7 @@ class PairScopedAnchorRepository(_TransactionalRepository):
 
     @classmethod
     def _decode_anchor_row(cls, row: Mapping[str, Any]) -> OpaqueAnchorStateV2:
+        redacted_error = None
         try:
             if row["schema_version"] != 2:
                 raise ValueError("anchor storage schema version is unsupported")
@@ -3570,15 +3656,20 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except AnchorIntegrityError:
             raise
         except Exception as exception:
-            raise AnchorIntegrityError(
-                f"anchor state hash, version, or payload integrity failure: {exception}"
-            ) from exception
+            if _contains_opaque_anchor_secret_rejection(exception):
+                redacted_error = _redacted_anchor_integrity_error("state decode")
+            else:
+                raise AnchorIntegrityError(
+                    f"anchor state hash, version, or payload integrity failure: {exception}"
+                ) from exception
+        raise redacted_error
 
     @classmethod
     def _decode_observation_row(
         cls,
         row: Mapping[str, Any],
     ) -> OpaqueAnchorRevisionObservationV2:
+        redacted_error = None
         try:
             if row["schema_version"] != 2:
                 raise ValueError("anchor observation storage schema version is unsupported")
@@ -3601,9 +3692,13 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except AnchorIntegrityError:
             raise
         except Exception as exception:
-            raise AnchorIntegrityError(
-                f"anchor observation hash, version, or payload integrity failure: {exception}"
-            ) from exception
+            if _contains_opaque_anchor_secret_rejection(exception):
+                redacted_error = _redacted_anchor_integrity_error("observation decode")
+            else:
+                raise AnchorIntegrityError(
+                    f"anchor observation hash, version, or payload integrity failure: {exception}"
+                ) from exception
+        raise redacted_error
 
     @classmethod
     def _load_opaque_connection(
