@@ -36,6 +36,8 @@ _SESSION_DATE_PATTERN = re.compile(r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
 _ANCHOR_PAIR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _ANCHOR_CYCLE_ID_PATTERN = re.compile(r"^xnys-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_ANCHOR_PAYLOAD_KIND_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TERMINAL_EXECUTOR_STATES = frozenset(
     {
         LeveragedEtfPairState.COMPLETED,
@@ -691,25 +693,40 @@ def _validate_checkpoint_payload_revision(kind: str, value: Any) -> None:
 
 def _validate_canonical_anchor_payload_v2(
     *,
+    schema_version: int,
     kind: str,
     contract_version_field: str,
     contract_version: int,
     payload_json: str,
     payload_hash: str,
 ) -> Mapping[str, Any]:
+    if type(schema_version) is not int or schema_version != 2:
+        raise ValueError("opaque anchor payload schema version is invalid")
+    if type(kind) is not str or len(kind) > 64 or _ANCHOR_PAYLOAD_KIND_PATTERN.fullmatch(kind) is None:
+        raise ValueError("opaque anchor payload kind is invalid")
+    if type(contract_version_field) is not str or contract_version_field not in {
+        "schema_version",
+        "integrity_version",
+        "evidence_version",
+    }:
+        raise ValueError("opaque anchor payload contract version field is invalid")
+    if type(contract_version) is not int or contract_version < 1:
+        raise ValueError("opaque anchor payload contract version is invalid")
+    if type(payload_json) is not str:
+        raise ValueError("opaque anchor payload JSON must be a string")
+    if type(payload_hash) is not str or _SHA256_HEX_PATTERN.fullmatch(payload_hash) is None:
+        raise ValueError("opaque anchor payload hash is invalid")
     value = _verify_canonical_json(payload_json, payload_hash, f"{kind} payload")
     if not isinstance(value, Mapping):
         raise ValueError("opaque anchor payload must be a JSON object")
     _validate_checkpoint_payload_revision(kind, value)
     declared_version = value.get(contract_version_field)
-    if (
-        not isinstance(declared_version, int)
-        or isinstance(declared_version, bool)
-        or declared_version != contract_version
-    ):
+    if type(declared_version) is not int or declared_version != contract_version:
         raise ValueError("opaque anchor payload contract version is invalid")
-    if "kind" in value and value["kind"] != kind:
-        raise ValueError("wrapper and embedded anchor payload kind must match exactly")
+    if "kind" in value:
+        embedded_kind = value["kind"]
+        if type(embedded_kind) is not type(kind) or embedded_kind != kind:
+            raise ValueError("wrapper and embedded anchor payload kind must match exactly")
     return value
 
 
@@ -728,6 +745,7 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
     @model_validator(mode="after")
     def validate_canonical_payload(self) -> CanonicalOpaqueAnchorPayloadV2:
         _validate_canonical_anchor_payload_v2(
+            schema_version=self.schema_version,
             kind=self.kind,
             contract_version_field=self.contract_version_field,
             contract_version=self.contract_version,
@@ -775,6 +793,7 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
 
     def value(self) -> Mapping[str, Any]:
         return _validate_canonical_anchor_payload_v2(
+            schema_version=self.schema_version,
             kind=self.kind,
             contract_version_field=self.contract_version_field,
             contract_version=self.contract_version,
@@ -806,8 +825,14 @@ def _validate_pair_scoped_payload_identity(
     payload: CanonicalOpaqueAnchorPayloadV2,
 ) -> Mapping[str, Any]:
     value = payload.value()
-    if value.get("pair_id") != key.pair_id or value.get("cycle_id") != key.cycle_id:
-        raise AnchorIntegrityError("anchor storage key does not match payload pair/cycle identity")
+    comparisons = {
+        "pair_id": key.pair_id,
+        "cycle_id": key.cycle_id,
+    }
+    for field_name, expected in comparisons.items():
+        actual = value.get(field_name)
+        if type(actual) is not type(expected) or actual != expected:
+            raise AnchorIntegrityError("anchor storage key does not match payload pair/cycle identity")
     return value
 
 
@@ -872,7 +897,8 @@ class OpaqueAnchorFinalizedV2(BaseModel):
             "evidence_hash": self.evidence_hash,
         }
         for field_name, expected in comparisons.items():
-            if value.get(field_name) != expected:
+            actual = value.get(field_name)
+            if type(actual) is not type(expected) or actual != expected:
                 raise AnchorIntegrityError(f"finalized anchor {field_name} disagrees with envelope metadata")
         return self
 
@@ -895,10 +921,14 @@ class OpaqueAnchorRevisionObservationV2(BaseModel):
         if self.payload.kind != "ANCHOR_REVISION_OBSERVATION":
             raise ValueError("revision payload kind must be ANCHOR_REVISION_OBSERVATION")
         value = _validate_pair_scoped_payload_identity(self.key, self.payload)
-        if value.get("evidence_hash") != self.evidence_hash:
-            raise AnchorIntegrityError("anchor revision evidence_hash disagrees with envelope metadata")
-        if value.get("observed_at_utc") != self.observed_at_utc:
-            raise AnchorIntegrityError("anchor revision observed_at_utc disagrees with envelope metadata")
+        comparisons = {
+            "evidence_hash": self.evidence_hash,
+            "observed_at_utc": self.observed_at_utc,
+        }
+        for field_name, expected in comparisons.items():
+            actual = value.get(field_name)
+            if type(actual) is not type(expected) or actual != expected:
+                raise AnchorIntegrityError(f"anchor revision {field_name} disagrees with envelope metadata")
         return self
 
 
@@ -2575,17 +2605,17 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         return expected_revision
 
     @staticmethod
-    def _revalidate_checkpoint_envelope(checkpoint: OpaqueAnchorCheckpointV2) -> OpaqueAnchorCheckpointV2:
-        if type(checkpoint) is not OpaqueAnchorCheckpointV2:
-            raise AnchorIntegrityError("checkpoint writes require an exact OpaqueAnchorCheckpointV2 envelope")
+    def _revalidate_opaque_write_envelope(envelope: Any, envelope_type: type[BaseModel], label: str) -> Any:
+        if type(envelope) is not envelope_type:
+            raise AnchorIntegrityError(f"{label} writes require an exact {envelope_type.__name__} envelope")
         try:
-            checkpoint.validate_metadata()
-            primitive = checkpoint.model_dump(mode="python", round_trip=True, warnings="error")
-            return OpaqueAnchorCheckpointV2.model_validate(primitive)
+            envelope.validate_metadata()
+            primitive = envelope.model_dump(mode="python", round_trip=True, warnings="error")
+            return envelope_type.model_validate(primitive)
         except AnchorIntegrityError:
             raise
         except Exception as exception:
-            raise AnchorIntegrityError(f"anchor checkpoint envelope integrity failure: {exception}") from exception
+            raise AnchorIntegrityError(f"anchor {label} envelope integrity failure: {exception}") from exception
 
     @classmethod
     def _assert_key_matches(
@@ -2730,7 +2760,11 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         checkpoint: OpaqueAnchorCheckpointV2,
         expected_revision: int,
     ) -> OpaqueAnchorCheckpointV2:
-        checkpoint = self._revalidate_checkpoint_envelope(checkpoint)
+        checkpoint = self._revalidate_opaque_write_envelope(
+            checkpoint,
+            OpaqueAnchorCheckpointV2,
+            "checkpoint",
+        )
         self._assert_key_matches(key, checkpoint)
         self._require_expected_revision(expected_revision, minimum=0)
         if checkpoint.revision != expected_revision + 1:
@@ -2821,6 +2855,11 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         record: OpaqueAnchorFinalizedV2,
         expected_revision: int,
     ) -> OpaqueAnchorFinalizedV2:
+        record = self._revalidate_opaque_write_envelope(
+            record,
+            OpaqueAnchorFinalizedV2,
+            "finalized anchor",
+        )
         self._assert_key_matches(key, record)
         self._require_expected_revision(expected_revision, minimum=1)
         if record.revision != expected_revision:
@@ -2895,6 +2934,11 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         key: AnchorStorageKeyV2,
         observation: OpaqueAnchorRevisionObservationV2,
     ) -> None:
+        observation = self._revalidate_opaque_write_envelope(
+            observation,
+            OpaqueAnchorRevisionObservationV2,
+            "anchor revision observation",
+        )
         self._assert_key_matches(key, observation)
 
         def operation(connection: Connection) -> None:
