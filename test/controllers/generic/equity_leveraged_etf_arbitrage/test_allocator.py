@@ -520,3 +520,27 @@ def test_degraded_bid_vwap_below_min_notional_rejects_canonical_slice() -> None:
 
     assert candidate.canonical_stock_slice_quantity == D("0")
     assert candidate.target_gross_notional == D("0")
+
+
+def test_ask_side_vwap_can_meet_min_notional_above_best_ask() -> None:
+    pair = _pair(
+        "ask-vwap-minimum",
+        requested_ratio="0.5",
+        etf=_leg("ask-vwap-minimum-ETF", "300"),
+        stock=_leg("ask-vwap-minimum-STOCK", "100", min_notional=D("150")),
+        etf_best_bid=D("299"),
+        etf_best_ask=D("300"),
+        stock_asks=(
+            BookLevel(price=D("100"), quantity=D("0.1")),
+            BookLevel(price=D("200"), quantity=D("0.9")),
+        ),
+        max_stock_taker_impact_bp=D("9000"),
+    )
+
+    result = PortfolioAllocator().allocate(_snapshot(pair))
+    candidate = _pair_result(result, "ask-vwap-minimum")
+
+    assert result.status is AllocationStatus.ALLOCATED
+    assert candidate.canonical_etf_slice_quantity == D("1")
+    assert candidate.canonical_stock_slice_quantity == D("1")
+    assert candidate.stock_vwap == D("190")
