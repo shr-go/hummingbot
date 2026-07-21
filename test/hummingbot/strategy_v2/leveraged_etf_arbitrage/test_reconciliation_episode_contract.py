@@ -667,8 +667,10 @@ def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade
             outcome="CONSISTENT_NO_FILL",
         ),
     )
-    assert current.state.value == "MAKER_WORKING"
-    assert repository.incomplete_intents(initial.executor_id) == ()
+    assert current.state.value == "RECONCILING"
+    legacy_snapshot_payload = current.model_dump(mode="json")
+    legacy_snapshot_payload["state"] = "MAKER_WORKING"
+    legacy_current = type(current).model_validate(legacy_snapshot_payload)
     manager.engine.dispose()
 
     with sqlite3.connect(db_path) as connection:
@@ -681,10 +683,22 @@ def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade
         legacy_payload = mutation["event"]["payload"]
         legacy_payload.pop("evidence_state")
         legacy_payload.pop("proven_no_fill")
+        mutation["snapshot_after"] = legacy_current.model_dump(mode="json")
+        mutation["snapshot_after_hash"] = legacy_current.canonical_sha256()
         rewritten_json, rewritten_hash = _canonical_json_hash(mutation)
         connection.execute(
             "UPDATE LeveragedEtfJournalEvent SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
             (rewritten_json, rewritten_hash, "event-t005-legacy-no-fill"),
+        )
+        legacy_snapshot_json = legacy_current.canonical_json()
+        _, legacy_snapshot_hash = _canonical_json_hash(legacy_current.model_dump(mode="json"))
+        connection.execute(
+            """
+            UPDATE LeveragedEtfExecutorSnapshot
+            SET state = ?, snapshot_json = ?, snapshot_hash = ?
+            WHERE executor_id = ?
+            """,
+            ("MAKER_WORKING", legacy_snapshot_json, legacy_snapshot_hash, initial.executor_id),
         )
         connection.executescript(SQLITE_GUARD_DDL["lepf_journal_no_update"])
         for trigger_name in (
@@ -703,7 +717,7 @@ def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade
     reopened = _open_manager(db_path)
     try:
         reopened_repository = LeveragedEtfJournalRepository(reopened)
-        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.replay(initial.executor_id) == legacy_current
         incomplete = reopened_repository.incomplete_intents(initial.executor_id)
         assert tuple(value.intent_id for value in incomplete) == ("intent-t005-unknown",)
         assert incomplete[0].status is JournalEventType.RECONCILIATION
@@ -723,7 +737,7 @@ def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade
             outcome="PARTIAL",
             created_at_utc="2026-07-17T14:01:08.000000Z",
         )
-        repaired = _append_fact(reopened_repository, current, late_fill)
+        repaired = _append_fact(reopened_repository, legacy_current, late_fill)
         assert repaired.etf_filled_quantity == Decimal("0.5")
     finally:
         reopened.engine.dispose()
