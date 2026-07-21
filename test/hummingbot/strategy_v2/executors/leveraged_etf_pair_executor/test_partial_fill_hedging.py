@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from decimal import Decimal
 from types import SimpleNamespace
@@ -11,7 +12,13 @@ from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
-from hummingbot.core.event.events import MarketEvent, MarketOrderFailureEvent, OrderFilledEvent
+from hummingbot.core.event.events import (
+    BuyOrderCreatedEvent,
+    MarketEvent,
+    MarketOrderFailureEvent,
+    OrderFilledEvent,
+    SellOrderCreatedEvent,
+)
 from hummingbot.model.leveraged_etf_repository import JournalEventType, LeveragedEtfJournalRepository
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types import (
@@ -55,6 +62,8 @@ class FakeConnector:
         self.preflight_calls = []
         self.preflight_error = None
         self.next_submission_error = None
+        self.async_submission_unknown_on_next_submit = False
+        self._unknown_submission_order_ids = set()
         self.trading_rules = {
             "SNXX-USDT": TradingRule(
                 trading_pair="SNXX-USDT",
@@ -127,10 +136,23 @@ class FakeConnector:
                 "position_action": kwargs.get("position_action"),
             }
         )
+        if self.async_submission_unknown_on_next_submit:
+            self.async_submission_unknown_on_next_submit = False
+            asyncio.get_running_loop().call_soon(self._record_submission_unknown, client_order_id)
         return client_order_id
 
+    def _record_submission_unknown(self, client_order_id):
+        self.timeline.append(("connector-submission-unknown", client_order_id))
+        self._unknown_submission_order_ids.add(client_order_id)
 
-def _config() -> LeveragedEtfPairExecutorConfig:
+    def is_order_submission_unknown(self, client_order_id):
+        return client_order_id in self._unknown_submission_order_ids
+
+
+def _config(
+    *,
+    operation: LeveragedEtfPairOperation = LeveragedEtfPairOperation.OPEN,
+) -> LeveragedEtfPairExecutorConfig:
     return LeveragedEtfPairExecutorConfig(
         id="f005-exec-1",
         timestamp=1721224862.0,
@@ -138,7 +160,7 @@ def _config() -> LeveragedEtfPairExecutorConfig:
         schema_version=1,
         pair_id="sndk_snxx",
         nav_cycle_id="xnys-2026-07-17",
-        operation=LeveragedEtfPairOperation.OPEN,
+        operation=operation,
         direction=LeveragedEtfPairDirection.SHORT_ETF_LONG_STOCK,
         etf_connector_name="binance_perpetual",
         etf_trading_pair="SNXX-USDT",
@@ -166,14 +188,18 @@ def _config() -> LeveragedEtfPairExecutorConfig:
     )
 
 
-def _executor(*, stock_step: Decimal = Decimal("0.1")):
+def _executor(
+    *,
+    stock_step: Decimal = Decimal("0.1"),
+    operation: LeveragedEtfPairOperation = LeveragedEtfPairOperation.OPEN,
+):
     timeline = []
     connector = FakeConnector(timeline, stock_step=stock_step)
     repository = FakeJournalRepository(timeline)
     strategy = SimpleNamespace(connectors={"binance_perpetual": connector}, current_timestamp=1721224862.0)
     executor = LeveragedEtfPairExecutor(
         strategy=strategy,
-        config=_config(),
+        config=_config(operation=operation),
         journal_repository=repository,
         update_interval=0.01,
     )
@@ -196,6 +222,21 @@ def _fill_event(order_id: str, trade_id: str, amount: str, *, timestamp: float, 
     )
 
 
+def _created_event(order_id: str, *, trading_pair: str, side: TradeType, exchange_order_id: str):
+    event_class = BuyOrderCreatedEvent if side is TradeType.BUY else SellOrderCreatedEvent
+    return event_class(
+        timestamp=1.0,
+        type=OrderType.LIMIT_MAKER if trading_pair == "SNXX-USDT" else OrderType.MARKET,
+        trading_pair=trading_pair,
+        amount=Decimal("100") if trading_pair == "SNXX-USDT" else Decimal("9.6"),
+        price=Decimal("30") if trading_pair == "SNXX-USDT" else Decimal("250"),
+        order_id=order_id,
+        creation_timestamp=1.0,
+        exchange_order_id=exchange_order_id,
+        position=PositionAction.OPEN.value,
+    )
+
+
 @pytest.mark.asyncio
 async def test_maker_preflight_and_submission_are_durable_before_the_native_connector_call():
     executor, connector, repository, timeline = _executor()
@@ -203,7 +244,7 @@ async def test_maker_preflight_and_submission_are_durable_before_the_native_conn
     await executor.control_task()
 
     assert connector.preflight_calls == [("SNXX-USDT", "SNDK-USDT")]
-    assert executor.state is LeveragedEtfPairState.MAKER_WORKING
+    assert executor.state is LeveragedEtfPairState.MAKER_SUBMITTING
     assert len(repository.created_snapshots) == 1
     assert len(connector.orders) == 1
     maker = connector.orders[0]
@@ -225,7 +266,187 @@ async def test_maker_preflight_and_submission_are_durable_before_the_native_conn
     )
     connector_index = next(index for index, item in enumerate(timeline) if item[0] == "connector")
     assert prepared_index < connector_index
-    assert [event.event_type for event in repository.events][-1] is JournalEventType.ACKNOWLEDGED
+    assert [event.event_type for event in repository.events][-1] is JournalEventType.PREPARED
+
+    executor.process_order_created_event(
+        MarketEvent.SellOrderCreated.value,
+        connector,
+        _created_event(
+            maker["client_order_id"],
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+            exchange_order_id="maker-exchange-1",
+        ),
+    )
+    assert executor.state is LeveragedEtfPairState.MAKER_WORKING
+    assert [event.event_type for event in repository.events][-2:] == [
+        JournalEventType.ORDER_CREATED,
+        JournalEventType.ACKNOWLEDGED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_maker_submission_waits_for_authoritative_confirmation_and_reconciles_async_unknown():
+    executor, connector, repository, _ = _executor()
+    connector.async_submission_unknown_on_next_submit = True
+
+    await executor.control_task()
+
+    assert len(connector.orders) == 1
+    assert [event.event_type for event in repository.events] == [
+        JournalEventType.STATE_TRANSITION,
+        JournalEventType.PREPARED,
+    ]
+    assert executor.state is LeveragedEtfPairState.MAKER_SUBMITTING
+
+    await asyncio.sleep(0)
+    await executor.control_task()
+
+    assert executor.state is LeveragedEtfPairState.RECONCILING
+    assert [event.event_type for event in repository.events][-1] is JournalEventType.SUBMIT_UNKNOWN
+    assert JournalEventType.ACKNOWLEDGED not in [event.event_type for event in repository.events]
+    assert len(connector.orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_stock_submission_reconciles_async_unknown_before_another_hedge_submission():
+    executor, connector, repository, _ = _executor()
+    await executor.control_task()
+    executor.process_order_created_event(
+        MarketEvent.SellOrderCreated.value,
+        connector,
+        _created_event(
+            executor.maker_client_order_id,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+            exchange_order_id="maker-exchange-1",
+        ),
+    )
+    connector.async_submission_unknown_on_next_submit = True
+
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "etf-native-stock-unknown-1",
+            "10",
+            timestamp=1.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+    stock_orders = [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"]
+    assert len(stock_orders) == 1
+    stock_events = [
+        event.event_type
+        for event in repository.events
+        if getattr(event.payload, "identity", None) is not None
+        and event.payload.identity.action.value == "STOCK_HEDGE"
+    ]
+    assert stock_events == [JournalEventType.PREPARED, JournalEventType.HEDGE_REQUESTED]
+
+    await asyncio.sleep(0)
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "etf-native-stock-unknown-2",
+            "5",
+            timestamp=2.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+
+    assert executor.state is LeveragedEtfPairState.RECONCILING
+    assert [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"] == stock_orders
+    stock_events = [
+        event.event_type
+        for event in repository.events
+        if getattr(event.payload, "identity", None) is not None
+        and event.payload.identity.action.value == "STOCK_HEDGE"
+    ]
+    assert stock_events == [
+        JournalEventType.PREPARED,
+        JournalEventType.HEDGE_REQUESTED,
+        JournalEventType.SUBMIT_UNKNOWN,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        LeveragedEtfPairOperation.REDUCE,
+        LeveragedEtfPairOperation.CLOSE,
+        LeveragedEtfPairOperation.EMERGENCY_FLATTEN,
+    ],
+)
+async def test_entry_executor_rejects_non_entry_operations_without_creating_an_intent_or_submitting(
+    operation: LeveragedEtfPairOperation,
+):
+    executor, connector, repository, _ = _executor(operation=operation)
+
+    await executor.control_task()
+
+    assert executor.state is LeveragedEtfPairState.RECOVERY_REQUIRED
+    assert connector.preflight_calls == []
+    assert connector.orders == []
+    assert JournalEventType.PREPARED not in [event.event_type for event in repository.events]
+
+
+@pytest.mark.asyncio
+async def test_maker_below_minimum_notional_never_creates_a_prepared_intent_or_submits():
+    executor, connector, repository, _ = _executor()
+    connector.trading_rules["SNXX-USDT"].min_notional_size = Decimal("3000.01")
+
+    await executor.control_task()
+
+    assert executor.state is LeveragedEtfPairState.RECOVERY_REQUIRED
+    assert connector.orders == []
+    assert JournalEventType.PREPARED not in [event.event_type for event in repository.events]
+
+
+@pytest.mark.asyncio
+async def test_stock_partial_fill_below_minimum_notional_remains_dust_without_a_prepared_intent_or_submission():
+    executor, connector, repository, _ = _executor()
+    connector.trading_rules["SNDK-USDT"].min_notional_size = Decimal("2400.01")
+    await executor.control_task()
+    executor.process_order_created_event(
+        MarketEvent.SellOrderCreated.value,
+        connector,
+        _created_event(
+            executor.maker_client_order_id,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+            exchange_order_id="maker-exchange-1",
+        ),
+    )
+
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "etf-notional-dust-1",
+            "10",
+            timestamp=1.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+
+    assert executor.state is LeveragedEtfPairState.STOCK_HEDGE_PENDING
+    assert executor.hedge_dust_quantity == Decimal("9.6")
+    assert [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"] == []
+    assert not [
+        event
+        for event in repository.events
+        if getattr(event.payload, "identity", None) is not None
+        and event.payload.identity.action.value == "STOCK_HEDGE"
+    ]
 
 
 @pytest.mark.asyncio
@@ -272,6 +493,18 @@ async def test_partial_etf_fills_are_deduplicated_and_submit_only_the_incrementa
     executor.process_order_filled_event(MarketEvent.OrderFilled.value, connector, first_fill)
     assert [order["amount"] for order in connector.orders if order["trading_pair"] == "SNDK-USDT"] == [Decimal("9.6")]
 
+    first_stock_order_id = stock_orders[0]["client_order_id"]
+    executor.process_order_created_event(
+        MarketEvent.BuyOrderCreated.value,
+        connector,
+        _created_event(
+            first_stock_order_id,
+            trading_pair="SNDK-USDT",
+            side=TradeType.BUY,
+            exchange_order_id="stock-exchange-1",
+        ),
+    )
+
     # A distinct trade with an earlier timestamp is still a new fact; trade IDs, not arrival time, deduplicate.
     executor.process_order_filled_event(
         MarketEvent.OrderFilled.value,
@@ -291,7 +524,6 @@ async def test_partial_etf_fills_are_deduplicated_and_submit_only_the_incrementa
     assert executor.stock_hedge_target_quantity == Decimal("14.4")
     assert executor.stock_pending_quantity == Decimal("14.4")
 
-    first_stock_order_id = stock_orders[0]["client_order_id"]
     executor.process_order_filled_event(
         MarketEvent.OrderFilled.value,
         connector,
