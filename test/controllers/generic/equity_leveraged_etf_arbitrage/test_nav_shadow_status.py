@@ -32,6 +32,7 @@ from controllers.generic.equity_leveraged_etf_arbitrage.shadow import (
 from controllers.generic.equity_leveraged_etf_arbitrage.status import (
     ControllerOperationalStatus,
     OperationalAlert,
+    redact_public_text,
 )
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -608,6 +609,89 @@ PEM_PRIVATE_KEY_SENTINEL
     ):
         assert sentinel not in serialized
     assert "[REDACTED]" in serialized
+
+
+@pytest.mark.parametrize(
+    ("secret_text", "sentinels"),
+    (
+        (
+            r'api_key={"nested":"API_KEY_STRUCTURED_SENTINEL","array":["API_KEY_ARRAY_SENTINEL",{"escaped":"value \\\"API_KEY_ESCAPED_SENTINEL\\\""}]}',
+            (
+                "API_KEY_STRUCTURED_SENTINEL",
+                "API_KEY_ARRAY_SENTINEL",
+                "API_KEY_ESCAPED_SENTINEL",
+            ),
+        ),
+        (
+            """api_key = {
+    "nested": "API_KEY_WHITESPACE_SENTINEL",
+    "array": [ "API_KEY_SPACED_ARRAY_SENTINEL", { "escaped": "value \\\"API_KEY_SPACED_ESCAPED_SENTINEL\\\"" } ]
+}""",
+            (
+                "API_KEY_WHITESPACE_SENTINEL",
+                "API_KEY_SPACED_ARRAY_SENTINEL",
+                "API_KEY_SPACED_ESCAPED_SENTINEL",
+            ),
+        ),
+        (
+            """private_key = [
+    "-----BEGIN PRIVATE KEY-----
+PEM_PRIVATE_KEY_ARRAY_SENTINEL
+-----END PRIVATE KEY-----",
+    { "nested": "PRIVATE_KEY_NESTED_ARRAY_SENTINEL" },
+    "PRIVATE_KEY_SPACED_ARRAY_SENTINEL"
+]""",
+            (
+                "PEM_PRIVATE_KEY_ARRAY_SENTINEL",
+                "PRIVATE_KEY_NESTED_ARRAY_SENTINEL",
+                "PRIVATE_KEY_SPACED_ARRAY_SENTINEL",
+            ),
+        ),
+    ),
+)
+def test_public_boundaries_fail_closed_for_complete_structured_secret_assignments(
+    secret_text: str,
+    sentinels: tuple[str, ...],
+):
+    coordinator = SessionStageCoordinator(load_nav_config())
+    decision = coordinator.evaluate(
+        pair_id="pair1",
+        cycle_id="xnys-2026-07-17",
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=OFFICIAL_CLOSE - timedelta(hours=2),
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    alert = OperationalAlert(code="UPSTREAM_FAILURE", message=secret_text)
+    intent = StageIntent(
+        pair_id=decision.pair_id,
+        cycle_id=decision.cycle_id,
+        kind=StageIntentKind.BLOCK_NEW_EXPOSURE,
+        reason=secret_text,
+    )
+    status = ControllerOperationalStatus(
+        decisions=(replace(decision, intents=(intent,)),),
+        alerts=(alert,),
+    )
+    configured = _configured_pair(1)
+    controller, _ = _controller((configured,), (_epoch(_frozen_pair(configured)),))
+    controller.last_failure = secret_text
+    controller.last_operational_status = status
+    controller._set_processed_data()
+
+    public_values = (
+        redact_public_text(secret_text),
+        json.dumps(alert.to_dict(), sort_keys=True),
+        json.dumps(status.to_dict(), sort_keys=True),
+        "\n".join(status.to_lines()),
+        json.dumps(controller.processed_data, sort_keys=True),
+    )
+
+    for serialized in public_values:
+        for sentinel in sentinels:
+            assert sentinel not in serialized
+    assert all("[REDACTED]" in value for value in public_values)
 
 
 def test_close_stage_decision_is_carried_by_controller_epoch_and_blocks_new_actions():
