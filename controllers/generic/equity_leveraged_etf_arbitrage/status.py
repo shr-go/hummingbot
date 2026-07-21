@@ -10,11 +10,41 @@ from controllers.generic.equity_leveraged_etf_arbitrage.nav import SessionStageD
 from controllers.generic.equity_leveraged_etf_arbitrage.shadow import ShadowPlan
 
 
-__all__ = ["ControllerOperationalStatus", "OperationalAlert"]
+__all__ = ["ControllerOperationalStatus", "OperationalAlert", "redact_public_text"]
 
 
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(api[_-]?key|private[_-]?key|secret|token|password)\s*=\s*([^\s,;]+)"
+_PEM_PRIVATE_KEY = re.compile(
+    (
+        r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?"
+        r"-----END(?: [A-Z0-9]+)* PRIVATE KEY-----"
+    ),
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SECRET_VALUE = re.compile(
+    r"""(?ix)
+    (?P<prefix>
+        (?P<quote>[\"'])?
+        (?:
+            api[_-]?key
+            | private[_-]?key
+            | (?:client[_-]?)?secret
+            | (?:access[_-]?|refresh[_-]?)?token
+            | password
+            | passphrase
+            | authorization
+        )
+        (?(quote)(?P=quote))
+        \s*(?:=|:)\s*
+    )
+    (?:
+        (?:Bearer\s+)?
+        (?:
+            \"(?:\\.|[^\"\\])*\"
+            | '(?:\\.|[^'\\])*'
+            | [^,;\s}\]]+
+        )
+    )
+    """
 )
 
 
@@ -23,8 +53,13 @@ def _decimal_text(value: Decimal) -> str:
     return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
 
 
-def _redact(message: str) -> str:
-    return _SECRET_ASSIGNMENT.sub(lambda found: f"{found.group(1)}=[REDACTED]", message)
+def redact_public_text(message: str) -> str:
+    """Remove credential material from text crossing a public status boundary."""
+
+    if not isinstance(message, str):
+        raise TypeError("public status text must be a string")
+    without_pem = _PEM_PRIVATE_KEY.sub("[REDACTED]", message)
+    return _SECRET_VALUE.sub(lambda found: f"{found.group('prefix')}[REDACTED]", without_pem)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +74,7 @@ class OperationalAlert:
             raise ValueError("operational alert message must be non-empty")
 
     def to_dict(self) -> dict[str, str]:
-        return {"code": self.code, "message": _redact(self.message)}
+        return {"code": self.code, "message": redact_public_text(self.message)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +109,10 @@ class ControllerOperationalStatus:
                 "pair_paused": decision.pair_paused,
                 "emergency_market_requested": decision.emergency_market_requested,
                 "intents": [
-                    {"kind": intent.kind.value, "reason": intent.reason}
+                    {
+                        "kind": intent.kind.value,
+                        "reason": redact_public_text(intent.reason),
+                    }
                     for intent in decision.intents
                 ],
             }
@@ -119,5 +157,8 @@ class ControllerOperationalStatus:
                 f"Shadow: hash={self.shadow_plan.deterministic_hash}; "
                 f"exchange_actions={len(self.shadow_plan.exchange_actions)}"
             )
-        lines.extend(f"  Alert {alert.code}: {_redact(alert.message)}" for alert in self.alerts)
+        lines.extend(
+            f"  Alert {alert.code}: {redact_public_text(alert.message)}"
+            for alert in self.alerts
+        )
         return lines

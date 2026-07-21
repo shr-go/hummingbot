@@ -315,7 +315,7 @@ def test_nav_stages_observe_exact_boundaries_pair_local_anomalies_and_normal_fal
         official_close_utc=OFFICIAL_CLOSE,
         now_utc=normal_time,
         anchor_status=AnchorRuntimeStatus.AVAILABLE,
-        spread_bp=D("200"),
+        spread_bp=D("199.9999"),
         p99_bp=D("100"),
     )
     assert normal.stage is NavStage.NORMAL
@@ -471,6 +471,7 @@ def test_independent_new_entry_cutoff_blocks_controller_open_and_add(
         for action in actions
     )
     assert normal.entry_allowed
+    assert cutoff.stage is NavStage.NEW_ENTRY_CUTOFF
     assert not cutoff.entry_allowed
     assert StageIntentKind.BLOCK_NEW_EXPOSURE in {intent.kind for intent in cutoff.intents}
 
@@ -519,6 +520,10 @@ def test_missing_nav_decision_fails_closed_for_open_and_add_in_close_window(
         and action.executor_config.operation.value == expected_operation
         for action in actions
     )
+    assert controller.last_operational_status is not None
+    assert [alert.code for alert in controller.last_operational_status.alerts] == [
+        "NAV_DECISION_UNAVAILABLE"
+    ]
 
 
 def test_anomalous_spread_p99_plus_100_is_inclusive_and_pair_local_in_status():
@@ -553,8 +558,10 @@ def test_public_status_and_processed_data_never_export_sensitive_failure_or_inte
     secret_text = (
         'api_key="API_KEY_SENTINEL" '
         '{"token": "JSON_TOKEN_SENTINEL", "secret": "JSON_SECRET_SENTINEL"} '
-        "private_key='-----BEGIN PRIVATE KEY-----\\n"
-        "PEM_PRIVATE_KEY_SENTINEL\\n-----END PRIVATE KEY-----'"
+        "authorization=Bearer AUTHORIZATION_SENTINEL "
+        """private_key='-----BEGIN PRIVATE KEY-----
+PEM_PRIVATE_KEY_SENTINEL
+-----END PRIVATE KEY-----'"""
     )
     coordinator = SessionStageCoordinator(load_nav_config())
     decision = coordinator.evaluate(
@@ -596,6 +603,7 @@ def test_public_status_and_processed_data_never_export_sensitive_failure_or_inte
         "API_KEY_SENTINEL",
         "JSON_TOKEN_SENTINEL",
         "JSON_SECRET_SENTINEL",
+        "AUTHORIZATION_SENTINEL",
         "PEM_PRIVATE_KEY_SENTINEL",
     ):
         assert sentinel not in serialized

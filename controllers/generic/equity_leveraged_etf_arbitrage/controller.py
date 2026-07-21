@@ -25,13 +25,20 @@ from controllers.generic.equity_leveraged_etf_arbitrage.reservations import (
     ReservationConflict,
     ReservationStore,
 )
-from controllers.generic.equity_leveraged_etf_arbitrage.nav import SessionStageDecision
+from controllers.generic.equity_leveraged_etf_arbitrage.nav import (
+    AnchorRuntimeStatus,
+    NavStage,
+    SessionStageDecision,
+)
 from controllers.generic.equity_leveraged_etf_arbitrage.shadow import (
     ShadowPairInput,
     ShadowPlan,
     ShadowPlanner,
 )
-from controllers.generic.equity_leveraged_etf_arbitrage.status import ControllerOperationalStatus
+from controllers.generic.equity_leveraged_etf_arbitrage.status import (
+    ControllerOperationalStatus,
+    OperationalAlert,
+)
 from hummingbot.core.data_type.common import MarketDict
 from hummingbot.strategy_v2.controllers.controller_base import (
     ControllerBase,
@@ -384,7 +391,7 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
         return actions
 
     def to_format_status(self) -> list[str]:
-        failure = self.last_failure or "none"
+        failure = self._public_failure_summary() or "none"
         allocation = self.last_allocation_hash or "unavailable"
         lines = [
             "Equity Leveraged ETF Arbitrage Controller:",
@@ -572,14 +579,22 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
                 key=lambda decision: decision.pair_id,
             )
         )
-        if not decisions:
-            return
+        alerts = tuple(
+            OperationalAlert(
+                code="NAV_DECISION_UNAVAILABLE",
+                message=f"{facts.pair_id}: trusted NAV/session decision is unavailable",
+            )
+            for facts in sorted(epoch.pairs, key=lambda value: value.pair_id)
+            if self._requires_nav_decision(facts)
+            and not self._has_trusted_nav_decision(facts)
+        )
         shadow = self.last_shadow_plan
         if shadow is not None and shadow.pair_ids != tuple(decision.pair_id for decision in decisions):
             shadow = None
         self.last_operational_status = ControllerOperationalStatus(
             decisions=decisions,
             shadow_plan=shadow,
+            alerts=alerts,
         )
 
     def _pair_facts_ready(self, configured: object, facts: PairEpochFacts) -> bool:
@@ -592,10 +607,7 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
             or not facts.market_data_fresh
             or not facts.bracket_data_fresh
             or frozen.stale
-            or (
-                facts.nav_decision is not None
-                and not facts.nav_decision.entry_allowed
-            )
+            or not self._nav_decision_allows_new_exposure(facts)
         ):
             return False
         try:
@@ -617,6 +629,40 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
             )
         except Exception:
             return False
+
+    @staticmethod
+    def _requires_nav_decision(facts: PairEpochFacts) -> bool:
+        return (
+            facts.frozen_pair is not None
+            and facts.anchor is not None
+            and facts.anchor.valid
+        )
+
+    @staticmethod
+    def _nav_decision_allows_new_exposure(facts: PairEpochFacts) -> bool:
+        """Accept exposure only with an internally consistent pair/cycle decision."""
+
+        decision = facts.nav_decision
+        return (
+            EquityLeveragedEtfArbitrageController._has_trusted_nav_decision(facts)
+            and decision is not None
+            and decision.stage is NavStage.NORMAL
+            and decision.operational_status is AnchorRuntimeStatus.AVAILABLE
+            and decision.entry_allowed
+            and not decision.pair_paused
+            and not decision.emergency_market_requested
+        )
+
+    @staticmethod
+    def _has_trusted_nav_decision(facts: PairEpochFacts) -> bool:
+        decision = facts.nav_decision
+        anchor = facts.anchor
+        return (
+            isinstance(decision, SessionStageDecision)
+            and anchor is not None
+            and decision.pair_id == facts.pair_id
+            and decision.cycle_id == anchor.nav_cycle_id
+        )
 
     def _actions_for_plan(
         self,
@@ -1051,7 +1097,7 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
     def _set_processed_data(self) -> None:
         self.processed_data = {
             "registered_pair_ids": self.registered_pair_ids,
-            "last_failure": self.last_failure,
+            "last_failure": self._public_failure_summary(),
             "allocation_hash": self.last_allocation_hash,
             "operational_status": (
                 None
@@ -1059,6 +1105,11 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
                 else self.last_operational_status.to_dict()
             ),
         }
+
+    def _public_failure_summary(self) -> str | None:
+        """Never serialize raw exception text from the Controller failure path."""
+
+        return None if self.last_failure is None else "failure recorded"
 
     def _fail(self, reason: str) -> None:
         self.last_failure = reason

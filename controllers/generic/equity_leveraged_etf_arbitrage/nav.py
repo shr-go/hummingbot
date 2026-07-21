@@ -325,7 +325,7 @@ class AnchorCycleCoordinator:
                 current_now,
                 checkpoint=updated,
                 alerts=(AnchorAlert.ANCHOR_UNAVAILABLE,),
-                failure_reason=result.failure_reason,
+                failure_reason="anchor acquisition is unavailable",
             )
         status = (
             AnchorRuntimeStatus.PENDING
@@ -442,16 +442,14 @@ class AnchorCycleCoordinator:
 
     @staticmethod
     def _safe_reason(exception: Exception) -> str:
-        # Contract exceptions contain field names and never configuration
-        # objects.  Keep only the exception type when an arbitrary adapter
-        # supplied the error text.
-        if isinstance(exception, (CheckpointIntegrityError, AnchorRevisionConflict, ValueError, TypeError)):
-            return str(exception)
+        # Failure snapshots are public operational output.  Never preserve an
+        # exception message, because an adapter can include credential text.
         return type(exception).__name__
 
 
 class NavStage(str, Enum):
     NORMAL = "NORMAL"
+    NEW_ENTRY_CUTOFF = "NEW_ENTRY_CUTOFF"
     CLOSE_30 = "CLOSE_30"
     CLOSE_1 = "CLOSE_1"
     POST_CLOSE = "POST_CLOSE"
@@ -565,6 +563,9 @@ class SessionStageCoordinator:
         if anchor_cycle_id is not None and not isinstance(anchor_cycle_id, str):
             raise TypeError("anchor_cycle_id must be a string when supplied")
 
+        entry_cutoff_at = official_close_utc - timedelta(
+            minutes=self._nav.new_entry_cutoff_minutes
+        )
         close_1_at = official_close_utc - timedelta(seconds=self._nav.force_market_close_lead_seconds)
         close_30_at = official_close_utc - timedelta(minutes=self._nav.maker_close_lead_minutes)
         if now_utc >= official_close_utc:
@@ -573,6 +574,8 @@ class SessionStageCoordinator:
             stage = NavStage.CLOSE_1
         elif now_utc >= close_30_at:
             stage = NavStage.CLOSE_30
+        elif now_utc >= entry_cutoff_at:
+            stage = NavStage.NEW_ENTRY_CUTOFF
         else:
             stage = NavStage.NORMAL
 
@@ -584,7 +587,7 @@ class SessionStageCoordinator:
         elif stale:
             operational_status = AnchorRuntimeStatus.STALE
 
-        anomalous = spread_bp > p99_bp + Decimal("100")
+        anomalous = spread_bp >= p99_bp + Decimal("100")
         entry_allowed = (
             stage is NavStage.NORMAL
             and operational_status is AnchorRuntimeStatus.AVAILABLE
@@ -611,7 +614,7 @@ class SessionStageCoordinator:
                 "official close is within 60 seconds",
             )
         if anomalous:
-            add(StageIntentKind.PAUSE_NEW_EXPOSURE, "spread exceeds P99 plus 100 bp")
+            add(StageIntentKind.PAUSE_NEW_EXPOSURE, "spread reaches P99 plus 100 bp")
         if cross_cycle:
             add(StageIntentKind.RECOVERY_REQUIRED, "holding belongs to a prior NAV cycle")
         elif operational_status is AnchorRuntimeStatus.RECOVERY_REQUIRED:
