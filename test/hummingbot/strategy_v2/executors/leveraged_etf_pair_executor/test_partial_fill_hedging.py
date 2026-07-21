@@ -376,6 +376,53 @@ async def test_native_stock_submission_reconciles_async_unknown_before_another_h
 
 
 @pytest.mark.asyncio
+async def test_stock_creation_submits_hedge_fills_deferred_while_the_prior_native_submission_was_unconfirmed():
+    executor, connector, _, _ = _executor()
+    await executor.control_task()
+
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "etf-deferred-hedge-1",
+            "10",
+            timestamp=1.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "etf-deferred-hedge-2",
+            "5",
+            timestamp=2.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+    stock_orders = [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"]
+    assert [order["amount"] for order in stock_orders] == [Decimal("9.6")]
+
+    executor.process_order_created_event(
+        MarketEvent.BuyOrderCreated.value,
+        connector,
+        _created_event(
+            stock_orders[0]["client_order_id"],
+            trading_pair="SNDK-USDT",
+            side=TradeType.BUY,
+            exchange_order_id="20001",
+        ),
+    )
+
+    stock_orders = [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"]
+    assert [order["amount"] for order in stock_orders] == [Decimal("9.6"), Decimal("4.8")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operation",
     [

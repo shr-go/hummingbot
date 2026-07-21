@@ -48,6 +48,7 @@ from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types imp
     LeveragedEtfPairExecutorReportV1,
     LeveragedEtfPairExecutorSnapshotV1,
     LeveragedEtfPairExecutorStateV1,
+    LeveragedEtfPairOperation,
     LeveragedEtfPairState,
     OrderReferenceV1,
 )
@@ -72,6 +73,9 @@ class _OrderIntent:
     identity: SideEffectIdentityV1
     filled_quantity: Decimal = _ZERO
     exchange_order_id: Optional[str] = None
+    submitted: bool = False
+    acknowledged: bool = False
+    submission_unknown: bool = False
 
     @property
     def remaining_quantity(self) -> Decimal:
@@ -178,9 +182,13 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         self._close_reason = "early stop requested; cancellation is outside the entry executor scope"
 
     async def control_task(self):
+        self._consume_submission_unknowns()
         if self._submission_halted or self._maker_submission_started:
             return
         self._ensure_journal_snapshot()
+        if not self._entry_operation_is_supported():
+            self._halt_unsupported_operation()
+            return
         try:
             await self._run_strict_preflight()
         except Exception:
@@ -204,26 +212,43 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         intent = self._intent_for_client_order_id(event.order_id)
         if intent is None:
             return
+        if intent.submission_unknown:
+            return
         exchange_order_id = event.exchange_order_id
         if not exchange_order_id:
             self._transition_to_recovery_required("order created event omitted exchange order id")
             return
-        if intent.exchange_order_id == exchange_order_id:
-            return
         if intent.exchange_order_id is not None and intent.exchange_order_id != exchange_order_id:
             self._transition_to_recovery_required("client order id mapped to conflicting exchange order ids")
             return
-        self._append_identity_event(
-            event_type=JournalEventType.ORDER_CREATED,
-            payload=OrderCreatedJournalPayloadV1(identity=intent.identity, exchange_order_id=exchange_order_id),
-            identity=intent.identity,
-            exchange_order_id=exchange_order_id,
-        )
-        intent.exchange_order_id = exchange_order_id
+        if intent.exchange_order_id is None:
+            self._append_identity_event(
+                event_type=JournalEventType.ORDER_CREATED,
+                payload=OrderCreatedJournalPayloadV1(identity=intent.identity, exchange_order_id=exchange_order_id),
+                identity=intent.identity,
+                exchange_order_id=exchange_order_id,
+            )
+            intent.exchange_order_id = exchange_order_id
+        was_acknowledged = intent.acknowledged
+        self._acknowledge_intent(intent)
+        if not was_acknowledged:
+            self._apply_acknowledged_state(intent)
+            if intent.identity.leg == "STOCK" and not self._submission_halted:
+                try:
+                    # ETF fills that arrived while the native stock submission
+                    # was unconfirmed were deliberately held.  An authoritative
+                    # creation event is the safe point to submit that backlog.
+                    self._submit_incremental_stock_hedge()
+                except Exception:
+                    self._submission_halted = True
+                    self._close_reason = "stock hedge setup or submission failed"
+                    self._transition_to_recovery_required("stock hedge setup or submission failed")
 
     def process_order_filled_event(self, _: int, market, event: OrderFilledEvent):
         intent = self._intent_for_client_order_id(event.order_id)
         if intent is None:
+            return
+        if intent.submission_unknown:
             return
         leg = "ETF" if intent.identity.leg == "ETF" else "STOCK"
         trade_id = str(event.exchange_trade_id or "")
@@ -242,6 +267,10 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             self._transition_to_recovery_required("fill exceeded prepared order quantity")
             return
 
+        # A fill is also an authoritative connector confirmation.  It may be
+        # delivered before OrderCreated, so it is the earliest safe point to
+        # persist ACKNOWLEDGED for this intent.
+        self._acknowledge_intent(intent)
         order_cumulative = intent.filled_quantity + quantity
         leg_cumulative = (
             self._etf_filled_quantity + quantity
@@ -305,7 +334,8 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             return
         # The connector had already allocated the stable client id, so preserve the
         # ambiguity/rejection fact and stop automatic submission rather than creating
-        # another maker order.  The F004 reducer permits reconciliation after ACK.
+        # another maker order.  The F004 reducer permits reconciliation from a
+        # prepared or acknowledged native submission.
         self._append_identity_event(
             event_type=JournalEventType.RECONCILIATION,
             payload=ReconciliationJournalPayloadV1(
@@ -445,7 +475,9 @@ class LeveragedEtfPairExecutor(ExecutorBase):
     def _submit_maker_order(self):
         if self._maker_submission_started:
             return
-        self._maker_submission_started = True
+        if not self._entry_operation_is_supported():
+            self._halt_unsupported_operation()
+            return
         maker_side = self._etf_trade_side()
         price_type = PriceType.BestBid if maker_side is TradeType.BUY else PriceType.BestAsk
         price = self._quantize_price(
@@ -453,13 +485,26 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             self.config.etf_trading_pair,
             Decimal(self.get_price(self.config.etf_connector_name, self.config.etf_trading_pair, price_type)),
         )
+        legal_quantity = self._quantize_order_quantity_at_price(
+            self.config.etf_connector_name,
+            self.config.etf_trading_pair,
+            self.config.etf_target_quantity,
+            price,
+        )
+        if legal_quantity != self.config.etf_target_quantity:
+            self._submission_halted = True
+            self._close_reason = "maker quantity is below the actual-price trading-rule minimum"
+            self._transition_to_recovery_required(self._close_reason)
+            return
+        self._maker_submission_started = True
         identity = self._new_identity(
             action=JournalSideEffect.ETF_MAKER,
             leg="ETF",
             logical_quantity=self.config.etf_target_quantity,
             order_quantity=self.config.etf_target_quantity,
         )
-        self._maker_intent = _OrderIntent(identity=identity)
+        intent = _OrderIntent(identity=identity)
+        self._maker_intent = intent
         self._append_identity_event(
             event_type=JournalEventType.PREPARED,
             payload=PreparedJournalPayloadV1(identity=identity),
@@ -480,24 +525,18 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             self._record_submission_exception(identity, exc, is_maker=True)
             return
         if order_id != identity.client_order_id:
-            self._transition_to_recovery_required("connector did not retain the preallocated maker client id")
+            self._mark_submission_unknown(intent=intent, reason="connector did not retain maker client id")
             return
-        self._append_identity_event(
-            event_type=JournalEventType.ACKNOWLEDGED,
-            payload=AcknowledgedJournalPayloadV1(identity=identity),
-            identity=identity,
-        )
-        # A connector can deliver a fill before this synchronous call returns.
-        # F004 accepts the late ACK, but local state must not regress from the
-        # fill-driven hedge state.
-        self._state = (
-            LeveragedEtfPairState.MAKER_WORKING
-            if self._etf_filled_quantity == _ZERO
-            else LeveragedEtfPairState.STOCK_HEDGE_PENDING
-        )
+        intent.submitted = True
+        self._consume_submission_unknowns()
 
     def _submit_incremental_stock_hedge(self):
         if self._submission_halted:
+            return
+        if not self._entry_operation_is_supported():
+            self._halt_unsupported_operation()
+            return
+        if self._consume_submission_unknowns() or self._has_unacknowledged_stock_submission():
             return
         etf_multiplier = self._contract_multiplier(self.config.etf_connector_name, self.config.etf_trading_pair)
         stock_multiplier = self._contract_multiplier(self.config.stock_connector_name, self.config.stock_trading_pair)
@@ -520,17 +559,21 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             return
         self._stock_hedge_target_quantity = quantized_target
         self._hedge_dust_quantity = raw_target - quantized_target
-        incremental_quantity = quantized_target - self._stock_filled_quantity - self.stock_pending_quantity
+        covered_quantity = self._stock_filled_quantity + self.stock_pending_quantity
+        incremental_quantity = quantized_target - covered_quantity
         if incremental_quantity <= _ZERO:
             return
-        legal_increment = self._quantize_order_quantity(
+        stock_price = self._current_executable_stock_price()
+        legal_increment = self._quantize_order_quantity_at_price(
             self.config.stock_connector_name,
             self.config.stock_trading_pair,
             incremental_quantity,
+            stock_price,
         )
-        if legal_increment != incremental_quantity or legal_increment <= _ZERO:
-            self._transition_to_recovery_required("incremental hedge quantity is not legally quantized")
+        if legal_increment <= _ZERO:
+            self._hedge_dust_quantity = max(_ZERO, raw_target - covered_quantity)
             return
+        self._hedge_dust_quantity = max(_ZERO, raw_target - covered_quantity - legal_increment)
         identity = self._new_identity(
             action=JournalSideEffect.STOCK_HEDGE,
             leg="STOCK",
@@ -563,13 +606,10 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             self._record_submission_exception(identity, exc, is_maker=False)
             return
         if order_id != identity.client_order_id:
-            self._transition_to_recovery_required("connector did not retain the preallocated stock client id")
+            self._mark_submission_unknown(intent=intent, reason="connector did not retain stock client id")
             return
-        self._append_identity_event(
-            event_type=JournalEventType.ACKNOWLEDGED,
-            payload=AcknowledgedJournalPayloadV1(identity=identity),
-            identity=identity,
-        )
+        intent.submitted = True
+        self._consume_submission_unknowns()
 
     def _record_submission_exception(self, identity: SideEffectIdentityV1, exc: Exception, *, is_maker: bool):
         failure_kind = getattr(exc, "failure_kind", None)
@@ -581,17 +621,92 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             )
             self._state = LeveragedEtfPairState.PREFLIGHT if is_maker else LeveragedEtfPairState.STOCK_HEDGE_PENDING
         else:
-            self._append_identity_event(
-                event_type=JournalEventType.SUBMIT_UNKNOWN,
-                payload=SubmitUnknownJournalPayloadV1(
-                    identity=identity,
-                    uncertainty_started_at_utc=self._event_clock,
-                ),
-                identity=identity,
-            )
-            self._state = LeveragedEtfPairState.RECONCILING
+            intent = self._intent_for_client_order_id(identity.client_order_id)
+            if intent is None:
+                raise RuntimeError("submission failure referenced an unknown local intent")
+            self._mark_submission_unknown(intent=intent, reason="order submission failed")
+            return
         self._submission_halted = True
         self._close_reason = "order submission failed"
+
+    def _acknowledge_intent(self, intent: _OrderIntent):
+        if intent.acknowledged:
+            return
+        self._append_identity_event(
+            event_type=JournalEventType.ACKNOWLEDGED,
+            payload=AcknowledgedJournalPayloadV1(identity=intent.identity),
+            identity=intent.identity,
+        )
+        intent.acknowledged = True
+
+    def _apply_acknowledged_state(self, intent: _OrderIntent):
+        if intent.identity.leg == "ETF":
+            self._state = (
+                LeveragedEtfPairState.MAKER_WORKING
+                if self._etf_filled_quantity == _ZERO
+                else LeveragedEtfPairState.STOCK_HEDGE_PENDING
+            )
+        else:
+            self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+
+    def _consume_submission_unknowns(self) -> bool:
+        intents = tuple(
+            intent
+            for intent in (self._maker_intent, *self._stock_intents.values())
+            if intent is not None and intent.submitted and not intent.acknowledged and not intent.submission_unknown
+        )
+        for intent in intents:
+            checker = getattr(self.connectors[intent.identity.connector_name], "is_order_submission_unknown", None)
+            if not callable(checker):
+                continue
+            try:
+                submission_unknown = bool(checker(intent.identity.client_order_id))
+            except Exception:
+                self._mark_submission_unknown(
+                    intent=intent,
+                    reason="unable to determine native order submission status",
+                )
+                return True
+            if submission_unknown:
+                self._mark_submission_unknown(
+                    intent=intent,
+                    reason="connector retained an unknown native order submission",
+                )
+                return True
+        return self._submission_halted
+
+    def _mark_submission_unknown(self, *, intent: _OrderIntent, reason: str):
+        if intent.submission_unknown:
+            return
+        intent.submission_unknown = True
+        self._append_identity_event(
+            event_type=JournalEventType.SUBMIT_UNKNOWN,
+            payload=SubmitUnknownJournalPayloadV1(
+                identity=intent.identity,
+                uncertainty_started_at_utc=self._event_clock,
+            ),
+            identity=intent.identity,
+        )
+        self._submission_halted = True
+        self._close_reason = reason
+        self._state = LeveragedEtfPairState.RECONCILING
+
+    def _has_unacknowledged_stock_submission(self) -> bool:
+        return any(
+            intent.submitted and not intent.acknowledged and not intent.submission_unknown
+            for intent in self._stock_intents.values()
+        )
+
+    def _entry_operation_is_supported(self) -> bool:
+        return self.config.operation in {
+            LeveragedEtfPairOperation.OPEN,
+            LeveragedEtfPairOperation.ADD,
+        }
+
+    def _halt_unsupported_operation(self):
+        self._submission_halted = True
+        self._close_reason = f"{self.config.operation.value} is outside the entry executor scope"
+        self._transition_to_recovery_required(self._close_reason)
 
     def _native_submit(
         self,
@@ -736,12 +851,40 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         quantized = (quantity / increment).to_integral_value(rounding=ROUND_DOWN) * increment
         return quantized if quantized >= min_order_size else _ZERO
 
+    def _quantize_order_quantity_at_price(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        quantity: Decimal,
+        price: Decimal,
+    ) -> Decimal:
+        if not price.is_finite() or price <= _ZERO:
+            raise RuntimeError(f"invalid executable price for {connector_name}:{trading_pair}")
+        rule = self._trading_rule(connector_name, trading_pair)
+        minimum_notional = Decimal(rule.min_notional_size)
+        if not minimum_notional.is_finite() or minimum_notional < _ZERO:
+            raise RuntimeError(f"invalid notional rule for {connector_name}:{trading_pair}")
+        quantized = self._quantize_order_quantity(connector_name, trading_pair, quantity)
+        if quantized <= _ZERO:
+            return _ZERO
+        return quantized if quantized * price >= minimum_notional else _ZERO
+
     def _quantize_price(self, connector_name: str, trading_pair: str, price: Decimal) -> Decimal:
         rule = self._trading_rule(connector_name, trading_pair)
         increment = Decimal(rule.min_price_increment)
         if price <= _ZERO or increment <= _ZERO:
             raise RuntimeError(f"invalid price rule for {connector_name}:{trading_pair}")
         return (price / increment).to_integral_value(rounding=ROUND_DOWN) * increment
+
+    def _current_executable_stock_price(self) -> Decimal:
+        price_type = PriceType.BestAsk if self._stock_trade_side() is TradeType.BUY else PriceType.BestBid
+        return Decimal(
+            self.get_price(
+                self.config.stock_connector_name,
+                self.config.stock_trading_pair,
+                price_type,
+            )
+        )
 
     def _etf_trade_side(self) -> TradeType:
         return (
