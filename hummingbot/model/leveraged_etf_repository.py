@@ -689,6 +689,30 @@ def _validate_checkpoint_payload_revision(kind: str, value: Any) -> None:
         raise ValueError("opaque anchor checkpoint payload revision must be an exact built-in integer")
 
 
+def _validate_canonical_anchor_payload_v2(
+    *,
+    kind: str,
+    contract_version_field: str,
+    contract_version: int,
+    payload_json: str,
+    payload_hash: str,
+) -> Mapping[str, Any]:
+    value = _verify_canonical_json(payload_json, payload_hash, f"{kind} payload")
+    if not isinstance(value, Mapping):
+        raise ValueError("opaque anchor payload must be a JSON object")
+    _validate_checkpoint_payload_revision(kind, value)
+    declared_version = value.get(contract_version_field)
+    if (
+        not isinstance(declared_version, int)
+        or isinstance(declared_version, bool)
+        or declared_version != contract_version
+    ):
+        raise ValueError("opaque anchor payload contract version is invalid")
+    if "kind" in value and value["kind"] != kind:
+        raise ValueError("wrapper and embedded anchor payload kind must match exactly")
+    return value
+
+
 class CanonicalOpaqueAnchorPayloadV2(BaseModel):
     """Canonical domain payload with an explicit, adapter-supplied version discriminator."""
 
@@ -703,19 +727,13 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
 
     @model_validator(mode="after")
     def validate_canonical_payload(self) -> CanonicalOpaqueAnchorPayloadV2:
-        value = _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
-        if not isinstance(value, Mapping):
-            raise ValueError("opaque anchor payload must be a JSON object")
-        _validate_checkpoint_payload_revision(self.kind, value)
-        declared_version = value.get(self.contract_version_field)
-        if (
-            not isinstance(declared_version, int)
-            or isinstance(declared_version, bool)
-            or declared_version != self.contract_version
-        ):
-            raise ValueError("opaque anchor payload contract version is invalid")
-        if "kind" in value and value["kind"] != self.kind:
-            raise ValueError("wrapper and embedded anchor payload kind must match exactly")
+        _validate_canonical_anchor_payload_v2(
+            kind=self.kind,
+            contract_version_field=self.contract_version_field,
+            contract_version=self.contract_version,
+            payload_json=self.payload_json,
+            payload_hash=self.payload_hash,
+        )
         return self
 
     @classmethod
@@ -756,10 +774,13 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
         )
 
     def value(self) -> Mapping[str, Any]:
-        value = _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
-        if not isinstance(value, Mapping):
-            raise ValueError("opaque anchor payload must be a JSON object")
-        return value
+        return _validate_canonical_anchor_payload_v2(
+            kind=self.kind,
+            contract_version_field=self.contract_version_field,
+            contract_version=self.contract_version,
+            payload_json=self.payload_json,
+            payload_hash=self.payload_hash,
+        )
 
 
 class AnchorStorageKeyV2(BaseModel):
@@ -2553,6 +2574,19 @@ class PairScopedAnchorRepository(_TransactionalRepository):
             raise AnchorRevisionConflict(f"expected revision must be an integer of at least {minimum}")
         return expected_revision
 
+    @staticmethod
+    def _revalidate_checkpoint_envelope(checkpoint: OpaqueAnchorCheckpointV2) -> OpaqueAnchorCheckpointV2:
+        if type(checkpoint) is not OpaqueAnchorCheckpointV2:
+            raise AnchorIntegrityError("checkpoint writes require an exact OpaqueAnchorCheckpointV2 envelope")
+        try:
+            checkpoint.validate_metadata()
+            primitive = checkpoint.model_dump(mode="python", round_trip=True, warnings="error")
+            return OpaqueAnchorCheckpointV2.model_validate(primitive)
+        except AnchorIntegrityError:
+            raise
+        except Exception as exception:
+            raise AnchorIntegrityError(f"anchor checkpoint envelope integrity failure: {exception}") from exception
+
     @classmethod
     def _assert_key_matches(
         cls,
@@ -2696,6 +2730,7 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         checkpoint: OpaqueAnchorCheckpointV2,
         expected_revision: int,
     ) -> OpaqueAnchorCheckpointV2:
+        checkpoint = self._revalidate_checkpoint_envelope(checkpoint)
         self._assert_key_matches(key, checkpoint)
         self._require_expected_revision(expected_revision, minimum=0)
         if checkpoint.revision != expected_revision + 1:
