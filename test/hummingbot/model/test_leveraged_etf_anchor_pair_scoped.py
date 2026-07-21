@@ -44,6 +44,10 @@ class _RevisionInt(int):
     pass
 
 
+class _MetadataString(str):
+    pass
+
+
 def _checkpoint_fields(revision: Any) -> dict[str, Any]:
     return {
         "integrity_version": 3,
@@ -109,18 +113,100 @@ def _checkpoint_copied_with_payload_revision(revision: Any):
     return copied_payload, copied_checkpoint
 
 
+def _finalized_envelope(evidence_hash: str = "a" * 64):
+    fields = {
+        "evidence_version": 3,
+        "pair_id": "sndk_snxx",
+        "cycle_id": "xnys-2026-07-17",
+        "target_session_date": "2026-07-17",
+        "official_close_utc": "2026-07-17T20:00:00.000000Z",
+        "deadline_utc": "2026-07-17T20:10:00.000000Z",
+        "finalized_at_utc": "2026-07-17T20:01:00.000000Z",
+        "evidence_hash": evidence_hash,
+    }
+    payload = durable_contract.CanonicalOpaqueAnchorPayloadV2.from_value(
+        kind="ANCHOR_RECORD",
+        contract_version_field="evidence_version",
+        contract_version=3,
+        value=fields,
+    )
+    return durable_contract.OpaqueAnchorFinalizedV2(
+        key=durable_contract.AnchorStorageKeyV2(
+            pair_id=fields["pair_id"],
+            cycle_id=fields["cycle_id"],
+        ),
+        target_session_date=fields["target_session_date"],
+        official_close_utc=fields["official_close_utc"],
+        deadline_utc=fields["deadline_utc"],
+        revision=1,
+        evidence_hash=evidence_hash,
+        payload=payload,
+    )
+
+
+def _revision_observation_envelope(evidence_hash: str = "c" * 64):
+    fields = {
+        "schema_version": 2,
+        "pair_id": "sndk_snxx",
+        "cycle_id": "xnys-2026-07-17",
+        "evidence_hash": evidence_hash,
+        "observed_at_utc": "2026-07-17T20:05:00.000000Z",
+    }
+    payload = durable_contract.CanonicalOpaqueAnchorPayloadV2.from_value(
+        kind="ANCHOR_REVISION_OBSERVATION",
+        contract_version_field="schema_version",
+        contract_version=2,
+        value=fields,
+    )
+    return durable_contract.OpaqueAnchorRevisionObservationV2(
+        key=durable_contract.AnchorStorageKeyV2(
+            pair_id=fields["pair_id"],
+            cycle_id=fields["cycle_id"],
+        ),
+        evidence_hash=evidence_hash,
+        observed_at_utc=fields["observed_at_utc"],
+        payload=payload,
+    )
+
+
+def _stored_anchor_row(state):
+    payload_value = state.payload.value()
+    finalized = isinstance(state, durable_contract.OpaqueAnchorFinalizedV2)
+    stored_at_utc = payload_value["finalized_at_utc"] if finalized else payload_value["next_poll_utc"]
+    return {
+        "pair_id": state.key.pair_id,
+        "cycle_id": state.key.cycle_id,
+        "schema_version": 2,
+        "state_kind": "FINALIZED" if finalized else "CHECKPOINT",
+        "revision": state.revision,
+        "target_session_date": state.target_session_date,
+        "official_close_utc": state.official_close_utc,
+        "deadline_utc": state.deadline_utc,
+        "evidence_hash": state.evidence_hash if finalized else None,
+        "payload_version_field": state.payload.contract_version_field,
+        "payload_contract_version": state.payload.contract_version,
+        "payload_json": state.payload.payload_json,
+        "payload_hash": state.payload.payload_hash,
+        "created_at_utc": stored_at_utc,
+        "updated_at_utc": stored_at_utc,
+    }
+
+
 class _CaptureMappings:
-    @staticmethod
-    def one_or_none():
-        return None
+    def __init__(self, row=None):
+        self._row = row
+
+    def one_or_none(self):
+        return self._row
 
 
 class _CaptureResult:
-    rowcount = 1
+    def __init__(self, row=None, rowcount: int = 1):
+        self._row = row
+        self.rowcount = rowcount
 
-    @staticmethod
-    def mappings():
-        return _CaptureMappings()
+    def mappings(self):
+        return _CaptureMappings(self._row)
 
 
 class _CaptureTransaction:
@@ -135,9 +221,14 @@ class _CaptureTransaction:
 
 
 class _CaptureConnection:
-    def __init__(self):
+    def __init__(self, *, anchor_row=None, observation_row=None):
+        self._anchor_row = anchor_row
+        self._observation_row = observation_row
         self.begin_count = 0
+        self.select_count = 0
         self.insert_parameters: list[dict[str, Any]] = []
+        self.update_parameters: list[dict[str, Any]] = []
+        self.observation_insert_parameters: list[dict[str, Any]] = []
 
     def begin(self):
         self.begin_count += 1
@@ -149,10 +240,20 @@ class _CaptureConnection:
 
     def execute(self, statement, parameters=None):
         sql = str(statement)
-        if "SELECT pair_id, cycle_id" in sql:
-            return _CaptureResult()
+        if "FROM LeveragedEtfAnchorRevisionObservation" in sql:
+            self.select_count += 1
+            return _CaptureResult(self._observation_row)
+        if "FROM LeveragedEtfAnchorState" in sql:
+            self.select_count += 1
+            return _CaptureResult(self._anchor_row)
         if "INSERT INTO LeveragedEtfAnchorState" in sql:
             self.insert_parameters.append(dict(parameters))
+            return _CaptureResult()
+        if "UPDATE LeveragedEtfAnchorState" in sql:
+            self.update_parameters.append(dict(parameters))
+            return _CaptureResult()
+        if "INSERT INTO LeveragedEtfAnchorRevisionObservation" in sql:
+            self.observation_insert_parameters.append(dict(parameters))
             return _CaptureResult()
         raise AssertionError(f"unexpected capture SQL: {sql}")
 
@@ -316,6 +417,134 @@ def test_exact_builtin_checkpoint_revision_round_trips_and_cas(
     reloaded = repository.load_opaque(second.key)
     assert reloaded == second
     assert type(reloaded.payload.value()["revision"]) is int
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence_hash",
+    [
+        "b" * 64,
+        _MetadataString("a" * 64),
+    ],
+    ids=("evidence-value", "evidence-type"),
+)
+def test_model_copy_finalized_rejects_before_transaction_or_update(
+    invalid_evidence_hash: str,
+):
+    valid = _finalized_envelope()
+    copied = valid.model_copy(update={"evidence_hash": invalid_evidence_hash})
+    assert type(copied) is durable_contract.OpaqueAnchorFinalizedV2
+    assert copied.payload.value()["evidence_hash"] == "a" * 64
+    connection = _CaptureConnection(
+        anchor_row=_stored_anchor_row(_checkpoint_envelope(_checkpoint_payload_from_value(1)))
+    )
+    engine = _CaptureEngine(connection)
+    repository = durable_contract.PairScopedAnchorRepository(SimpleNamespace(engine=engine))
+    rejection = None
+
+    try:
+        repository.finalize_opaque_if_absent(copied.key, copied, expected_revision=1)
+    except (ValueError, ValidationError, AnchorIntegrityError) as exception:
+        rejection = exception
+
+    assert (
+        rejection is not None,
+        engine.connect_count,
+        connection.begin_count,
+        connection.select_count,
+        connection.update_parameters,
+    ) == (True, 0, 0, 0, [])
+
+
+def test_valid_finalization_remains_idempotent_and_different_evidence_is_immutable(
+    manager: SQLConnectionManager,
+):
+    repository = durable_contract.PairScopedAnchorRepository(manager)
+    checkpoint = _checkpoint_envelope(_checkpoint_payload_from_value(1))
+    finalized = _finalized_envelope()
+    repository.compare_and_set_opaque_checkpoint(checkpoint.key, checkpoint, expected_revision=0)
+
+    assert repository.finalize_opaque_if_absent(finalized.key, finalized, expected_revision=1) == finalized
+    assert repository.finalize_opaque_if_absent(finalized.key, finalized, expected_revision=1) == finalized
+    with pytest.raises(AnchorIntegrityError, match="different final evidence"):
+        repository.finalize_opaque_if_absent(
+            finalized.key,
+            _finalized_envelope("b" * 64),
+            expected_revision=1,
+        )
+    assert repository.load_opaque(finalized.key) == finalized
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "evidence-value",
+        "evidence-type",
+        "observed-at-value",
+        "observed-at-type",
+        "payload-kind",
+        "payload-hash",
+        "payload-version",
+    ],
+)
+def test_model_copy_revision_observation_rejects_before_transaction_or_insert(mutation: str):
+    valid = _revision_observation_envelope()
+    if mutation == "evidence-value":
+        copied = valid.model_copy(update={"evidence_hash": "d" * 64})
+    elif mutation == "evidence-type":
+        copied = valid.model_copy(update={"evidence_hash": _MetadataString("c" * 64)})
+    elif mutation == "observed-at-value":
+        copied = valid.model_copy(update={"observed_at_utc": "2026-07-17T20:06:00.000000Z"})
+    elif mutation == "observed-at-type":
+        copied = valid.model_copy(
+            update={"observed_at_utc": _MetadataString("2026-07-17T20:05:00.000000Z")}
+        )
+    elif mutation == "payload-kind":
+        copied = valid.model_copy(
+            update={"payload": valid.payload.model_copy(update={"kind": "ANCHOR_RECORD"})}
+        )
+    elif mutation == "payload-hash":
+        copied = valid.model_copy(
+            update={"payload": valid.payload.model_copy(update={"payload_hash": "0" * 64})}
+        )
+    else:
+        copied = valid.model_copy(
+            update={"payload": valid.payload.model_copy(update={"contract_version": 3})}
+        )
+    assert type(copied) is durable_contract.OpaqueAnchorRevisionObservationV2
+    assert type(copied.payload) is durable_contract.CanonicalOpaqueAnchorPayloadV2
+    connection = _CaptureConnection(anchor_row=_stored_anchor_row(_finalized_envelope()))
+    engine = _CaptureEngine(connection)
+    repository = durable_contract.PairScopedAnchorRepository(SimpleNamespace(engine=engine))
+    rejection = None
+
+    try:
+        repository.append_opaque_revision_observation(copied.key, copied)
+    except (ValueError, ValidationError, AnchorIntegrityError) as exception:
+        rejection = exception
+
+    assert (
+        rejection is not None,
+        engine.connect_count,
+        connection.begin_count,
+        connection.select_count,
+        connection.observation_insert_parameters,
+    ) == (True, 0, 0, 0, [])
+
+
+def test_valid_revision_observation_remains_idempotent_and_reloads(
+    manager: SQLConnectionManager,
+):
+    repository = durable_contract.PairScopedAnchorRepository(manager)
+    checkpoint = _checkpoint_envelope(_checkpoint_payload_from_value(1))
+    finalized = _finalized_envelope()
+    observation = _revision_observation_envelope()
+    repository.compare_and_set_opaque_checkpoint(checkpoint.key, checkpoint, expected_revision=0)
+    repository.finalize_opaque_if_absent(finalized.key, finalized, expected_revision=1)
+
+    repository.append_opaque_revision_observation(observation.key, observation)
+    repository.append_opaque_revision_observation(observation.key, observation)
+
+    assert repository.opaque_revision_observations(observation.key) == (observation,)
 
 
 class _F003OpaqueAdapter:
