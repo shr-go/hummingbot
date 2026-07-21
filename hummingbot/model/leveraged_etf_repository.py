@@ -682,6 +682,13 @@ class AnchorRevisionObservationV1(BaseModel):
         return self
 
 
+def _validate_checkpoint_payload_revision(kind: str, value: Any) -> None:
+    if kind == "ANCHOR_CHECKPOINT" and (
+        not isinstance(value, Mapping) or type(value.get("revision")) is not int
+    ):
+        raise ValueError("opaque anchor checkpoint payload revision must be an exact built-in integer")
+
+
 class CanonicalOpaqueAnchorPayloadV2(BaseModel):
     """Canonical domain payload with an explicit, adapter-supplied version discriminator."""
 
@@ -699,6 +706,7 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
         value = _verify_canonical_json(self.payload_json, self.payload_hash, f"{self.kind} payload")
         if not isinstance(value, Mapping):
             raise ValueError("opaque anchor payload must be a JSON object")
+        _validate_checkpoint_payload_revision(self.kind, value)
         declared_version = value.get(self.contract_version_field)
         if (
             not isinstance(declared_version, int)
@@ -719,6 +727,7 @@ class CanonicalOpaqueAnchorPayloadV2(BaseModel):
         contract_version: int,
         value: Any,
     ) -> CanonicalOpaqueAnchorPayloadV2:
+        _validate_checkpoint_payload_revision(kind, value)
         payload_json = _canonical_json(value)
         return cls(
             kind=kind,
@@ -808,7 +817,8 @@ class OpaqueAnchorCheckpointV2(BaseModel):
             "revision": self.revision,
         }
         for field_name, expected in comparisons.items():
-            if value.get(field_name) != expected:
+            actual = value.get(field_name)
+            if type(actual) is not type(expected) or actual != expected:
                 raise AnchorIntegrityError(f"anchor checkpoint {field_name} disagrees with envelope metadata")
         return self
 
