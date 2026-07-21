@@ -48,6 +48,16 @@ class _MetadataString(str):
     pass
 
 
+class _LyingString(str):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
 def _checkpoint_fields(revision: Any) -> dict[str, Any]:
     return {
         "integrity_version": 3,
@@ -113,10 +123,10 @@ def _checkpoint_copied_with_payload_revision(revision: Any):
     return copied_payload, copied_checkpoint
 
 
-def _finalized_envelope(evidence_hash: str = "a" * 64):
+def _finalized_envelope(evidence_hash: str = "a" * 64, pair_id: str = "sndk_snxx"):
     fields = {
         "evidence_version": 3,
-        "pair_id": "sndk_snxx",
+        "pair_id": pair_id,
         "cycle_id": "xnys-2026-07-17",
         "target_session_date": "2026-07-17",
         "official_close_utc": "2026-07-17T20:00:00.000000Z",
@@ -545,6 +555,59 @@ def test_valid_revision_observation_remains_idempotent_and_reloads(
     repository.append_opaque_revision_observation(observation.key, observation)
 
     assert repository.opaque_revision_observations(observation.key) == (observation,)
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_model_copy_external_key_is_rejected_before_opaque_write(surface: str):
+    if surface == "checkpoint":
+        envelope = _checkpoint_envelope(_checkpoint_payload_from_value(1))
+        connection = _CaptureConnection()
+    elif surface == "finalized":
+        envelope = _finalized_envelope()
+        connection = _CaptureConnection()
+    else:
+        envelope = _revision_observation_envelope()
+        connection = _CaptureConnection(
+            anchor_row=_stored_anchor_row(_finalized_envelope(pair_id="intc_intw"))
+        )
+    external_key = envelope.key.model_copy(
+        update={"pair_id": _LyingString("intc_intw")}
+    )
+    assert type(external_key) is durable_contract.AnchorStorageKeyV2
+    assert type(external_key.pair_id) is _LyingString
+    assert str(external_key.pair_id) == "intc_intw"
+    assert envelope.key == external_key
+    engine = _CaptureEngine(connection)
+    repository = durable_contract.PairScopedAnchorRepository(SimpleNamespace(engine=engine))
+    rejection = None
+
+    try:
+        if surface == "checkpoint":
+            repository.compare_and_set_opaque_checkpoint(
+                external_key,
+                envelope,
+                expected_revision=0,
+            )
+        elif surface == "finalized":
+            repository.finalize_opaque_if_absent(
+                external_key,
+                envelope,
+                expected_revision=1,
+            )
+        else:
+            repository.append_opaque_revision_observation(external_key, envelope)
+    except (ValueError, ValidationError, AnchorIntegrityError, AnchorRevisionConflict) as exception:
+        rejection = exception
+
+    assert (
+        rejection is not None,
+        engine.connect_count,
+        connection.begin_count,
+        connection.select_count,
+        connection.insert_parameters,
+        connection.update_parameters,
+        connection.observation_insert_parameters,
+    ) == (True, 0, 0, 0, [], [], [])
 
 
 class _F003OpaqueAdapter:
