@@ -7,6 +7,7 @@ def get_declarative_base():
     from .leveraged_etf_persistence import (  # noqa: F401
         LeveragedEtfAnchorRevisionObservation,
         LeveragedEtfAnchorState,
+        LeveragedEtfExposureEpisodeAudit,
         LeveragedEtfExecutorSnapshot,
         LeveragedEtfJournalEvent,
         LeveragedEtfStrategyReservation,

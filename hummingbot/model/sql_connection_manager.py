@@ -32,7 +32,7 @@ class SQLConnectionManager(TransactionBase):
     _scm_trade_fills_instance: Optional["SQLConnectionManager"] = None
 
     LOCAL_DB_VERSION_KEY = "local_db_version"
-    LOCAL_DB_VERSION_VALUE = "20260721"
+    LOCAL_DB_VERSION_VALUE = "20260722"
 
     @classmethod
     def logger(cls) -> HummingbotLogger:

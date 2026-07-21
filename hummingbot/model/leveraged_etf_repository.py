@@ -188,6 +188,17 @@ class ReconciliationOutcome(str, Enum):
     CONFLICT = "CONFLICT"
 
 
+class ReconciliationEvidenceState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    PROVEN_NO_FILL = "PROVEN_NO_FILL"
+    AUTHORITATIVE_FILL = "AUTHORITATIVE_FILL"
+
+
+class ExposureEpisodeStatus(str, Enum):
+    UNFINISHED = "UNFINISHED"
+    CLOSED = "CLOSED"
+
+
 def _canonical_decimal_text(value: Decimal) -> str:
     if value == 0:
         return "0"
@@ -277,6 +288,9 @@ class FillJournalPayloadV1(_IdentityJournalPayloadV1):
     order_cumulative_filled_quantity: CanonicalPositiveDecimal
     leg_cumulative_filled_quantity: CanonicalPositiveDecimal
     outcome: Literal["PARTIAL", "FILLED"]
+    evidence_state: Literal[ReconciliationEvidenceState.AUTHORITATIVE_FILL] = (
+        ReconciliationEvidenceState.AUTHORITATIVE_FILL
+    )
 
     @model_validator(mode="after")
     def validate_fill_outcome(self) -> FillJournalPayloadV1:
@@ -328,20 +342,109 @@ class RollbackJournalPayloadV1(_IdentityJournalPayloadV1):
         return self
 
 
+class ReconciliationOrderStatusEvidenceV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    outcome: Literal[
+        ReconciliationOutcome.NOT_FOUND,
+        ReconciliationOutcome.CANCELED,
+        ReconciliationOutcome.EXPIRED,
+        ReconciliationOutcome.REJECTED,
+    ]
+    exchange_order_id: Optional[StableIdentifier] = None
+    cumulative_filled_quantity: CanonicalNonNegativeDecimal
+
+
+class ReconciliationTradeHistoryEvidenceV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    exchange_order_id: Optional[StableIdentifier] = None
+    exchange_trade_ids: Tuple[StableIdentifier, ...]
+    cumulative_filled_quantity: CanonicalNonNegativeDecimal
+
+
+class ReconciliationPositionConsistencyEvidenceV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    consistent: Literal[True]
+    exposure_change_quantity: CanonicalNonNegativeDecimal
+
+
+class NoFillReconciliationSweepV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    sweep_id: StableIdentifier
+    observed_at_utc: CanonicalUtcInstant
+    post_grace: Literal[True]
+    order_status: ReconciliationOrderStatusEvidenceV1
+    trade_history: ReconciliationTradeHistoryEvidenceV1
+    position_consistency: ReconciliationPositionConsistencyEvidenceV1
+
+    @model_validator(mode="after")
+    def validate_zero_fill_sources(self) -> NoFillReconciliationSweepV1:
+        if self.order_status.exchange_order_id != self.trade_history.exchange_order_id:
+            raise ValueError("no-fill order-status and trade-history order identities disagree")
+        if self.order_status.cumulative_filled_quantity != 0:
+            raise ValueError("no-fill order-status cumulative quantity must be exactly zero")
+        if self.trade_history.cumulative_filled_quantity != 0 or self.trade_history.exchange_trade_ids:
+            raise ValueError("no-fill trade history must contain exactly zero accepted fills")
+        if self.position_consistency.exposure_change_quantity != 0:
+            raise ValueError("no-fill position evidence must contain exactly zero exposure change")
+        return self
+
+
+class ProvenNoFillEvidenceV1(CanonicalWireModel):
+    schema_version: SchemaVersionV1 = 1
+    proof_id: StableIdentifier
+    sweeps: Tuple[NoFillReconciliationSweepV1, NoFillReconciliationSweepV1]
+
+    @model_validator(mode="after")
+    def validate_consistent_sweeps(self) -> ProvenNoFillEvidenceV1:
+        first, second = self.sweeps
+        if first.sweep_id == second.sweep_id:
+            raise ValueError("proven no-fill sweeps require distinct stable identities")
+        if second.observed_at_utc <= first.observed_at_utc:
+            raise ValueError("proven no-fill sweeps must be strictly ordered")
+        if first.order_status != second.order_status:
+            raise ValueError("proven no-fill order-status sweeps are inconsistent")
+        if first.trade_history != second.trade_history:
+            raise ValueError("proven no-fill trade-history sweeps are inconsistent")
+        if first.position_consistency != second.position_consistency:
+            raise ValueError("proven no-fill position sweeps are inconsistent")
+        return self
+
+
 class ReconciliationJournalPayloadV1(_IdentityJournalPayloadV1):
     kind: Literal["RECONCILIATION"] = "RECONCILIATION"
     outcome: ReconciliationOutcome
     exchange_order_id: Optional[StableIdentifier] = None
     order_cumulative_filled_quantity: CanonicalNonNegativeDecimal = Decimal("0")
+    evidence_state: ReconciliationEvidenceState = ReconciliationEvidenceState.UNKNOWN
+    proven_no_fill: Optional[ProvenNoFillEvidenceV1] = None
+
+    @model_validator(mode="after")
+    def validate_evidence_arm(self) -> ReconciliationJournalPayloadV1:
+        if self.evidence_state == ReconciliationEvidenceState.AUTHORITATIVE_FILL:
+            raise ValueError("AUTHORITATIVE_FILL evidence requires a trade-ID FILL fact")
+        if self.evidence_state == ReconciliationEvidenceState.PROVEN_NO_FILL:
+            if self.outcome != ReconciliationOutcome.CONSISTENT_NO_FILL:
+                raise ValueError("PROVEN_NO_FILL requires a CONSISTENT_NO_FILL outcome")
+            if self.proven_no_fill is None:
+                raise ValueError("PROVEN_NO_FILL requires two durable three-source sweeps")
+            if self.order_cumulative_filled_quantity != 0:
+                raise ValueError("PROVEN_NO_FILL reconciliation cumulative quantity must be exactly zero")
+            for sweep in self.proven_no_fill.sweeps:
+                if sweep.order_status.exchange_order_id != self.exchange_order_id:
+                    raise ValueError("proven no-fill order identity disagrees with reconciliation")
+        elif self.proven_no_fill is not None:
+            raise ValueError("no-fill proof is only valid for the PROVEN_NO_FILL evidence arm")
+        return self
 
     @property
     def terminal(self) -> bool:
+        if self.evidence_state == ReconciliationEvidenceState.PROVEN_NO_FILL:
+            return True
         return self.outcome in {
             ReconciliationOutcome.FILLED,
             ReconciliationOutcome.CANCELED,
             ReconciliationOutcome.EXPIRED,
             ReconciliationOutcome.REJECTED,
-            ReconciliationOutcome.CONSISTENT_NO_FILL,
         }
 
 
@@ -496,6 +599,31 @@ class IncompleteIntentV1(CanonicalWireModel):
     status: JournalEventType
     last_sequence: StrictInt = Field(ge=1)
     prepared_event: JournalEventV1
+
+
+class ExposureEpisodeAuditV1(CanonicalWireModel):
+    """One append-only revision of an unhedged-exposure episode audit."""
+
+    schema_version: SchemaVersionV1 = 1
+    episode_id: StableIdentifier
+    executor_id: StableIdentifier
+    pair_id: StableIdentifier
+    nav_cycle_id: StableIdentifier
+    revision: StrictInt = Field(ge=1)
+    status: ExposureEpisodeStatus
+    t0_utc: CanonicalUtcInstant
+    process_boot_id: StableIdentifier
+    hedge_phase_deadline_ms: StrictInt = Field(ge=1)
+    rollback_phase_deadline_ms: StrictInt = Field(ge=1)
+    unhedged_response_deadline_ms: StrictInt = Field(ge=1)
+    latest_monotonic_elapsed_ms: StrictInt = Field(ge=0)
+    recorded_at_utc: CanonicalUtcInstant
+
+    @model_validator(mode="after")
+    def validate_audit_times(self) -> ExposureEpisodeAuditV1:
+        if self.recorded_at_utc < self.t0_utc:
+            raise ValueError("exposure episode record time precedes audit t0")
+        return self
 
 
 class ReservationIdentityPayloadV1(CanonicalWireModel):
@@ -1003,6 +1131,14 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                created_at_utc
         FROM LeveragedEtfJournalEvent
     """
+    _EPISODE_SELECT = """
+        SELECT episode_id, revision, executor_id, pair_id, nav_cycle_id,
+               schema_version, status, t0_utc, process_boot_id,
+               hedge_phase_deadline_ms, rollback_phase_deadline_ms,
+               unhedged_response_deadline_ms, latest_monotonic_elapsed_ms,
+               payload_json, payload_hash, recorded_at_utc
+        FROM LeveragedEtfExposureEpisodeAudit
+    """
     _REQUIRES_PREPARED_INTENT = frozenset(
         {
             JournalEventType.ACKNOWLEDGED,
@@ -1216,6 +1352,183 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             decoded = tuple(by_executor.get(current_executor_id, ()))
             self._replay_decoded(snapshot, decoded)
             verified[current_executor_id] = (snapshot, decoded)
+        return verified
+
+    @staticmethod
+    def _revalidate_exposure_episode_write(record: Any) -> ExposureEpisodeAuditV1:
+        if type(record) is not ExposureEpisodeAuditV1:
+            raise JournalIntegrityError("exposure episode writes require an exact ExposureEpisodeAuditV1 record")
+        try:
+            exact_integer_fields = (
+                "schema_version",
+                "revision",
+                "hedge_phase_deadline_ms",
+                "rollback_phase_deadline_ms",
+                "unhedged_response_deadline_ms",
+                "latest_monotonic_elapsed_ms",
+            )
+            for field_name in exact_integer_fields:
+                if type(getattr(record, field_name)) is not int:
+                    raise ValueError(f"exposure episode {field_name} must be an exact integer")
+            exact_string_fields = (
+                "episode_id",
+                "executor_id",
+                "pair_id",
+                "nav_cycle_id",
+                "process_boot_id",
+            )
+            for field_name in exact_string_fields:
+                if type(getattr(record, field_name)) is not str:
+                    raise ValueError(f"exposure episode {field_name} must be an exact string")
+            primitive = record.model_dump(mode="python", round_trip=True, warnings="error")
+            return ExposureEpisodeAuditV1.model_validate(primitive)
+        except JournalIntegrityError:
+            raise
+        except Exception as exception:
+            raise JournalIntegrityError(f"exposure episode record integrity failure: {exception}") from exception
+
+    @staticmethod
+    def _revalidate_journal_event_write(event: Any) -> JournalEventV1:
+        if type(event) is not JournalEventV1:
+            raise JournalIntegrityError("journal writes require an exact JournalEventV1 event")
+        try:
+            primitive = event.model_dump(mode="python", round_trip=True, warnings="error")
+            return JournalEventV1.model_validate(primitive)
+        except JournalIntegrityError:
+            raise
+        except Exception as exception:
+            raise JournalIntegrityError(f"journal event integrity failure: {exception}") from exception
+
+    @staticmethod
+    def _validate_episode_identifier(value: Any, label: str) -> str:
+        if (
+            type(value) is not str
+            or not 1 <= len(value) <= 255
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value) is None
+        ):
+            raise JournalIntegrityError(f"{label} must be a stable identifier")
+        return value
+
+    @staticmethod
+    def _decode_episode_row(row: Mapping[str, Any]) -> ExposureEpisodeAuditV1:
+        try:
+            payload = _verify_canonical_json(row["payload_json"], row["payload_hash"], "exposure episode audit")
+            record = ExposureEpisodeAuditV1.model_validate(payload)
+        except Exception as exception:
+            raise JournalIntegrityError(f"exposure episode audit integrity failure: {exception}") from exception
+        serialized = record.model_dump(mode="json")
+        for column_name in (
+            "episode_id",
+            "revision",
+            "executor_id",
+            "pair_id",
+            "nav_cycle_id",
+            "schema_version",
+            "status",
+            "t0_utc",
+            "process_boot_id",
+            "hedge_phase_deadline_ms",
+            "rollback_phase_deadline_ms",
+            "unhedged_response_deadline_ms",
+            "latest_monotonic_elapsed_ms",
+            "recorded_at_utc",
+        ):
+            if (
+                type(row[column_name]) is not type(serialized[column_name])
+                or row[column_name] != serialized[column_name]
+            ):
+                raise JournalIntegrityError(f"exposure episode column {column_name} disagrees with payload")
+        return record
+
+    @classmethod
+    def _episode_rows(
+        cls,
+        connection: Connection,
+        executor_id: Optional[str] = None,
+        episode_id: Optional[str] = None,
+    ):
+        clauses = []
+        parameters = {}
+        if executor_id is not None:
+            clauses.append("executor_id = :executor_id")
+            parameters["executor_id"] = executor_id
+        if episode_id is not None:
+            clauses.append("episode_id = :episode_id")
+            parameters["episode_id"] = episode_id
+        statement = cls._EPISODE_SELECT
+        if clauses:
+            statement += " WHERE " + " AND ".join(clauses)
+        statement += " ORDER BY episode_id, revision"
+        return connection.execute(text(statement), parameters).mappings().all()
+
+    @staticmethod
+    def _replay_episode_records(
+        records: Tuple[ExposureEpisodeAuditV1, ...],
+    ) -> ExposureEpisodeAuditV1:
+        if not records:
+            raise JournalIntegrityError("exposure episode replay requires at least one record")
+        first = records[0]
+        if first.revision != 1 or first.status != ExposureEpisodeStatus.UNFINISHED:
+            raise JournalIntegrityError("exposure episode must begin at unfinished revision one")
+        stable_fields = (
+            "episode_id",
+            "executor_id",
+            "pair_id",
+            "nav_cycle_id",
+            "t0_utc",
+            "hedge_phase_deadline_ms",
+            "rollback_phase_deadline_ms",
+            "unhedged_response_deadline_ms",
+        )
+        last_elapsed_by_boot: dict[str, int] = {}
+        previous_recorded_at = first.recorded_at_utc
+        closed = False
+        for expected_revision, record in enumerate(records, start=1):
+            if record.revision != expected_revision:
+                raise JournalIntegrityError("exposure episode revision history is not contiguous")
+            if any(getattr(record, field_name) != getattr(first, field_name) for field_name in stable_fields):
+                raise JournalIntegrityError("exposure episode stable identity, t0, or durations changed")
+            if record.recorded_at_utc < previous_recorded_at:
+                raise JournalIntegrityError("exposure episode record time moved backwards")
+            if closed:
+                raise JournalIntegrityError("closed exposure episode cannot accept later revisions")
+            prior_elapsed = last_elapsed_by_boot.get(record.process_boot_id)
+            if prior_elapsed is not None and record.latest_monotonic_elapsed_ms < prior_elapsed:
+                raise JournalIntegrityError("same-boot monotonic elapsed duration decreased")
+            last_elapsed_by_boot[record.process_boot_id] = record.latest_monotonic_elapsed_ms
+            closed = record.status == ExposureEpisodeStatus.CLOSED
+            previous_recorded_at = record.recorded_at_utc
+        return records[-1]
+
+    def _verified_exposure_episode_state(
+        self,
+        connection: Connection,
+        executor_id: Optional[str] = None,
+    ) -> dict[str, Tuple[ExposureEpisodeAuditV1, ...]]:
+        verified_executors = self._verified_recovery_state(connection, executor_id)
+        rows = self._episode_rows(connection, executor_id=executor_id)
+        grouped: dict[str, list[ExposureEpisodeAuditV1]] = {}
+        for row in rows:
+            record = self._decode_episode_row(row)
+            owner = verified_executors.get(record.executor_id)
+            if owner is None:
+                raise JournalIntegrityError("orphan exposure episode audit has no executor snapshot")
+            snapshot = owner[0]
+            if record.pair_id != snapshot.pair_id or record.nav_cycle_id != snapshot.nav_cycle_id:
+                raise JournalIntegrityError("exposure episode pair/cycle identity disagrees with executor")
+            grouped.setdefault(record.episode_id, []).append(record)
+
+        verified = {}
+        active_by_executor: dict[str, str] = {}
+        for episode_id, values in grouped.items():
+            records = tuple(values)
+            latest = self._replay_episode_records(records)
+            verified[episode_id] = records
+            if latest.status == ExposureEpisodeStatus.UNFINISHED:
+                prior = active_by_executor.get(latest.executor_id)
+                if prior is not None and prior != episode_id:
+                    raise JournalIntegrityError("executor has more than one unfinished exposure episode")
+                active_by_executor[latest.executor_id] = episode_id
         return verified
 
     @staticmethod
@@ -1756,6 +2069,10 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 raise JournalIntegrityError("reconciliation cumulative fill disagrees with accepted fill facts")
             if recorded_order_fill > identity.order_quantity:
                 raise JournalIntegrityError("reconciliation cumulative fill exceeds prepared order quantity")
+            if payload.evidence_state == ReconciliationEvidenceState.PROVEN_NO_FILL:
+                assert payload.proven_no_fill is not None
+                if any(sweep.observed_at_utc > event.created_at_utc for sweep in payload.proven_no_fill.sweeps):
+                    raise JournalIntegrityError("proven no-fill sweep occurs after its reconciliation event")
             if payload.outcome == ReconciliationOutcome.FILLED:
                 if payload.exchange_order_id is None or recorded_order_fill != identity.order_quantity:
                     raise JournalIntegrityError("reconciliation FILLED requires a fully recorded bound order")
@@ -1999,11 +2316,13 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
                 else LeveragedEtfPairState.RECOVERY_REQUIRED
             )
         if isinstance(payload, ReconciliationJournalPayloadV1):
-            if payload.outcome in {
+            if payload.evidence_state == ReconciliationEvidenceState.UNKNOWN and payload.outcome in {
                 ReconciliationOutcome.NOT_FOUND,
                 ReconciliationOutcome.UNKNOWN,
-                ReconciliationOutcome.CONFLICT,
+                ReconciliationOutcome.CONSISTENT_NO_FILL,
             }:
+                return LeveragedEtfPairState.RECONCILING
+            if payload.outcome == ReconciliationOutcome.CONFLICT:
                 return LeveragedEtfPairState.RECOVERY_REQUIRED
             if action == JournalSideEffect.ETF_MAKER:
                 if maker_filled > 0 and not balanced:
@@ -2167,6 +2486,8 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         event: JournalEventV1,
         expected_snapshot: Optional[LeveragedEtfPairExecutorSnapshotV1] = None,
     ) -> CommittedJournalEventV1:
+        event = self._revalidate_journal_event_write(event)
+
         def operation(connection: Connection):
             current = self._load_snapshot_connection(connection, executor_id)
             if current is None:
@@ -2346,6 +2667,145 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
             )
 
         return self._read_transaction(operation)
+
+    def compare_and_append_exposure_episode(
+        self,
+        record: ExposureEpisodeAuditV1,
+        expected_revision: int,
+    ) -> ExposureEpisodeAuditV1:
+        candidate = self._revalidate_exposure_episode_write(record)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise JournalConflictError("expected episode revision must be a non-negative integer")
+
+        def operation(connection: Connection):
+            verified = self._verified_exposure_episode_state(connection)
+            snapshot = self._load_snapshot_connection(connection, candidate.executor_id)
+            if snapshot is None:
+                raise JournalConflictError(f"episode executor {candidate.executor_id} does not exist")
+            if candidate.pair_id != snapshot.pair_id or candidate.nav_cycle_id != snapshot.nav_cycle_id:
+                raise JournalIntegrityError("exposure episode pair/cycle identity disagrees with executor")
+
+            history = verified.get(candidate.episode_id)
+            if history is not None:
+                if history[0].executor_id != candidate.executor_id:
+                    raise JournalConflictError("exposure episode identity is owned by a different executor")
+                for existing in history:
+                    if existing.revision == candidate.revision:
+                        if existing == candidate:
+                            return existing
+                        raise JournalIntegrityError("exposure episode revision has a conflicting payload")
+                latest = history[-1]
+                if latest.status == ExposureEpisodeStatus.CLOSED:
+                    raise JournalConflictError("closed exposure episode cannot be reopened")
+                if expected_revision != latest.revision or candidate.revision != expected_revision + 1:
+                    raise JournalConflictError("exposure episode compare-and-set revision mismatch")
+                self._replay_episode_records((*history, candidate))
+            else:
+                active = tuple(
+                    values[-1]
+                    for values in verified.values()
+                    if values[-1].executor_id == candidate.executor_id
+                    and values[-1].status == ExposureEpisodeStatus.UNFINISHED
+                )
+                if active:
+                    raise JournalConflictError("executor already has an unfinished exposure episode")
+                if expected_revision != 0 or candidate.revision != 1:
+                    raise JournalConflictError("new exposure episode must compare-and-set revision zero to one")
+                if candidate.status != ExposureEpisodeStatus.UNFINISHED:
+                    raise JournalConflictError("new exposure episode must begin unfinished")
+                self._replay_episode_records((candidate,))
+
+            serialized = candidate.model_dump(mode="json")
+            payload_json = candidate.canonical_json()
+            connection.execute(
+                text("""
+                    INSERT INTO LeveragedEtfExposureEpisodeAudit (
+                        episode_id, revision, executor_id, pair_id, nav_cycle_id,
+                        schema_version, status, t0_utc, process_boot_id,
+                        hedge_phase_deadline_ms, rollback_phase_deadline_ms,
+                        unhedged_response_deadline_ms, latest_monotonic_elapsed_ms,
+                        payload_json, payload_hash, recorded_at_utc
+                    ) VALUES (
+                        :episode_id, :revision, :executor_id, :pair_id, :nav_cycle_id,
+                        :schema_version, :status, :t0_utc, :process_boot_id,
+                        :hedge_phase_deadline_ms, :rollback_phase_deadline_ms,
+                        :unhedged_response_deadline_ms, :latest_monotonic_elapsed_ms,
+                        :payload_json, :payload_hash, :recorded_at_utc
+                    )
+                    """),
+                {
+                    **serialized,
+                    "payload_json": payload_json,
+                    "payload_hash": _sha256_text(payload_json),
+                },
+            )
+            return candidate
+
+        try:
+            return self._write(operation)
+        except IntegrityError as exception:
+            raise JournalConflictError("exposure episode persistence constraint rejected the append") from exception
+
+    def exposure_episode_records(
+        self,
+        executor_id: str,
+        episode_id: str,
+    ) -> Tuple[ExposureEpisodeAuditV1, ...]:
+        executor_id = self._validate_episode_identifier(executor_id, "executor_id")
+        episode_id = self._validate_episode_identifier(episode_id, "episode_id")
+
+        def operation(connection: Connection):
+            verified = self._verified_exposure_episode_state(connection, executor_id)
+            records = verified.get(episode_id, ())
+            if records and records[0].executor_id != executor_id:
+                raise JournalIntegrityError("exposure episode owner disagrees with repository key")
+            return records
+
+        return self._read_transaction(operation)
+
+    def replay_exposure_episode(
+        self,
+        executor_id: str,
+        episode_id: str,
+    ) -> ExposureEpisodeAuditV1:
+        records = self.exposure_episode_records(executor_id, episode_id)
+        if not records:
+            raise JournalConflictError(f"exposure episode {episode_id} does not exist for executor {executor_id}")
+        return records[-1]
+
+    def unfinished_exposure_episodes(
+        self,
+        executor_id: Optional[str] = None,
+    ) -> Tuple[ExposureEpisodeAuditV1, ...]:
+        if executor_id is not None:
+            executor_id = self._validate_episode_identifier(executor_id, "executor_id")
+
+        def operation(connection: Connection):
+            verified = self._verified_exposure_episode_state(connection, executor_id)
+            unfinished = (
+                records[-1]
+                for records in verified.values()
+                if records[-1].status == ExposureEpisodeStatus.UNFINISHED
+            )
+            return tuple(
+                sorted(
+                    unfinished,
+                    key=lambda value: (
+                        value.executor_id,
+                        value.pair_id,
+                        value.nav_cycle_id,
+                        value.episode_id,
+                    ),
+                )
+            )
+
+        return self._read_transaction(operation)
+
+    def active_exposure_episode(self, executor_id: str) -> Optional[ExposureEpisodeAuditV1]:
+        active = self.unfinished_exposure_episodes(executor_id)
+        if len(active) > 1:
+            raise JournalIntegrityError("executor has more than one unfinished exposure episode")
+        return None if not active else active[0]
 
     @staticmethod
     def _decode_reservation_row(row: Mapping[str, Any]) -> StrategyReservationV1:

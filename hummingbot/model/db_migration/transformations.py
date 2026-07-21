@@ -193,3 +193,24 @@ class UpgradeEmptyLeveragedEtfAnchorPairScope(DatabaseTransformation):
     @property
     def to_version(self):
         return 20260721
+
+
+class AddLeveragedEtfExposureEpisodeAudit(DatabaseTransformation):
+    """Add the single append-only exposure-episode audit surface."""
+
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        with db_handle.engine.begin() as connection:
+            ensure_leveraged_etf_persistence_schema(connection)
+        return db_handle
+
+    @property
+    def name(self):
+        return "AddLeveragedEtfExposureEpisodeAudit"
+
+    @property
+    def from_version(self):
+        return 20260721
+
+    @property
+    def to_version(self):
+        return 20260722

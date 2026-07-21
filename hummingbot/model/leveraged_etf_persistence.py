@@ -165,6 +165,85 @@ class LeveragedEtfJournalEvent(HummingbotBase):
     created_at_utc = Column(Text, nullable=False)
 
 
+class LeveragedEtfExposureEpisodeAudit(HummingbotBase):
+    __tablename__ = "LeveragedEtfExposureEpisodeAudit"
+    __table_args__ = (
+        CheckConstraint(
+            "typeof(schema_version) = 'integer' AND schema_version = 1",
+            name="ck_lepf_episode_schema_version",
+        ),
+        CheckConstraint(_canonical_pair_id_check("pair_id"), name="ck_lepf_episode_pair_id"),
+        CheckConstraint(_canonical_cycle_id_check("nav_cycle_id"), name="ck_lepf_episode_cycle_id"),
+        CheckConstraint(
+            "typeof(revision) = 'integer' AND revision >= 1",
+            name="ck_lepf_episode_revision",
+        ),
+        CheckConstraint(
+            "status IN ('UNFINISHED', 'CLOSED')",
+            name="ck_lepf_episode_status",
+        ),
+        CheckConstraint(
+            "typeof(hedge_phase_deadline_ms) = 'integer' AND hedge_phase_deadline_ms >= 1",
+            name="ck_lepf_episode_hedge_duration",
+        ),
+        CheckConstraint(
+            "typeof(rollback_phase_deadline_ms) = 'integer' AND rollback_phase_deadline_ms >= 1",
+            name="ck_lepf_episode_rollback_duration",
+        ),
+        CheckConstraint(
+            "typeof(unhedged_response_deadline_ms) = 'integer' AND unhedged_response_deadline_ms >= 1",
+            name="ck_lepf_episode_absolute_duration",
+        ),
+        CheckConstraint(
+            "typeof(latest_monotonic_elapsed_ms) = 'integer' AND latest_monotonic_elapsed_ms >= 0",
+            name="ck_lepf_episode_elapsed",
+        ),
+        CheckConstraint(_sha256_check("payload_hash"), name="ck_lepf_episode_payload_hash"),
+        ForeignKeyConstraint(
+            ("executor_id",),
+            ("LeveragedEtfExecutorSnapshot.executor_id",),
+            name="fk_lepf_episode_executor",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "lepf_episode_executor_status_revision",
+            "executor_id",
+            "status",
+            "episode_id",
+            "revision",
+        ),
+        Index(
+            "lepf_episode_pair_cycle_executor",
+            "pair_id",
+            "nav_cycle_id",
+            "executor_id",
+        ),
+        Index(
+            "lepf_episode_boot_revision",
+            "episode_id",
+            "process_boot_id",
+            "revision",
+        ),
+    )
+
+    episode_id = Column(Text, primary_key=True, nullable=False)
+    revision = Column(Integer, primary_key=True, nullable=False)
+    executor_id = Column(Text, nullable=False)
+    pair_id = Column(Text, nullable=False)
+    nav_cycle_id = Column(Text, nullable=False)
+    schema_version = Column(Integer, nullable=False)
+    status = Column(Text, nullable=False)
+    t0_utc = Column(Text, nullable=False)
+    process_boot_id = Column(Text, nullable=False)
+    hedge_phase_deadline_ms = Column(Integer, nullable=False)
+    rollback_phase_deadline_ms = Column(Integer, nullable=False)
+    unhedged_response_deadline_ms = Column(Integer, nullable=False)
+    latest_monotonic_elapsed_ms = Column(Integer, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    payload_hash = Column(Text, nullable=False)
+    recorded_at_utc = Column(Text, nullable=False)
+
+
 class LeveragedEtfStrategyReservation(HummingbotBase):
     __tablename__ = "LeveragedEtfStrategyReservation"
     __table_args__ = (
@@ -319,6 +398,7 @@ class LeveragedEtfAnchorRevisionObservation(HummingbotBase):
 LEVERAGED_ETF_PERSISTENCE_TABLES: Tuple[Table, ...] = (
     LeveragedEtfExecutorSnapshot.__table__,
     LeveragedEtfJournalEvent.__table__,
+    LeveragedEtfExposureEpisodeAudit.__table__,
     LeveragedEtfStrategyReservation.__table__,
     LeveragedEtfAnchorState.__table__,
     LeveragedEtfAnchorRevisionObservation.__table__,
@@ -358,6 +438,18 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         )
         BEGIN
             SELECT RAISE(ABORT, 'LeveragedEtfExecutorSnapshot is referenced');
+        END
+    """,
+    "lepf_snapshot_episode_referenced_no_delete": """
+        CREATE TRIGGER IF NOT EXISTS lepf_snapshot_episode_referenced_no_delete
+        BEFORE DELETE ON LeveragedEtfExecutorSnapshot
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfExposureEpisodeAudit
+            WHERE executor_id = OLD.executor_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfExecutorSnapshot has exposure episode audit records');
         END
     """,
     "lepf_journal_executor_fk_insert": """
@@ -429,6 +521,56 @@ SQLITE_GUARD_DDL: Mapping[str, str] = {
         )
         BEGIN
             SELECT RAISE(ABORT, 'LeveragedEtfJournalEvent exchange order has a different owner');
+        END
+    """,
+    "lepf_episode_executor_fk_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_episode_executor_fk_insert
+        BEFORE INSERT ON LeveragedEtfExposureEpisodeAudit
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1 FROM LeveragedEtfExecutorSnapshot
+            WHERE executor_id = NEW.executor_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfExposureEpisodeAudit executor_id does not exist');
+        END
+    """,
+    "lepf_episode_identity_insert": """
+        CREATE TRIGGER IF NOT EXISTS lepf_episode_identity_insert
+        BEFORE INSERT ON LeveragedEtfExposureEpisodeAudit
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM LeveragedEtfExposureEpisodeAudit
+            WHERE (episode_id = NEW.episode_id AND revision = NEW.revision)
+               OR (
+                    episode_id = NEW.episode_id
+                    AND (
+                        executor_id <> NEW.executor_id
+                        OR pair_id <> NEW.pair_id
+                        OR nav_cycle_id <> NEW.nav_cycle_id
+                        OR t0_utc <> NEW.t0_utc
+                        OR hedge_phase_deadline_ms <> NEW.hedge_phase_deadline_ms
+                        OR rollback_phase_deadline_ms <> NEW.rollback_phase_deadline_ms
+                        OR unhedged_response_deadline_ms <> NEW.unhedged_response_deadline_ms
+                    )
+               )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfExposureEpisodeAudit identity already exists or changed');
+        END
+    """,
+    "lepf_episode_no_update": """
+        CREATE TRIGGER IF NOT EXISTS lepf_episode_no_update
+        BEFORE UPDATE ON LeveragedEtfExposureEpisodeAudit
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfExposureEpisodeAudit is append-only');
+        END
+    """,
+    "lepf_episode_no_delete": """
+        CREATE TRIGGER IF NOT EXISTS lepf_episode_no_delete
+        BEFORE DELETE ON LeveragedEtfExposureEpisodeAudit
+        BEGIN
+            SELECT RAISE(ABORT, 'LeveragedEtfExposureEpisodeAudit is append-only');
         END
     """,
     "lepf_reservation_executor_fk_insert": """
