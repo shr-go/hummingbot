@@ -10,19 +10,23 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_risk_da
 )
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.allocator import (
     AccountRiskSnapshot,
+    AllocationInputError,
     AllocationStatus,
     AllocationTier,
     BookLevel,
     FrozenAllocationSnapshot,
+    FrozenExecutionCosts,
     FrozenLeg,
     FrozenPair,
     PortfolioAllocator,
 )
+from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import StrategyConfig
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.domain import ArbitrageDirection
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.risk import LeverageBracket, LeverageSchedule
 
 
 D = Decimal
+_UNSET = object()
 
 
 def _schedule(symbol: str, leverage: int = 100, cap: str = "1000000") -> LeverageSchedule:
@@ -132,19 +136,58 @@ def _account(
     )
 
 
+def _strategy_config(
+    *,
+    maker_fee_bp: str = "0",
+    taker_fee_bp: str = "4",
+    maker_slippage_bp_per_fill: str = "2",
+) -> StrategyConfig:
+    return StrategyConfig(
+        strategy_id="equity_leveraged_etf_arbitrage",
+        max_total_notional_ratio="32",
+        controller_interval_ms=1000,
+        executor_safety_interval_ms=250,
+        entry_confirmations=3,
+        entry_confirmation_interval_ms=1000,
+        divergence_cancel_bp="3",
+        divergence_confirmations=3,
+        market_data_max_age_ms=1500,
+        account_data_max_age_ms=5000,
+        maker_fee_bp=maker_fee_bp,
+        taker_fee_bp=taker_fee_bp,
+        maker_slippage_bp_per_fill=maker_slippage_bp_per_fill,
+        include_funding_cost=False,
+        hedge_submit_timeout_ms=1000,
+        hedge_reconcile_timeout_ms=5000,
+        unhedged_response_deadline_ms=20000,
+        hedge_phase_deadline_ms=10000,
+        hedge_max_attempts=3,
+        hedge_retry_backoff_ms=(100, 250, 500),
+        rollback_submit_timeout_ms=1000,
+        rollback_reconcile_timeout_ms=5000,
+        rollback_phase_deadline_ms=10000,
+        rollback_max_attempts=3,
+        rollback_retry_backoff_ms=(100, 250, 500),
+        order_eventual_consistency_grace_ms=2000,
+    )
+
+
 def _snapshot(
     *pairs: FrozenPair,
     account: AccountRiskSnapshot | None = None,
     max_total_notional_ratio: str = "32",
-    execution_costs: object | None = None,
+    execution_costs: object = _UNSET,
 ) -> FrozenAllocationSnapshot:
     values = {
         "account": account or _account(),
         "pairs": tuple(pairs),
         "max_total_notional_ratio": D(max_total_notional_ratio),
+        "execution_costs": (
+            FrozenExecutionCosts.from_strategy_config(_strategy_config())
+            if execution_costs is _UNSET
+            else execution_costs
+        ),
     }
-    if execution_costs is not None:
-        values["execution_costs"] = execution_costs
     return FrozenAllocationSnapshot(**values)
 
 
@@ -550,35 +593,63 @@ def test_ask_side_vwap_can_meet_min_notional_above_best_ask() -> None:
     assert candidate.stock_vwap == D("190")
 
 
-def test_configured_costs_can_block_an_unsupported_entry_tier() -> None:
-    from hummingbot.strategy_v2.leveraged_etf_arbitrage.allocator import FrozenExecutionCosts
+def test_snapshot_requires_config_bound_execution_costs() -> None:
+    pair = _pair("cost-provenance")
 
+    with pytest.raises(TypeError, match="execution_costs"):
+        FrozenAllocationSnapshot(
+            account=_account(),
+            pairs=(pair,),
+            max_total_notional_ratio=D("32"),
+        )
+
+    unbound_costs = FrozenExecutionCosts(
+        maker_fee_bp=D("0"),
+        taker_fee_bp=D("4"),
+        maker_slippage_bp_per_fill=D("2"),
+    )
+    with pytest.raises(AllocationInputError, match="StrategyConfig"):
+        _snapshot(pair, execution_costs=unbound_costs)
+
+
+def test_config_bound_strategy_costs_lower_g_exec_and_descend_unsupported_tier() -> None:
     pair = _pair(
         "configured-costs",
         requested_ratio="0.32",
         tiers=(
-            AllocationTier(minimum_net_bp=D("0"), target_ratio=D("0")),
+            AllocationTier(minimum_net_bp=D("0"), target_ratio=D("0.17")),
             AllocationTier(minimum_net_bp=D("600"), target_ratio=D("0.32")),
         ),
     )
+    documented_config = _strategy_config()
+    expensive_config = _strategy_config(
+        maker_fee_bp="100",
+        taker_fee_bp="100",
+        maker_slippage_bp_per_fill="100",
+    )
+    documented_costs = FrozenExecutionCosts.from_strategy_config(documented_config)
+    expensive_costs = FrozenExecutionCosts.from_strategy_config(expensive_config)
 
-    default_result = PortfolioAllocator().allocate(_snapshot(pair))
+    default_result = PortfolioAllocator().allocate(_snapshot(pair, execution_costs=documented_costs))
     expensive_result = PortfolioAllocator().allocate(
         _snapshot(
             pair,
-            execution_costs=FrozenExecutionCosts(
-                maker_fee_bp=D("100"),
-                taker_fee_bp=D("100"),
-                maker_slippage_bp_per_fill=D("100"),
-            ),
+            execution_costs=expensive_costs,
         )
     )
     default_candidate = _pair_result(default_result, "configured-costs")
     expensive_candidate = _pair_result(expensive_result, "configured-costs")
 
+    assert documented_costs.maker_fee_bp == D("0")
+    assert documented_costs.taker_fee_bp == D("4")
+    assert documented_costs.maker_slippage_bp_per_fill == D("2")
+    assert expensive_costs.maker_fee_bp == D("100")
+    assert expensive_costs.taker_fee_bp == D("100")
+    assert expensive_costs.maker_slippage_bp_per_fill == D("100")
     assert default_result.status is AllocationStatus.ALLOCATED
     assert default_candidate.executable_net_bp > D("600")
-    assert default_candidate.target_gross_notional > D("0")
+    assert default_candidate.target_gross_notional == D("320")
     assert expensive_result.status is AllocationStatus.ALLOCATED
-    assert expensive_candidate.canonical_etf_slice_quantity == D("0")
-    assert expensive_candidate.target_gross_notional == D("0")
+    assert expensive_candidate.executable_net_bp < default_candidate.executable_net_bp
+    assert expensive_candidate.executable_net_bp < D("600")
+    assert expensive_candidate.target_gross_notional == D("160")
