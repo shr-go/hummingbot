@@ -16,6 +16,11 @@ from controllers.generic.equity_leveraged_etf_arbitrage.controller import (
 from controllers.generic.equity_leveraged_etf_arbitrage.reservations import (
     F004ReservationStore,
 )
+from controllers.generic.equity_leveraged_etf_arbitrage.nav import (
+    AnchorRuntimeStatus,
+    NavStage,
+    SessionStageDecision,
+)
 from hummingbot.model.leveraged_etf_repository import LeveragedEtfJournalRepository
 from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types import (
     LeveragedEtfPairExecutorConfig,
@@ -327,6 +332,19 @@ def _anchor(pair: FrozenPair) -> AnchorFacts:
     )
 
 
+def _entry_allowed_nav_decision(pair_id: str, cycle_id: str) -> SessionStageDecision:
+    return SessionStageDecision(
+        pair_id=pair_id,
+        cycle_id=cycle_id,
+        stage=NavStage.NORMAL,
+        operational_status=AnchorRuntimeStatus.AVAILABLE,
+        entry_allowed=True,
+        pair_paused=False,
+        emergency_market_requested=False,
+        intents=(),
+    )
+
+
 def _epoch(
     *pairs: FrozenPair,
     account: AccountRiskSnapshot | None = None,
@@ -339,11 +357,14 @@ def _epoch(
             PairEpochFacts(
                 pair_id=pair.pair_id,
                 frozen_pair=pair,
-                anchor=_anchor(pair),
+                anchor=(anchor := _anchor(pair)),
                 market_data_fresh=True,
                 bracket_data_fresh=True,
                 current_etf_leverage=1,
                 current_stock_leverage=1,
+                nav_decision=_entry_allowed_nav_decision(
+                    pair.pair_id, anchor.nav_cycle_id
+                ),
             )
             for pair in pairs
         ),

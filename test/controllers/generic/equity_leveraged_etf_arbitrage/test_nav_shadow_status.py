@@ -22,6 +22,7 @@ from controllers.generic.equity_leveraged_etf_arbitrage.nav import (
     AnchorRuntimeStatus,
     NavStage,
     SessionStageCoordinator,
+    StageIntent,
     StageIntentKind,
 )
 from controllers.generic.equity_leveraged_etf_arbitrage.shadow import (
@@ -50,6 +51,7 @@ from hummingbot.model.leveraged_etf_repository import (
 )
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import SessionName
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from test.hummingbot.data_feed.yahoo_finance.conftest import (
     FakeClock,
     OFFICIAL_CLOSE,
@@ -64,6 +66,7 @@ from test.hummingbot.data_feed.yahoo_finance.test_pair_scoped_anchor import (
 )
 from test.controllers.generic.equity_leveraged_etf_arbitrage.test_controller_actions import (
     _actions,
+    _Connector,
     _configured_pair,
     _controller,
     _epoch,
@@ -413,6 +416,190 @@ def test_nav_stages_observe_exact_boundaries_pair_local_anomalies_and_normal_fal
     assert coordinator.select_session(
         SessionName.EXTENDED, {SessionName.REGULAR: object()}
     ) is SessionName.REGULAR
+
+
+@pytest.mark.parametrize(
+    ("current_etf", "current_stock", "expected_operation"),
+    (
+        (D("0"), D("0"), "OPEN"),
+        (D("-1"), D("1"), "ADD"),
+    ),
+)
+def test_independent_new_entry_cutoff_blocks_controller_open_and_add(
+    current_etf: Decimal,
+    current_stock: Decimal,
+    expected_operation: str,
+):
+    nav = load_nav_config().model_copy(update={"new_entry_cutoff_minutes": 45})
+    coordinator = SessionStageCoordinator(nav)
+    configured = _configured_pair(1)
+    frozen = _frozen_pair(
+        configured,
+        current_etf=current_etf,
+        current_stock=current_stock,
+    )
+    base_epoch = _epoch(frozen)
+    normal = coordinator.evaluate(
+        pair_id=configured.id,
+        cycle_id=base_epoch.pairs[0].anchor.nav_cycle_id,
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=OFFICIAL_CLOSE - timedelta(minutes=45, microseconds=1),
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    cutoff = coordinator.evaluate(
+        pair_id=configured.id,
+        cycle_id=base_epoch.pairs[0].anchor.nav_cycle_id,
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=OFFICIAL_CLOSE - timedelta(minutes=45),
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    epoch = replace(
+        base_epoch,
+        pairs=(replace(base_epoch.pairs[0], nav_decision=cutoff),),
+    )
+    controller, _ = _controller((configured,), (epoch,))
+
+    actions = _actions(controller)
+
+    assert not any(
+        isinstance(action, CreateExecutorAction)
+        and action.executor_config.operation.value == expected_operation
+        for action in actions
+    )
+    assert normal.entry_allowed
+    assert not cutoff.entry_allowed
+    assert StageIntentKind.BLOCK_NEW_EXPOSURE in {intent.kind for intent in cutoff.intents}
+
+
+@pytest.mark.parametrize(
+    ("current_etf", "current_stock", "expected_operation"),
+    (
+        (D("0"), D("0"), "OPEN"),
+        (D("-1"), D("1"), "ADD"),
+    ),
+)
+def test_missing_nav_decision_fails_closed_for_open_and_add_in_close_window(
+    current_etf: Decimal,
+    current_stock: Decimal,
+    expected_operation: str,
+):
+    configured = _configured_pair(1)
+    frozen = _frozen_pair(
+        configured,
+        current_etf=current_etf,
+        current_stock=current_stock,
+    )
+    base_epoch = _epoch(frozen)
+    close_window = SessionStageCoordinator(load_nav_config()).evaluate(
+        pair_id=configured.id,
+        cycle_id=base_epoch.pairs[0].anchor.nav_cycle_id,
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=OFFICIAL_CLOSE - timedelta(minutes=30),
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    assert not close_window.entry_allowed
+    # An epoch source that omits the close-window decision cannot bypass the
+    # Controller's exposure gate.
+    epoch = replace(
+        base_epoch,
+        pairs=(replace(base_epoch.pairs[0], nav_decision=None),),
+    )
+    controller, _ = _controller((configured,), (epoch,))
+
+    actions = _actions(controller)
+
+    assert not any(
+        isinstance(action, CreateExecutorAction)
+        and action.executor_config.operation.value == expected_operation
+        for action in actions
+    )
+
+
+def test_anomalous_spread_p99_plus_100_is_inclusive_and_pair_local_in_status():
+    coordinator = SessionStageCoordinator(load_nav_config())
+    arguments = {
+        "cycle_id": "xnys-2026-07-17",
+        "official_close_utc": OFFICIAL_CLOSE,
+        "now_utc": OFFICIAL_CLOSE - timedelta(minutes=30, microseconds=1),
+        "anchor_status": AnchorRuntimeStatus.AVAILABLE,
+        "p99_bp": D("100"),
+    }
+    below = coordinator.evaluate(pair_id="pair2", spread_bp=D("199.9999"), **arguments)
+    exact = coordinator.evaluate(pair_id="pair1", spread_bp=D("200"), **arguments)
+    above = coordinator.evaluate(pair_id="pair3", spread_bp=D("200.0001"), **arguments)
+
+    assert below.entry_allowed and not below.pair_paused
+    assert not exact.entry_allowed and exact.pair_paused
+    assert not above.entry_allowed and above.pair_paused
+    assert StageIntentKind.PAUSE_NEW_EXPOSURE in {intent.kind for intent in exact.intents}
+    status_pairs = {
+        item["pair_id"]: item
+        for item in ControllerOperationalStatus(decisions=(exact, below, above)).to_dict()["pairs"]
+    }
+    assert status_pairs["pair1"]["pair_paused"]
+    assert "PAUSE_NEW_EXPOSURE" in {
+        intent["kind"] for intent in status_pairs["pair1"]["intents"]
+    }
+    assert not status_pairs["pair2"]["pair_paused"]
+
+
+def test_public_status_and_processed_data_never_export_sensitive_failure_or_intent_text():
+    secret_text = (
+        'api_key="API_KEY_SENTINEL" '
+        '{"token": "JSON_TOKEN_SENTINEL", "secret": "JSON_SECRET_SENTINEL"} '
+        "private_key='-----BEGIN PRIVATE KEY-----\\n"
+        "PEM_PRIVATE_KEY_SENTINEL\\n-----END PRIVATE KEY-----'"
+    )
+    coordinator = SessionStageCoordinator(load_nav_config())
+    decision = coordinator.evaluate(
+        pair_id="pair1",
+        cycle_id="xnys-2026-07-17",
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=OFFICIAL_CLOSE - timedelta(hours=2),
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    secret_intent = StageIntent(
+        pair_id=decision.pair_id,
+        cycle_id=decision.cycle_id,
+        kind=StageIntentKind.BLOCK_NEW_EXPOSURE,
+        reason=secret_text,
+    )
+    status = ControllerOperationalStatus(
+        decisions=(replace(decision, intents=(secret_intent,)),),
+        alerts=(OperationalAlert(code="UPSTREAM_FAILURE", message=secret_text),),
+    )
+    configured = _configured_pair(1)
+    controller, _ = _controller(
+        (configured,),
+        (_epoch(_frozen_pair(configured)),),
+        connector=_Connector((RuntimeError(secret_text),)),
+    )
+
+    assert _actions(controller) == []
+    public = {
+        "status": status.to_dict(),
+        "status_lines": status.to_lines(),
+        "controller_processed_data": controller.processed_data,
+        "controller_lines": controller.to_format_status(),
+    }
+    serialized = json.dumps(public, sort_keys=True)
+
+    for sentinel in (
+        "API_KEY_SENTINEL",
+        "JSON_TOKEN_SENTINEL",
+        "JSON_SECRET_SENTINEL",
+        "PEM_PRIVATE_KEY_SENTINEL",
+    ):
+        assert sentinel not in serialized
+    assert "[REDACTED]" in serialized
 
 
 def test_close_stage_decision_is_carried_by_controller_epoch_and_blocks_new_actions():
