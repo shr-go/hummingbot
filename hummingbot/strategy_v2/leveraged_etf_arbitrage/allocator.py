@@ -333,6 +333,30 @@ class PairCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreparedPairCandidate:
+    """A target after direction, slice, and executable-target validation."""
+
+    target_etf_quantity: Decimal
+    target_stock_quantity: Decimal
+    target_gross_notional: Decimal
+    exposure_increasing: bool
+    canonical_slice: tuple[Decimal, Decimal, Decimal, Decimal] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectedQuantityState:
+    """One physical execution state before leverage-dependent margin math."""
+
+    name: ProjectedStateName
+    etf_position: Decimal
+    etf_candidate_open: Decimal
+    etf_candidate_reservation: Decimal
+    stock_position: Decimal
+    stock_candidate_open: Decimal
+    stock_candidate_reservation: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateEvaluation:
     n: int
     scale: Decimal
@@ -556,9 +580,18 @@ class PortfolioAllocator:
             pair_id = pair.pair_id
             if caps[pair_id] <= current[pair_id] or pair_id in skipped:
                 continue
-            target_etf, target_stock, _ = self._target_for_gross(pair, caps[pair_id])
+            prepared = self._prepare_pair_candidate(pair, caps[pair_id], current[pair_id])
+            if not prepared.exposure_increasing or prepared.canonical_slice is None:
+                continue
             try:
-                self._select_pair_leverage(pair, target_etf, target_stock)
+                self._select_pair_leverage(
+                    pair,
+                    prepared.target_etf_quantity,
+                    prepared.target_stock_quantity,
+                    prepared.canonical_slice[0],
+                    prepared.canonical_slice[1],
+                    prepared.exposure_increasing,
+                )
             except RiskInputError:
                 caps[pair_id] = current[pair_id]
                 skipped.add(pair_id)
@@ -788,6 +821,67 @@ class PortfolioAllocator:
         actual = pair.etf.notional_for(signed_etf) + pair.stock.notional_for(signed_stock)
         return signed_etf, signed_stock, actual
 
+    def _stock_quantity_for_etf_quantity(self, pair: FrozenPair, etf_quantity: Decimal) -> Decimal:
+        """Map an ETF maker quantity to a stock hedge quantity on frozen rules."""
+
+        hedge = calculate_hedge_ratio(pair.stock_anchor, pair.etf_anchor, pair.etf_daily_multiplier)
+        return _floor_to_step(
+            etf_quantity * pair.etf.contract_multiplier * hedge / pair.stock.contract_multiplier,
+            pair.stock.quantity_step,
+        )
+
+    def _maximum_slice_etf_quantity(
+        self,
+        pair: FrozenPair,
+        etf_delta: Decimal,
+        stock_delta: Decimal,
+    ) -> Decimal:
+        """Return the greatest ETF step whose mapped stock hedge can be filled."""
+
+        maximum_etf = _floor_to_step(etf_delta, pair.etf.quantity_step)
+        if maximum_etf == 0:
+            return _ZERO
+        available_stock = sum((level.quantity for level in self._stock_levels(pair)), _ZERO)
+        maximum_stock = min(stock_delta, available_stock)
+        if self._stock_quantity_for_etf_quantity(pair, maximum_etf) <= maximum_stock:
+            return maximum_etf
+
+        low = 0
+        high = int((maximum_etf / pair.etf.quantity_step).to_integral_value(rounding=ROUND_DOWN))
+        while low < high:
+            mid = (low + high + 1) // 2
+            quantity = Decimal(mid) * pair.etf.quantity_step
+            if self._stock_quantity_for_etf_quantity(pair, quantity) <= maximum_stock:
+                low = mid
+            else:
+                high = mid - 1
+        return Decimal(low) * pair.etf.quantity_step
+
+    def _slice_minimums_met(
+        self,
+        pair: FrozenPair,
+        etf_quantity: Decimal,
+        etf_delta: Decimal,
+        stock_delta: Decimal,
+    ) -> bool:
+        """Check both legs' exchange minima at their executable frozen prices."""
+
+        if etf_quantity <= 0 or etf_quantity > etf_delta or etf_quantity < pair.etf.min_quantity:
+            return False
+        etf_price = self._entry_etf_price(pair)
+        etf_notional = etf_quantity * pair.etf.contract_multiplier * etf_price
+        if etf_notional < pair.etf.min_notional:
+            return False
+        stock_quantity = self._stock_quantity_for_etf_quantity(pair, etf_quantity)
+        if stock_quantity <= 0 or stock_quantity > stock_delta or stock_quantity < pair.stock.min_quantity:
+            return False
+        try:
+            stock_vwap = depth_vwap(self._stock_levels(pair), stock_quantity, self._stock_side(pair))
+        except InsufficientDepthError:
+            return False
+        stock_notional = stock_quantity * pair.stock.contract_multiplier * stock_vwap
+        return stock_notional >= pair.stock.min_notional
+
     def _minimum_slice(
         self,
         pair: FrozenPair,
@@ -807,14 +901,25 @@ class PortfolioAllocator:
             pair.stock.min_quantity,
             pair.stock.min_notional / (stock_best * pair.stock.contract_multiplier),
         )
-        needed_for_stock = (
-            stock_needed
-            * pair.stock.contract_multiplier
-            / (pair.etf.contract_multiplier * hedge)
-        )
-        quantity = _ceil_to_step(max(etf_needed, needed_for_stock), pair.etf.quantity_step)
-        details = self._slice_details(pair, quantity, etf_delta, stock_delta)
-        return details
+        needed_for_stock = stock_needed * pair.stock.contract_multiplier / (pair.etf.contract_multiplier * hedge)
+        minimum_etf = _ceil_to_step(max(etf_needed, needed_for_stock), pair.etf.quantity_step)
+        maximum_etf = self._maximum_slice_etf_quantity(pair, etf_delta, stock_delta)
+        if minimum_etf == 0 or minimum_etf > maximum_etf:
+            return None
+        if not self._slice_minimums_met(pair, maximum_etf, etf_delta, stock_delta):
+            return None
+
+        low = int((minimum_etf / pair.etf.quantity_step).to_integral_value(rounding=ROUND_DOWN))
+        high = int((maximum_etf / pair.etf.quantity_step).to_integral_value(rounding=ROUND_DOWN))
+        while low < high:
+            mid = (low + high) // 2
+            quantity = Decimal(mid) * pair.etf.quantity_step
+            if self._slice_minimums_met(pair, quantity, etf_delta, stock_delta):
+                high = mid
+            else:
+                low = mid + 1
+        quantity = Decimal(low) * pair.etf.quantity_step
+        return self._slice_details(pair, quantity, etf_delta, stock_delta)
 
     def _canonical_slice(
         self,
@@ -828,7 +933,7 @@ class PortfolioAllocator:
         if minimum is None:
             return None
         minimum_etf = minimum[0]
-        maximum_etf = _floor_to_step(etf_delta, pair.etf.quantity_step)
+        maximum_etf = self._maximum_slice_etf_quantity(pair, etf_delta, stock_delta)
         if minimum_etf > maximum_etf:
             return None
         low = int((minimum_etf / pair.etf.quantity_step).to_integral_value(rounding=ROUND_DOWN))
@@ -864,13 +969,9 @@ class PortfolioAllocator:
         etf_price = self._entry_etf_price(pair)
         if etf_quantity < pair.etf.min_quantity:
             return None
-        if pair.etf.notional_for(etf_quantity) < pair.etf.min_notional:
+        if etf_quantity * pair.etf.contract_multiplier * etf_price < pair.etf.min_notional:
             return None
-        hedge = calculate_hedge_ratio(pair.stock_anchor, pair.etf_anchor, pair.etf_daily_multiplier)
-        stock_quantity = _floor_to_step(
-            etf_quantity * pair.etf.contract_multiplier * hedge / pair.stock.contract_multiplier,
-            pair.stock.quantity_step,
-        )
+        stock_quantity = self._stock_quantity_for_etf_quantity(pair, etf_quantity)
         if stock_quantity <= 0 or stock_quantity > stock_delta:
             return None
         if stock_quantity < pair.stock.min_quantity:
@@ -879,7 +980,7 @@ class PortfolioAllocator:
             stock_vwap = depth_vwap(self._stock_levels(pair), stock_quantity, self._stock_side(pair))
         except InsufficientDepthError:
             return None
-        if pair.stock.notional_for(stock_quantity) < pair.stock.min_notional:
+        if stock_quantity * pair.stock.contract_multiplier * stock_vwap < pair.stock.min_notional:
             return None
         impact = stock_book_walk_bp(
             stock_vwap,
@@ -909,37 +1010,90 @@ class PortfolioAllocator:
             return etf_quantity, stock_quantity, Decimal("-1"), stock_vwap
         return etf_quantity, stock_quantity, opportunity.net_bp.display, stock_vwap
 
-    def _capacity_notional(self, leg: FrozenLeg, target_quantity: Decimal) -> Decimal:
-        target = leg.notional_for(target_quantity)
-        transient = (
-            leg.notional_for(leg.current_quantity)
+    @staticmethod
+    def _projected_leg_notional(
+        leg: FrozenLeg,
+        position_quantity: Decimal,
+        candidate_open_quantity: Decimal,
+        candidate_reservation_quantity: Decimal,
+    ) -> Decimal:
+        """Return the same mark-priced quantity total used by ``_leg_state``."""
+
+        return (
+            leg.notional_for(position_quantity)
             + leg.notional_for(leg.owned_open_quantity)
+            + leg.notional_for(candidate_open_quantity)
             + leg.notional_for(leg.owned_reservation_quantity)
+            + leg.notional_for(candidate_reservation_quantity)
         )
-        return max(target, transient) + leg.safety_notional_buffer
 
     def _select_pair_leverage(
         self,
         pair: FrozenPair,
         target_etf: Decimal,
         target_stock: Decimal,
+        etf_slice: Decimal,
+        stock_slice: Decimal,
+        increasing: bool,
     ) -> tuple[LeverageSelection, LeverageSelection]:
+        quantity_states = self._projected_quantity_states(
+            pair,
+            target_etf,
+            target_stock,
+            etf_slice,
+            stock_slice,
+            increasing,
+        )
+        etf_capacity = (
+            max(
+                self._projected_leg_notional(
+                    pair.etf,
+                    state.etf_position,
+                    state.etf_candidate_open,
+                    state.etf_candidate_reservation,
+                )
+                for state in quantity_states
+            )
+            + pair.etf.safety_notional_buffer
+        )
+        stock_capacity = (
+            max(
+                self._projected_leg_notional(
+                    pair.stock,
+                    state.stock_position,
+                    state.stock_candidate_open,
+                    state.stock_candidate_reservation,
+                )
+                for state in quantity_states
+            )
+            + pair.stock.safety_notional_buffer
+        )
         return (
-            pair.etf.leverage_schedule.select_leverage(self._capacity_notional(pair.etf, target_etf)),
-            pair.stock.leverage_schedule.select_leverage(self._capacity_notional(pair.stock, target_stock)),
+            pair.etf.leverage_schedule.select_leverage(etf_capacity),
+            pair.stock.leverage_schedule.select_leverage(stock_capacity),
         )
 
-    def _evaluate_pair(self, pair: FrozenPair, requested_gross: Decimal, current_gross: Decimal) -> PairCandidate:
+    def _prepare_pair_candidate(
+        self,
+        pair: FrozenPair,
+        requested_gross: Decimal,
+        current_gross: Decimal,
+    ) -> _PreparedPairCandidate:
+        """Freeze the executable target and canonical slice for one candidate."""
+
         target_etf, target_stock, actual_gross = self._target_for_gross(pair, requested_gross)
         current_etf = pair.etf.current_quantity
         current_stock = pair.stock.current_quantity
-        if (
-            (current_etf != 0 and target_etf != 0 and current_etf.is_signed() != target_etf.is_signed())
-            or (current_stock != 0 and target_stock != 0 and current_stock.is_signed() != target_stock.is_signed())
+        if (current_etf != 0 and target_etf != 0 and current_etf.is_signed() != target_etf.is_signed()) or (
+            current_stock != 0 and target_stock != 0 and current_stock.is_signed() != target_stock.is_signed()
         ):
             # Direction flips are a close-then-reopen lifecycle operation.  The
             # pure allocator must not reserve the opposite exposure in one epoch.
-            target_etf, target_stock, actual_gross = current_etf, current_stock, current_gross
+            target_etf, target_stock, actual_gross = (
+                current_etf,
+                current_stock,
+                current_gross,
+            )
         increasing = actual_gross > current_gross
         etf_delta = max(_ZERO, abs(target_etf) - abs(current_etf)) if increasing else _ZERO
         stock_delta = max(_ZERO, abs(target_stock) - abs(current_stock)) if increasing else _ZERO
@@ -950,10 +1104,16 @@ class PortfolioAllocator:
         if increasing and canonical is None:
             # A candidate with no legal next maker slice is exactly the current
             # fully hedged target; it cannot reserve a fictitious small order.
-            target_etf, target_stock, actual_gross = current_etf, current_stock, current_gross
-            increasing = False
-            etf_delta = stock_delta = _ZERO
+            return _PreparedPairCandidate(current_etf, current_stock, current_gross, False, None)
+        return _PreparedPairCandidate(target_etf, target_stock, actual_gross, increasing, canonical)
 
+    def _evaluate_pair(self, pair: FrozenPair, requested_gross: Decimal, current_gross: Decimal) -> PairCandidate:
+        prepared = self._prepare_pair_candidate(pair, requested_gross, current_gross)
+        target_etf = prepared.target_etf_quantity
+        target_stock = prepared.target_stock_quantity
+        actual_gross = prepared.target_gross_notional
+        increasing = prepared.exposure_increasing
+        canonical = prepared.canonical_slice
         if canonical is None:
             etf_slice = stock_slice = _ZERO
             net_bp = pair.current_net_bp
@@ -962,7 +1122,14 @@ class PortfolioAllocator:
             etf_slice, stock_slice, net_bp, stock_vwap = canonical
 
         try:
-            etf_selection, stock_selection = self._select_pair_leverage(pair, target_etf, target_stock)
+            etf_selection, stock_selection = self._select_pair_leverage(
+                pair,
+                target_etf,
+                target_stock,
+                etf_slice,
+                stock_slice,
+                increasing,
+            )
         except RiskInputError as error:
             raise AllocationInputError(f"{pair.pair_id} candidate leverage selection failed: {error}") from error
 
@@ -998,17 +1165,17 @@ class PortfolioAllocator:
             exposure_increasing=increasing,
         )
 
-    def _projected_states(
+    def _projected_quantity_states(
         self,
         pair: FrozenPair,
         target_etf: Decimal,
         target_stock: Decimal,
         etf_slice: Decimal,
         stock_slice: Decimal,
-        etf_selection: LeverageSelection,
-        stock_selection: LeverageSelection,
         increasing: bool,
-    ) -> tuple[ProjectedPairState, ...]:
+    ) -> tuple[_ProjectedQuantityState, ...]:
+        """Enumerate the leverage-independent physical states for a candidate."""
+
         current_etf = pair.etf.current_quantity
         current_stock = pair.stock.current_quantity
         etf_change = target_etf - current_etf
@@ -1026,23 +1193,15 @@ class PortfolioAllocator:
             stock_position: Decimal,
             stock_candidate_open: Decimal,
             stock_candidate_reservation: Decimal,
-        ) -> ProjectedPairState:
-            return ProjectedPairState(
+        ) -> _ProjectedQuantityState:
+            return _ProjectedQuantityState(
                 name=name,
-                etf=self._leg_state(
-                    pair.etf,
-                    etf_position,
-                    etf_candidate_open,
-                    etf_candidate_reservation,
-                    etf_selection,
-                ),
-                stock=self._leg_state(
-                    pair.stock,
-                    stock_position,
-                    stock_candidate_open,
-                    stock_candidate_reservation,
-                    stock_selection,
-                ),
+                etf_position=etf_position,
+                etf_candidate_open=etf_candidate_open,
+                etf_candidate_reservation=etf_candidate_reservation,
+                stock_position=stock_position,
+                stock_candidate_open=stock_candidate_open,
+                stock_candidate_reservation=stock_candidate_reservation,
             )
 
         if not increasing or etf_slice == 0 or stock_slice == 0:
@@ -1069,7 +1228,7 @@ class PortfolioAllocator:
                 ),
             )
 
-        states: list[ProjectedPairState] = [
+        states: list[_ProjectedQuantityState] = [
             make_state(
                 ProjectedStateName.CURRENT_RESERVATION,
                 current_etf,
@@ -1134,6 +1293,47 @@ class PortfolioAllocator:
             )
         )
         return tuple(states)
+
+    def _projected_states(
+        self,
+        pair: FrozenPair,
+        target_etf: Decimal,
+        target_stock: Decimal,
+        etf_slice: Decimal,
+        stock_slice: Decimal,
+        etf_selection: LeverageSelection,
+        stock_selection: LeverageSelection,
+        increasing: bool,
+    ) -> tuple[ProjectedPairState, ...]:
+        """Apply selected leverages to the same physical states used for capacity."""
+
+        return tuple(
+            ProjectedPairState(
+                name=state.name,
+                etf=self._leg_state(
+                    pair.etf,
+                    state.etf_position,
+                    state.etf_candidate_open,
+                    state.etf_candidate_reservation,
+                    etf_selection,
+                ),
+                stock=self._leg_state(
+                    pair.stock,
+                    state.stock_position,
+                    state.stock_candidate_open,
+                    state.stock_candidate_reservation,
+                    stock_selection,
+                ),
+            )
+            for state in self._projected_quantity_states(
+                pair,
+                target_etf,
+                target_stock,
+                etf_slice,
+                stock_slice,
+                increasing,
+            )
+        )
 
     def _stock_partial_points(self, pair: FrozenPair, stock_slice: Decimal) -> tuple[Decimal, ...]:
         """Enumerate finite margin-critical stock partial-fill quantities."""
