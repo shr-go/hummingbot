@@ -5,13 +5,17 @@ from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from controllers.generic.equity_leveraged_etf_arbitrage.anchor_repository import (
     F004AnchorRepositoryAdapter,
 )
-from controllers.generic.equity_leveraged_etf_arbitrage.controller import PairEpochFacts
+from controllers.generic.equity_leveraged_etf_arbitrage.controller import (
+    EquityLeveragedEtfArbitrageController,
+    PairEpochFacts,
+)
 from controllers.generic.equity_leveraged_etf_arbitrage.nav import (
     AnchorAlert,
     AnchorCycleCoordinator,
@@ -39,6 +43,7 @@ from hummingbot.data_feed.yahoo_finance.acquisition import (
 )
 from hummingbot.model.leveraged_etf_repository import (
     AnchorIntegrityError,
+    AnchorPollingCheckpointV1,
     AnchorRepositoryV1,
     AnchorRevisionConflict,
     PairScopedAnchorRepository,
@@ -56,6 +61,13 @@ from test.hummingbot.data_feed.yahoo_finance.test_pair_scoped_anchor import (
     acquisition,
     finalized_pair,
     observation_pair,
+)
+from test.controllers.generic.equity_leveraged_etf_arbitrage.test_controller_actions import (
+    _actions,
+    _configured_pair,
+    _controller,
+    _epoch,
+    _frozen_pair,
 )
 
 
@@ -82,7 +94,9 @@ async def test_f003_pair_scoped_adapter_is_lossless_durable_and_never_falls_back
         sndk_acquisition, sndk_empty, sndk_final = await finalized_pair(
             "sndk_snxx", "SNDK", "SNXX", 1
         )
-        _, intc_empty, intc_final = await finalized_pair("intc_intw", "INTC", "INTW", 5)
+        intc_acquisition, intc_empty, intc_final = await finalized_pair(
+            "intc_intw", "INTC", "INTW", 5
+        )
         sndk_key = AnchorRepositoryKey.create("sndk_snxx", sndk_empty.cycle_id)
         intc_key = AnchorRepositoryKey.create("intc_intw", intc_empty.cycle_id)
 
@@ -103,13 +117,15 @@ async def test_f003_pair_scoped_adapter_is_lossless_durable_and_never_falls_back
             adapter.compare_and_set_checkpoint(sndk_key, reset_sndk, expected_revision=1)
         with pytest.raises(CheckpointIntegrityError, match="pair|key"):
             adapter.compare_and_set_checkpoint(sndk_key, intc_empty, expected_revision=2)
+        with pytest.raises(CheckpointIntegrityError, match="pair|key"):
+            adapter.finalize_if_absent(sndk_key, intc_final.candidate, expected_revision=2)
 
         assert adapter.finalize_if_absent(sndk_key, sndk_final.candidate, expected_revision=2) == sndk_final.candidate
         assert adapter.finalize_if_absent(sndk_key, sndk_final.candidate, expected_revision=2) == sndk_final.candidate
         assert adapter.finalize_if_absent(intc_key, intc_final.candidate, expected_revision=1) == intc_final.candidate
         assert adapter.load(sndk_key).to_evidence_fields() == sndk_final.candidate.to_evidence_fields()
 
-        _, _, conflicting = await finalized_pair("sndk_snxx", "SNDK", "SNXX", 9)
+        _, _, conflicting = await finalized_pair("sndk_snxx", "SNDK", "SNXX", 5)
         with pytest.raises(AnchorIntegrityError, match="evidence|immutable|conflict"):
             adapter.finalize_if_absent(sndk_key, conflicting.candidate, expected_revision=2)
 
@@ -122,6 +138,25 @@ async def test_f003_pair_scoped_adapter_is_lossless_durable_and_never_falls_back
         adapter.append_revision_observation(sndk_key, assessment.revision_observation)
         adapter.append_revision_observation(sndk_key, assessment.revision_observation)
         assert adapter.revision_observations(sndk_key) == (assessment.revision_observation,)
+
+        intc_stock, intc_etf = observation_pair(
+            "INTC", "INTW", OFFICIAL_CLOSE + timedelta(seconds=90), "c", "d", 5
+        )
+        intc_assessment = intc_acquisition.assess_finalized(
+            intc_final.candidate,
+            intc_stock,
+            replace(intc_etf, close=intc_etf.close + D("0.01")),
+        )
+        with pytest.raises(CheckpointIntegrityError, match="pair|key"):
+            adapter.append_revision_observation(sndk_key, intc_assessment.revision_observation)
+
+        fields = sndk_empty.to_recovery_fields()
+        with pytest.raises(CheckpointIntegrityError, match="fields"):
+            AnchorPollingCheckpoint.from_recovery_fields({**fields, "unexpected": "field"})
+        with pytest.raises(CheckpointIntegrityError, match="fields"):
+            AnchorPollingCheckpoint.from_recovery_fields(
+                {name: value for name, value in fields.items() if name != "pair_id"}
+            )
 
         legacy_checkpoint = AnchorPollingCheckpoint.from_contract_fields(sndk_empty.to_contract_fields())
         with pytest.raises(CheckpointIntegrityError, match="version 3|pair"):
@@ -146,6 +181,24 @@ async def test_f003_pair_scoped_adapter_is_lossless_durable_and_never_falls_back
             legacy_repository.load_opaque(sndk_key.cycle_id)
     finally:
         legacy_repository.sql_manager.engine.dispose()
+
+    historical = AnchorPollingCheckpointV1(
+        cycle_id="xnys-2026-07-17",
+        target_session_date="2026-07-17",
+        official_close_utc="2026-07-17T20:00:00.000000Z",
+        deadline_utc="2026-07-17T20:10:00.000000Z",
+        attempt=0,
+        next_poll_utc="2026-07-17T20:00:00.000000Z",
+        confirmation_count=0,
+        candidate_stock_close=None,
+        candidate_etf_close=None,
+        candidate_stock_raw_response_hash=None,
+        candidate_etf_raw_response_hash=None,
+        stock_received_at_utc=None,
+        etf_received_at_utc=None,
+        revision=1,
+    )
+    assert historical.schema_version == 1
 
 
 @pytest.mark.asyncio
@@ -178,7 +231,7 @@ async def test_anchor_cycle_restarts_with_remaining_deadline_and_records_revisio
         )
         assert first.status is AnchorRuntimeStatus.ACQUIRING
         assert first.checkpoint is not None
-        assert first.remaining_deadline_seconds < D("540")
+        assert first.remaining_deadline_seconds == D("540")
     finally:
         first_manager.engine.dispose()
 
@@ -208,6 +261,14 @@ async def test_anchor_cycle_restarts_with_remaining_deadline_and_records_revisio
         assert finalized.status is AnchorRuntimeStatus.AVAILABLE
         assert finalized.candidate is not None
         assert finalized.checkpoint is None
+        anchor_facts = finalized.to_controller_anchor_facts(raw_bp=D("100"), net_bp=D("80"))
+        assert anchor_facts is not None
+        assert (anchor_facts.nav_cycle_id, anchor_facts.s0, anchor_facts.l0, anchor_facts.h) == (
+            "xnys-2026-07-17",
+            finalized.candidate.stock_close,
+            finalized.candidate.etf_close,
+            finalized.candidate.hedge_ratio,
+        )
 
         stock, etf = observation_pair(
             "SNDK", "SNXX", OFFICIAL_CLOSE + timedelta(seconds=90), "5", "6", 3
@@ -326,6 +387,19 @@ def test_nav_stages_observe_exact_boundaries_pair_local_anomalies_and_normal_fal
     assert not cross_cycle.entry_allowed
     assert StageIntentKind.RECOVERY_REQUIRED in {intent.kind for intent in cross_cycle.intents}
 
+    stale = coordinator.evaluate(
+        pair_id="sndk_snxx",
+        cycle_id="xnys-2026-07-17",
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=normal_time,
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        anchor_cycle_id="xnys-2026-07-16",
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    assert stale.operational_status is AnchorRuntimeStatus.STALE
+    assert not stale.entry_allowed
+
     early_close = OFFICIAL_CLOSE - timedelta(hours=3)
     assert coordinator.evaluate(
         pair_id="intc_intw",
@@ -339,6 +413,30 @@ def test_nav_stages_observe_exact_boundaries_pair_local_anomalies_and_normal_fal
     assert coordinator.select_session(
         SessionName.EXTENDED, {SessionName.REGULAR: object()}
     ) is SessionName.REGULAR
+
+
+def test_close_stage_decision_is_carried_by_controller_epoch_and_blocks_new_actions():
+    configured = _configured_pair(1)
+    frozen = _frozen_pair(configured)
+    base_epoch = _epoch(frozen)
+    decision = SessionStageCoordinator(load_nav_config()).evaluate(
+        pair_id=configured.id,
+        cycle_id=base_epoch.pairs[0].anchor.nav_cycle_id,
+        official_close_utc=OFFICIAL_CLOSE,
+        now_utc=OFFICIAL_CLOSE - timedelta(minutes=30),
+        anchor_status=AnchorRuntimeStatus.AVAILABLE,
+        spread_bp=D("1"),
+        p99_bp=D("100"),
+    )
+    epoch = replace(
+        base_epoch,
+        pairs=(replace(base_epoch.pairs[0], nav_decision=decision),),
+    )
+    controller, _ = _controller((configured,), (epoch,))
+
+    assert _actions(controller) == []
+    assert controller.last_operational_status is not None
+    assert controller.processed_data["operational_status"]["pairs"][0]["stage"] == "CLOSE_30"
 
 
 def test_shadow_plan_is_deterministic_action_free_and_operational_status_redacts():
@@ -383,8 +481,61 @@ def test_shadow_plan_is_deterministic_action_free_and_operational_status_redacts
     assert first.pair_ids == ("intc_intw", "sndk_snxx")
     assert first.exchange_actions == ()
     assert not first.has_exchange_side_effects
+    assert first.metrics.pair_count == 2
+    assert first.metrics.entry_allowed_pair_count == 2
+    assert first.metrics.blocked_pair_count == 0
     assert first.pairs[1].etf_leverage == 10
     assert first.pairs[1].stock_leverage == 5
+
+    class _MutationTrapConnector:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def strict_account_preflight(self, *args, **kwargs):
+            self.calls.append("preflight")
+            raise AssertionError("shadow planning must not preflight or mutate an exchange")
+
+        async def set_leverage_with_result(self, *args, **kwargs):
+            self.calls.append("leverage")
+            raise AssertionError("shadow planning must not set leverage")
+
+    class _UnusedEpochSource:
+        async def build_epoch(self, *args, **kwargs):
+            raise AssertionError("shadow planning must not build an exchange epoch")
+
+    class _UnusedReservations:
+        def active(self):
+            raise AssertionError("shadow planning must not read or mutate reservations")
+
+        def reserve(self, *args, **kwargs):
+            raise AssertionError("shadow planning must not reserve")
+
+        def release(self, *args, **kwargs):
+            raise AssertionError("shadow planning must not release")
+
+    trap = _MutationTrapConnector()
+    controller = EquityLeveragedEtfArbitrageController(
+        config=SimpleNamespace(
+            id="shadow-controller",
+            pairs=(
+                SimpleNamespace(
+                    id="sndk_snxx",
+                    stock_trading_pair="SNDK-USDT",
+                    etf_trading_pair="SNXX-USDT",
+                    enabled=True,
+                ),
+            ),
+        ),
+        market_data_provider=object(),
+        actions_queue=object(),
+        connector=trap,
+        epoch_source=_UnusedEpochSource(),
+        reservations=_UnusedReservations(),
+    )
+    controller_plan = controller.build_shadow_plan((inputs[1],))
+    assert controller_plan.exchange_actions == ()
+    assert controller.determine_executor_actions() == []
+    assert trap.calls == []
 
     status = ControllerOperationalStatus(
         decisions=(decision,),

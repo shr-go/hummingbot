@@ -25,6 +25,13 @@ from controllers.generic.equity_leveraged_etf_arbitrage.reservations import (
     ReservationConflict,
     ReservationStore,
 )
+from controllers.generic.equity_leveraged_etf_arbitrage.nav import SessionStageDecision
+from controllers.generic.equity_leveraged_etf_arbitrage.shadow import (
+    ShadowPairInput,
+    ShadowPlan,
+    ShadowPlanner,
+)
+from controllers.generic.equity_leveraged_etf_arbitrage.status import ControllerOperationalStatus
 from hummingbot.core.data_type.common import MarketDict
 from hummingbot.strategy_v2.controllers.controller_base import (
     ControllerBase,
@@ -127,6 +134,7 @@ class PairEpochFacts:
     current_stock_leverage: int | None = None
     entry_ready: bool = True
     failure_reason: str | None = None
+    nav_decision: SessionStageDecision | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.pair_id, str) or not self.pair_id:
@@ -148,6 +156,13 @@ class PairEpochFacts:
                 raise ValueError(f"{name} must be a positive int when supplied")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise ValueError("failure_reason must be a string when supplied")
+        if self.nav_decision is not None:
+            if not isinstance(self.nav_decision, SessionStageDecision):
+                raise ValueError("nav_decision must be a SessionStageDecision when supplied")
+            if self.nav_decision.pair_id != self.pair_id:
+                raise ValueError("nav_decision pair_id must match PairEpochFacts")
+            if self.anchor is not None and self.nav_decision.cycle_id != self.anchor.nav_cycle_id:
+                raise ValueError("nav_decision cycle_id must match the pair anchor cycle")
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +303,8 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
         self._stored_executor_ids: set[str] = set()
         self.last_failure: str | None = None
         self.last_allocation_hash: str | None = None
+        self.last_operational_status: ControllerOperationalStatus | None = None
+        self.last_shadow_plan: ShadowPlan | None = None
 
     @property
     def registered_pair_ids(self) -> tuple[str, ...]:
@@ -369,12 +386,32 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
     def to_format_status(self) -> list[str]:
         failure = self.last_failure or "none"
         allocation = self.last_allocation_hash or "unavailable"
-        return [
+        lines = [
             "Equity Leveraged ETF Arbitrage Controller:",
             f"  Registered pairs: {', '.join(self.registered_pair_ids)}",
             f"  Allocation hash: {allocation}",
             f"  Last preflight failure: {failure}",
         ]
+        if self.last_operational_status is not None:
+            lines.extend(self.last_operational_status.to_lines())
+        return lines
+
+    def build_shadow_plan(self, inputs: tuple[ShadowPairInput, ...]) -> ShadowPlan:
+        """Build a report-only plan without connector mutation or action emission.
+
+        This deliberately bypasses normal update processing: normal processing
+        performs strict account reads and can set leverage, while a shadow
+        caller needs a pure supplied snapshot only.
+        """
+
+        plan = ShadowPlanner().plan(inputs)
+        decisions = tuple(sorted((item.nav_decision for item in inputs), key=lambda item: item.pair_id))
+        self.last_shadow_plan = plan
+        self.last_operational_status = ControllerOperationalStatus(
+            decisions=decisions,
+            shadow_plan=plan,
+        )
+        return plan
 
     @staticmethod
     def _normalize_pairs(pairs: Sequence[object]) -> tuple[object, ...]:
@@ -423,6 +460,8 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
         if not epoch.account_data_fresh:
             self._fail("account facts are stale")
             return None
+
+        self._record_nav_status(epoch)
 
         facts_by_pair_id = {facts.pair_id: facts for facts in epoch.pairs}
         usable: list[FrozenPair] = []
@@ -522,6 +561,27 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
             return None
         return preflight
 
+    def _record_nav_status(self, epoch: ControllerEpoch) -> None:
+        decisions = tuple(
+            sorted(
+                (
+                    facts.nav_decision
+                    for facts in epoch.pairs
+                    if facts.nav_decision is not None
+                ),
+                key=lambda decision: decision.pair_id,
+            )
+        )
+        if not decisions:
+            return
+        shadow = self.last_shadow_plan
+        if shadow is not None and shadow.pair_ids != tuple(decision.pair_id for decision in decisions):
+            shadow = None
+        self.last_operational_status = ControllerOperationalStatus(
+            decisions=decisions,
+            shadow_plan=shadow,
+        )
+
     def _pair_facts_ready(self, configured: object, facts: PairEpochFacts) -> bool:
         frozen = facts.frozen_pair
         anchor = facts.anchor
@@ -532,6 +592,10 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
             or not facts.market_data_fresh
             or not facts.bracket_data_fresh
             or frozen.stale
+            or (
+                facts.nav_decision is not None
+                and not facts.nav_decision.entry_allowed
+            )
         ):
             return False
         try:
@@ -989,6 +1053,11 @@ class EquityLeveragedEtfArbitrageController(ControllerBase):
             "registered_pair_ids": self.registered_pair_ids,
             "last_failure": self.last_failure,
             "allocation_hash": self.last_allocation_hash,
+            "operational_status": (
+                None
+                if self.last_operational_status is None
+                else self.last_operational_status.to_dict()
+            ),
         }
 
     def _fail(self, reason: str) -> None:
