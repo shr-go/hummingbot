@@ -680,6 +680,7 @@ def test_t005_legacy_unproven_no_fill_replays_nonterminal_after_20260721_upgrade
             ("event-t005-legacy-no-fill",),
         ).fetchone()[0]
         mutation = json.loads(payload_json)
+        mutation.pop("reducer_semantics_version", None)
         legacy_payload = mutation["event"]["payload"]
         legacy_payload.pop("evidence_state")
         legacy_payload.pop("proven_no_fill")

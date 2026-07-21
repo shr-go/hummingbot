@@ -806,17 +806,30 @@ def test_intent_transition_incomplete_query_and_logical_quantity_collision(
         ("intent-maker-1", JournalEventType.ACKNOWLEDGED),
     )
 
-    reconciled = _snapshot_at(acknowledged, 3)
+    filled = _snapshot_with_leg_fill(
+        acknowledged,
+        sequence=3,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="40",
+        filled="40",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-maker-1",
+    )
     repository.append_and_reduce(
         initial.executor_id,
         _followup_event(
             initial,
-            reconciled,
-            JournalEventType.RECONCILIATION,
-            "event-maker-reconciled-1",
+            filled,
+            JournalEventType.FILL,
+            "event-maker-filled-1",
             terminal=True,
+            exchange_order_id="exchange-maker-1",
+            exchange_trade_id="trade-maker-1",
+            fill_quantity="40",
+            cumulative_filled_quantity="40",
         ),
-        reconciled,
+        filled,
     )
     assert repository.incomplete_intents(initial.executor_id) == ()
 
@@ -1757,7 +1770,16 @@ def _create_terminal_maker_intent(
 ) -> LeveragedEtfPairExecutorSnapshotV1:
     prepared = _prepared_snapshot(initial)
     acknowledged = _snapshot_at(prepared, 2, "MAKER_WORKING")
-    reconciled = _snapshot_at(acknowledged, 3, "MAKER_WORKING")
+    filled = _snapshot_with_leg_fill(
+        acknowledged,
+        sequence=3,
+        state="STOCK_HEDGE_PENDING",
+        leg="ETF",
+        submitted="40",
+        filled="40",
+        client_order_id="exec-sndk-snxx-0001-maker-1",
+        exchange_order_id="exchange-recovery-maker",
+    )
     repository.create_executor(initial)
     repository.append_and_reduce(initial.executor_id, _prepared_event(initial, prepared), prepared)
     repository.append_and_reduce(
@@ -1769,14 +1791,18 @@ def _create_terminal_maker_intent(
         initial.executor_id,
         _followup_event(
             initial,
-            reconciled,
-            JournalEventType.RECONCILIATION,
-            "event-recovery-terminal",
+            filled,
+            JournalEventType.FILL,
+            "event-recovery-filled",
             terminal=True,
+            exchange_order_id="exchange-recovery-maker",
+            exchange_trade_id="trade-recovery-maker",
+            fill_quantity="40",
+            cumulative_filled_quantity="40",
         ),
-        reconciled,
+        filled,
     )
-    return reconciled
+    return filled
 
 
 @pytest.mark.parametrize("discovery_method", ("incomplete_intents", "incomplete_executors"))
