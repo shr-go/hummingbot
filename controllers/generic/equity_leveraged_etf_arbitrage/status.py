@@ -13,37 +13,25 @@ from controllers.generic.equity_leveraged_etf_arbitrage.shadow import ShadowPlan
 __all__ = ["ControllerOperationalStatus", "OperationalAlert", "redact_public_text"]
 
 
-_PEM_PRIVATE_KEY = re.compile(
-    (
-        r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?"
-        r"-----END(?: [A-Z0-9]+)* PRIVATE KEY-----"
-    ),
-    flags=re.IGNORECASE | re.DOTALL,
+_PEM_PRIVATE_KEY_MARKER = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----",
+    flags=re.IGNORECASE,
 )
-_SECRET_VALUE = re.compile(
+_SENSITIVE_ASSIGNMENT = re.compile(
     r"""(?ix)
-    (?P<prefix>
-        (?P<quote>[\"'])?
-        (?:
-            api[_-]?key
-            | private[_-]?key
-            | (?:client[_-]?)?secret
-            | (?:access[_-]?|refresh[_-]?)?token
-            | password
-            | passphrase
-            | authorization
-        )
-        (?(quote)(?P=quote))
-        \s*(?:=|:)\s*
-    )
+    (?<![A-Z0-9_-])
+    [\"']?
     (?:
-        (?:Bearer\s+)?
-        (?:
-            \"(?:\\.|[^\"\\])*\"
-            | '(?:\\.|[^'\\])*'
-            | [^,;\s}\]]+
-        )
+        api[_-]?key
+        | private[_-]?key
+        | (?:client[_-]?)?secret
+        | (?:access[_-]?|refresh[_-]?)?token
+        | password
+        | passphrase
+        | authorization
     )
+    [\"']?
+    \s*(?:=|:)
     """
 )
 
@@ -54,12 +42,20 @@ def _decimal_text(value: Decimal) -> str:
 
 
 def redact_public_text(message: str) -> str:
-    """Remove credential material from text crossing a public status boundary."""
+    """Fail closed for arbitrary credential-bearing diagnostic text.
+
+    Error messages are untrusted text, not a JSON transport.  Parsing only a
+    prefix can leave nested structured values, whitespace-delimited arrays, or
+    malformed/escaped text behind.  Once a sensitive assignment or PEM marker
+    is present, omit the complete public message instead of attempting a
+    partial substitution.
+    """
 
     if not isinstance(message, str):
         raise TypeError("public status text must be a string")
-    without_pem = _PEM_PRIVATE_KEY.sub("[REDACTED]", message)
-    return _SECRET_VALUE.sub(lambda found: f"{found.group('prefix')}[REDACTED]", without_pem)
+    if _PEM_PRIVATE_KEY_MARKER.search(message) or _SENSITIVE_ASSIGNMENT.search(message):
+        return "[REDACTED]"
+    return message
 
 
 @dataclass(frozen=True, slots=True)

@@ -608,7 +608,7 @@ PEM_PRIVATE_KEY_SENTINEL
         "PEM_PRIVATE_KEY_SENTINEL",
     ):
         assert sentinel not in serialized
-    assert "[REDACTED]" in serialized
+    assert serialized.count("[REDACTED]") >= 2
 
 
 @pytest.mark.parametrize(
@@ -680,12 +680,22 @@ def test_public_boundaries_fail_closed_for_complete_structured_secret_assignment
     controller.last_operational_status = status
     controller._set_processed_data()
 
+    alert_dict = alert.to_dict()
+    status_dict = status.to_dict()
+    status_lines = status.to_lines()
+    processed = controller.processed_data
+    assert redact_public_text(secret_text) == "[REDACTED]"
+    assert alert_dict["message"] == "[REDACTED]"
+    assert status_dict["pairs"][0]["intents"][0]["reason"] == "[REDACTED]"
+    assert status_lines[-1] == "  Alert UPSTREAM_FAILURE: [REDACTED]"
+    assert processed["operational_status"]["alerts"][0]["message"] == "[REDACTED]"
+    assert processed["operational_status"]["pairs"][0]["intents"][0]["reason"] == "[REDACTED]"
     public_values = (
         redact_public_text(secret_text),
-        json.dumps(alert.to_dict(), sort_keys=True),
-        json.dumps(status.to_dict(), sort_keys=True),
-        "\n".join(status.to_lines()),
-        json.dumps(controller.processed_data, sort_keys=True),
+        json.dumps(alert_dict, sort_keys=True),
+        json.dumps(status_dict, sort_keys=True),
+        "\n".join(status_lines),
+        json.dumps(processed, sort_keys=True),
     )
 
     for serialized in public_values:
@@ -829,5 +839,5 @@ def test_shadow_plan_is_deterministic_action_free_and_operational_status_redacts
     serialized = json.dumps(status.to_dict(), sort_keys=True)
     assert "do-not-leak" not in serialized
     assert "also-do-not-leak" not in serialized
-    assert "api_key=[REDACTED]" in serialized
+    assert '"message": "[REDACTED]"' in serialized
     assert status.to_lines()[0] == "Equity Leveraged ETF operational status:"
