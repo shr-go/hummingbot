@@ -275,7 +275,7 @@ async def test_maker_preflight_and_submission_are_durable_before_the_native_conn
             maker["client_order_id"],
             trading_pair="SNXX-USDT",
             side=TradeType.SELL,
-            exchange_order_id="maker-exchange-1",
+            exchange_order_id="10001",
         ),
     )
     assert executor.state is LeveragedEtfPairState.MAKER_WORKING
@@ -319,7 +319,7 @@ async def test_native_stock_submission_reconciles_async_unknown_before_another_h
             executor.maker_client_order_id,
             trading_pair="SNXX-USDT",
             side=TradeType.SELL,
-            exchange_order_id="maker-exchange-1",
+            exchange_order_id="10001",
         ),
     )
     connector.async_submission_unknown_on_next_submit = True
@@ -421,7 +421,7 @@ async def test_stock_partial_fill_below_minimum_notional_remains_dust_without_a_
             executor.maker_client_order_id,
             trading_pair="SNXX-USDT",
             side=TradeType.SELL,
-            exchange_order_id="maker-exchange-1",
+            exchange_order_id="10001",
         ),
     )
 
@@ -501,7 +501,7 @@ async def test_partial_etf_fills_are_deduplicated_and_submit_only_the_incrementa
             first_stock_order_id,
             trading_pair="SNDK-USDT",
             side=TradeType.BUY,
-            exchange_order_id="stock-exchange-1",
+            exchange_order_id="20001",
         ),
     )
 
