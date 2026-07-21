@@ -92,6 +92,23 @@ def _checkpoint_envelope(payload, revision: int = 1):
     )
 
 
+def _checkpoint_copied_with_payload_revision(revision: Any):
+    valid_payload = _checkpoint_payload_from_value(1)
+    payload_json, payload_hash = _canonical_json_hash(_checkpoint_fields(revision))
+    copied_payload = valid_payload.model_copy(
+        update={
+            "payload_json": payload_json,
+            "payload_hash": payload_hash,
+        }
+    )
+    copied_checkpoint = _checkpoint_envelope(valid_payload).model_copy(
+        update={"payload": copied_payload}
+    )
+    assert type(copied_payload) is durable_contract.CanonicalOpaqueAnchorPayloadV2
+    assert type(copied_checkpoint) is durable_contract.OpaqueAnchorCheckpointV2
+    return copied_payload, copied_checkpoint
+
+
 class _CaptureMappings:
     @staticmethod
     def one_or_none():
@@ -119,10 +136,11 @@ class _CaptureTransaction:
 
 class _CaptureConnection:
     def __init__(self):
+        self.begin_count = 0
         self.insert_parameters: list[dict[str, Any]] = []
 
-    @staticmethod
-    def begin():
+    def begin(self):
+        self.begin_count += 1
         return _CaptureTransaction()
 
     @staticmethod
@@ -146,8 +164,10 @@ class _CaptureConnection:
 class _CaptureEngine:
     def __init__(self, connection: _CaptureConnection):
         self._connection = connection
+        self.connect_count = 0
 
     def connect(self):
+        self.connect_count += 1
         return self._connection
 
 
@@ -242,6 +262,41 @@ def test_repository_write_path_never_binds_noncanonical_payload_revision(invalid
         rejection = exception
 
     assert rejection is not None
+    assert connection.insert_parameters == []
+
+
+@pytest.mark.parametrize(
+    "invalid_revision",
+    [True, 1.0, "1"],
+    ids=("bool", "float", "string"),
+)
+def test_model_copy_payload_value_revalidates_checkpoint_revision(invalid_revision: Any):
+    copied_payload, _ = _checkpoint_copied_with_payload_revision(invalid_revision)
+
+    with pytest.raises((ValueError, ValidationError), match="revision"):
+        copied_payload.value()
+
+
+@pytest.mark.parametrize(
+    "invalid_revision",
+    [True, 1.0, "1"],
+    ids=("bool", "float", "string"),
+)
+def test_model_copy_checkpoint_rejects_before_transaction_or_insert(invalid_revision: Any):
+    _, copied_checkpoint = _checkpoint_copied_with_payload_revision(invalid_revision)
+    connection = _CaptureConnection()
+    engine = _CaptureEngine(connection)
+    repository = durable_contract.PairScopedAnchorRepository(SimpleNamespace(engine=engine))
+
+    with pytest.raises((ValueError, ValidationError, AnchorIntegrityError), match="revision|integrity"):
+        repository.compare_and_set_opaque_checkpoint(
+            copied_checkpoint.key,
+            copied_checkpoint,
+            expected_revision=0,
+        )
+
+    assert engine.connect_count == 0
+    assert connection.begin_count == 0
     assert connection.insert_parameters == []
 
 
