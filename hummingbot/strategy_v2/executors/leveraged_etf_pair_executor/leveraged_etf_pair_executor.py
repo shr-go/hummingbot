@@ -325,6 +325,17 @@ class LeveragedEtfPairExecutor(ExecutorBase):
                         )
                         else LeveragedEtfPairState.MAKER_WORKING
                     )
+            if not self._submission_halted:
+                try:
+                    # A native stock fill can arrive before OrderCreated.  It
+                    # authoritatively acknowledges that intent, so this is the
+                    # safe point to release any ETF hedge delta that was held
+                    # while the prior stock submission was unconfirmed.
+                    self._submit_incremental_stock_hedge()
+                except Exception:
+                    self._submission_halted = True
+                    self._close_reason = "stock hedge setup or submission failed"
+                    self._transition_to_recovery_required("stock hedge setup or submission failed")
 
     def process_order_failed_event(self, _: int, market, event: MarketOrderFailureEvent):
         if self._submission_halted:
