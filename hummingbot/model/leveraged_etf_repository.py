@@ -2463,7 +2463,7 @@ class LeveragedEtfJournalRepository(_TransactionalRepository):
         legal_sources = (
             prepared_sources[action] if event.event_type == JournalEventType.PREPARED else active_sources[action]
         )
-        if source not in legal_sources:
+        if source not in legal_sources and not reopens_legacy_no_fill:
             raise JournalConflictError(
                 f"illegal {event.event_type.value} source state {source.value} for {action.value}"
             )
