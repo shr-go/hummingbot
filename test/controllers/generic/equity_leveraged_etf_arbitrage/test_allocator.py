@@ -41,6 +41,22 @@ def _schedule(symbol: str, leverage: int = 100, cap: str = "1000000") -> Leverag
     )
 
 
+def _two_bracket_schedule(
+    symbol: str,
+    high_leverage: int,
+    high_cap: str,
+    low_leverage: int,
+    low_cap: str,
+) -> LeverageSchedule:
+    return LeverageSchedule(
+        symbol=symbol,
+        brackets=(
+            LeverageBracket(1, high_leverage, D("0"), D(high_cap), D("0.005"), D("0")),
+            LeverageBracket(2, low_leverage, D(high_cap), D(low_cap), D("0.01"), D("1")),
+        ),
+    )
+
+
 def _leg(
     symbol: str,
     mark: str,
@@ -453,3 +469,54 @@ def test_typed_f002_account_and_bracket_adapters_remain_pure() -> None:
     assert schedule.select_leverage(D("999")).leverage == 32
     assert account.total_margin_balance == D("100")
     assert account.available_balance == D("99")
+
+
+def test_existing_reservation_and_new_delta_select_lower_candidate_leverage() -> None:
+    pair = _pair(
+        "concurrent-capacity",
+        requested_ratio="0.32",
+        etf=_leg(
+            "concurrent-capacity-ETF",
+            "60",
+            _two_bracket_schedule("concurrent-capacity-ETF", 100, "150", 50, "300"),
+            owned_reservation_quantity=D("-2"),
+        ),
+        stock=_leg(
+            "concurrent-capacity-STOCK",
+            "100",
+            _two_bracket_schedule("concurrent-capacity-STOCK", 100, "250", 50, "500"),
+            owned_reservation_quantity=D("2"),
+        ),
+    )
+
+    result = PortfolioAllocator().allocate(_snapshot(pair))
+    candidate = _pair_result(result, "concurrent-capacity")
+
+    assert result.status is AllocationStatus.ALLOCATED
+    assert candidate.target_etf_quantity == D("-2")
+    assert candidate.target_stock_quantity == D("2")
+    assert candidate.etf_leverage == 50
+    assert candidate.stock_leverage == 50
+
+
+def test_degraded_bid_vwap_below_min_notional_rejects_canonical_slice() -> None:
+    pair = _pair(
+        "degraded-bid",
+        requested_ratio="0.32",
+        direction=ArbitrageDirection.LONG_ETF_SHORT_STOCK,
+        etf=_leg("degraded-bid-ETF", "40", min_notional=D("40")),
+        stock=_leg("degraded-bid-STOCK", "100", min_notional=D("195")),
+        etf_best_bid=D("40"),
+        etf_best_ask=D("41"),
+        stock_bids=(
+            BookLevel(price=D("100"), quantity=D("1")),
+            BookLevel(price=D("90"), quantity=D("1000")),
+        ),
+        max_stock_taker_impact_bp=D("500"),
+    )
+
+    result = PortfolioAllocator().allocate(_snapshot(pair))
+    candidate = _pair_result(result, "degraded-bid")
+
+    assert candidate.canonical_stock_slice_quantity == D("0")
+    assert candidate.target_gross_notional == D("0")
