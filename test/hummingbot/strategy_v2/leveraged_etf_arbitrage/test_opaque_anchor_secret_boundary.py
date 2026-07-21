@@ -366,3 +366,306 @@ def test_t007_non_secret_opaque_payloads_round_trip_after_reopen(tmp_path: Path)
         assert repository.opaque_revision_observations(key) == (observation,)
     finally:
         reopened.engine.dispose()
+
+
+_T008_API_KEY_FIELD = "T008-API-KEY-FIELD-7D38-api_key"
+_T008_API_KEY_VALUE = "T008-API-KEY-VALUE-9F271"
+_T008_PKCS8_FIELD = "T008-PKCS8-FIELD-91AC-private_key_pem"
+_T008_PKCS8_MARKER = "T008-PKCS8-VALUE-B31C2"
+_T008_PKCS8_VALUE = (
+    "-----BEGIN PRIVATE KEY-----\n"
+    f"{_T008_PKCS8_MARKER}\n"
+    "-----END PRIVATE KEY-----"
+)
+_T008_SECRET_SENTINELS = (
+    _T008_API_KEY_FIELD,
+    _T008_API_KEY_VALUE,
+    _T008_PKCS8_FIELD,
+    _T008_PKCS8_MARKER,
+    _T008_PKCS8_VALUE,
+    "-----BEGIN PRIVATE KEY-----",
+    "-----END PRIVATE KEY-----",
+)
+
+
+def _t008_secret_value(envelope) -> dict:
+    value = envelope.payload.value()
+    value["provider_state"] = {
+        "history": [
+            {
+                _T008_API_KEY_FIELD: _T008_API_KEY_VALUE,
+                _T008_PKCS8_FIELD: _T008_PKCS8_VALUE,
+            }
+        ]
+    }
+    return value
+
+
+def _t008_canonical_secret(envelope) -> tuple[str, str]:
+    return _canonical_json_hash(_t008_secret_value(envelope))
+
+
+def _t008_forged_payload(envelope) -> CanonicalOpaqueAnchorPayloadV2:
+    payload_json, payload_hash = _t008_canonical_secret(envelope)
+    return CanonicalOpaqueAnchorPayloadV2.model_construct(
+        schema_version=2,
+        kind=envelope.payload.kind,
+        contract_version_field=envelope.payload.contract_version_field,
+        contract_version=envelope.payload.contract_version,
+        payload_json=payload_json,
+        payload_hash=payload_hash,
+    )
+
+
+def _t008_forged_envelope(surface: str):
+    key, envelope = _surface(surface)
+    return key, envelope.model_copy(update={"payload": _t008_forged_payload(envelope)})
+
+
+def _t008_capture_secret_rejection(operation):
+    try:
+        operation()
+    except (ValueError, ValidationError, AnchorIntegrityError) as error:
+        assert "secret" in str(error).lower()
+        return error
+    pytest.fail("secret-bearing opaque anchor payload was accepted")
+
+
+def _t008_nested_renderings(value) -> tuple[str, ...]:
+    renderings = []
+    pending = [value]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if isinstance(candidate, str):
+            renderings.append(candidate)
+        elif isinstance(candidate, dict):
+            if id(candidate) in visited:
+                continue
+            visited.add(id(candidate))
+            pending.extend(candidate.keys())
+            pending.extend(candidate.values())
+        elif isinstance(candidate, (list, tuple, set)):
+            if id(candidate) in visited:
+                continue
+            visited.add(id(candidate))
+            pending.extend(candidate)
+        else:
+            renderings.extend((str(candidate), repr(candidate)))
+    return tuple(renderings)
+
+
+def _t008_assert_secret_safe(error: BaseException, payload_json: str) -> None:
+    escaped_payload_json = json.dumps(payload_json, ensure_ascii=False)
+    forbidden = (*_T008_SECRET_SENTINELS, payload_json, escaped_payload_json)
+    pending = [error]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        renderings = [
+            str(candidate),
+            repr(candidate),
+            repr(candidate.args),
+            json.dumps(candidate.args, default=repr, ensure_ascii=False),
+        ]
+        if isinstance(candidate, ValidationError):
+            structured = candidate.errors(
+                include_url=True,
+                include_context=True,
+                include_input=True,
+            )
+            renderings.extend(_t008_nested_renderings(structured))
+            renderings.extend(
+                (
+                    repr(structured),
+                    json.dumps(structured, default=repr, ensure_ascii=False),
+                    candidate.json(
+                        include_url=True,
+                        include_context=True,
+                        include_input=True,
+                    ),
+                )
+            )
+        if any(secret in rendering for secret in forbidden for rendering in renderings):
+            pytest.fail("opaque anchor error surface exposed a T008 secret sentinel")
+        pending.extend((candidate.__cause__, candidate.__context__))
+
+
+def test_t008_direct_payload_construction_redacts_secret_input():
+    _, checkpoint = _surface("checkpoint")
+    payload_json, payload_hash = _t008_canonical_secret(checkpoint)
+
+    error = _t008_capture_secret_rejection(
+        lambda: CanonicalOpaqueAnchorPayloadV2(
+            schema_version=2,
+            kind=checkpoint.payload.kind,
+            contract_version_field=checkpoint.payload.contract_version_field,
+            contract_version=checkpoint.payload.contract_version,
+            payload_json=payload_json,
+            payload_hash=payload_hash,
+        )
+    )
+
+    _t008_assert_secret_safe(error, payload_json)
+
+
+def test_t008_from_value_redacts_secret_input():
+    _, checkpoint = _surface("checkpoint")
+    payload_json, _ = _t008_canonical_secret(checkpoint)
+
+    error = _t008_capture_secret_rejection(
+        lambda: CanonicalOpaqueAnchorPayloadV2.from_value(
+            kind=checkpoint.payload.kind,
+            contract_version_field=checkpoint.payload.contract_version_field,
+            contract_version=checkpoint.payload.contract_version,
+            value=_t008_secret_value(checkpoint),
+        )
+    )
+
+    _t008_assert_secret_safe(error, payload_json)
+
+
+def test_t008_canonical_decode_redacts_secret_input():
+    _, checkpoint = _surface("checkpoint")
+    payload_json, payload_hash = _t008_canonical_secret(checkpoint)
+
+    error = _t008_capture_secret_rejection(
+        lambda: CanonicalOpaqueAnchorPayloadV2.from_canonical_json(
+            kind=checkpoint.payload.kind,
+            contract_version_field=checkpoint.payload.contract_version_field,
+            contract_version=checkpoint.payload.contract_version,
+            payload_json=payload_json,
+            payload_hash=payload_hash,
+        )
+    )
+
+    _t008_assert_secret_safe(error, payload_json)
+
+
+def test_t008_value_revalidation_redacts_secret_input():
+    _, checkpoint = _surface("checkpoint")
+    forged = _t008_forged_payload(checkpoint)
+
+    error = _t008_capture_secret_rejection(forged.value)
+
+    _t008_assert_secret_safe(error, forged.payload_json)
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_t008_envelope_revalidation_redacts_secret_input(surface: str):
+    _, envelope = _t008_forged_envelope(surface)
+
+    error = _t008_capture_secret_rejection(
+        lambda: PairScopedAnchorRepository._revalidate_opaque_write_envelope(
+            envelope,
+            type(envelope),
+            surface,
+        )
+    )
+
+    _t008_assert_secret_safe(error, envelope.payload.payload_json)
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_t008_write_rejection_is_redacted_and_preserves_storage(tmp_path: Path, surface: str):
+    manager = _open_manager(tmp_path / f"redacted-secret-write-{surface}.sqlite")
+    try:
+        repository = PairScopedAnchorRepository(manager)
+        key, checkpoint = _surface("checkpoint")
+        if surface == "checkpoint":
+            _, candidate = _t008_forged_envelope(surface)
+            error = _t008_capture_secret_rejection(
+                lambda: repository.compare_and_set_opaque_checkpoint(key, candidate, expected_revision=0)
+            )
+            assert _row_count(manager, "LeveragedEtfAnchorState") == 0
+        else:
+            repository.compare_and_set_opaque_checkpoint(key, checkpoint, expected_revision=0)
+            _, finalized = _surface("finalized")
+            if surface == "finalized":
+                candidate = finalized.model_copy(update={"payload": _t008_forged_payload(finalized)})
+                error = _t008_capture_secret_rejection(
+                    lambda: repository.finalize_opaque_if_absent(key, candidate, expected_revision=1)
+                )
+                assert repository.load_opaque(key) == checkpoint
+            else:
+                repository.finalize_opaque_if_absent(key, finalized, expected_revision=1)
+                _, observation = _t008_forged_envelope(surface)
+                candidate = observation
+                error = _t008_capture_secret_rejection(
+                    lambda: repository.append_opaque_revision_observation(key, candidate)
+                )
+                assert _row_count(manager, "LeveragedEtfAnchorRevisionObservation") == 0
+                assert repository.opaque_revision_observations(key) == ()
+        _t008_assert_secret_safe(error, candidate.payload.payload_json)
+    finally:
+        manager.engine.dispose()
+
+
+def _t008_inject_hash_valid_secret(db_path: Path, surface: str, pair_id: str, cycle_id: str) -> str:
+    table_name = (
+        "LeveragedEtfAnchorRevisionObservation"
+        if surface == "observation"
+        else "LeveragedEtfAnchorState"
+    )
+    trigger_name = {
+        "checkpoint": None,
+        "finalized": "lepf_anchor_finalized_no_update",
+        "observation": "lepf_anchor_observation_no_update",
+    }[surface]
+    with sqlite3.connect(db_path) as connection:
+        if trigger_name is not None:
+            connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        select_fields = (
+            "payload_json, evidence_hash, observed_at_utc"
+            if surface == "observation"
+            else "payload_json, evidence_hash, NULL"
+        )
+        row = connection.execute(
+            f'SELECT {select_fields} FROM "{table_name}" WHERE pair_id = ? AND cycle_id = ?',
+            (pair_id, cycle_id),
+        ).fetchone()
+        value = json.loads(row[0])
+        value["provider_state"] = {
+            "history": [
+                {
+                    _T008_API_KEY_FIELD: _T008_API_KEY_VALUE,
+                    _T008_PKCS8_FIELD: _T008_PKCS8_VALUE,
+                }
+            ]
+        }
+        payload_json, payload_hash = _canonical_json_hash(value)
+        identity_sql = "pair_id = ? AND cycle_id = ?"
+        identity_parameters = [pair_id, cycle_id]
+        if surface == "observation":
+            identity_sql += " AND evidence_hash = ? AND observed_at_utc = ?"
+            identity_parameters.extend((row[1], row[2]))
+        connection.execute(
+            f'UPDATE "{table_name}" SET payload_json = ?, payload_hash = ? '
+            f"WHERE {identity_sql}",
+            (payload_json, payload_hash, *identity_parameters),
+        )
+        if trigger_name is not None:
+            connection.execute(SQLITE_GUARD_DDL[trigger_name])
+    return payload_json
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_t008_hash_valid_legacy_secret_reopen_error_is_redacted(tmp_path: Path, surface: str):
+    db_path = tmp_path / f"redacted-legacy-secret-{surface}.sqlite"
+    key = _seed_anchor_surface(db_path, surface)
+    payload_json = _t008_inject_hash_valid_secret(db_path, surface, key.pair_id, key.cycle_id)
+
+    reopened = _open_manager(db_path)
+    try:
+        repository = PairScopedAnchorRepository(reopened)
+        if surface == "observation":
+            operation = lambda: repository.opaque_revision_observations(key)
+        else:
+            operation = lambda: repository.load_opaque(key)
+        error = _t008_capture_secret_rejection(operation)
+        _t008_assert_secret_safe(error, payload_json)
+    finally:
+        reopened.engine.dispose()
