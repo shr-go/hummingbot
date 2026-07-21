@@ -113,6 +113,28 @@ def _reconciliation_event(
     return JournalEventV1.model_validate(serialized)
 
 
+def _state_transition_event(
+    event_id: str,
+    target_state: str,
+    *,
+    created_at_utc: str,
+) -> JournalEventV1:
+    return JournalEventV1.model_validate(
+        {
+            "schema_version": 1,
+            "event_id": event_id,
+            "event_type": "STATE_TRANSITION",
+            "payload": {
+                "schema_version": 1,
+                "kind": "STATE_TRANSITION",
+                "reason": "test recovery terminal",
+                "target_state": target_state,
+            },
+            "created_at_utc": created_at_utc,
+        }
+    )
+
+
 def _no_fill_proof(
     *,
     proof_id: str = "proof-t005-no-fill",
@@ -198,6 +220,30 @@ def _require_episode_contract():
     if status_type is None or record_type is None:
         pytest.skip("T005 exposure episode audit contract is not implemented yet")
     return status_type, record_type
+
+
+def test_t005_legacy_replay_provenance_is_not_a_public_reconciliation_field():
+    _, proof_type = _require_reconciliation_contract()
+    payload_type = durable_contract.ReconciliationJournalPayloadV1
+    schema = payload_type.model_json_schema()
+
+    assert "legacy_without_evidence_state" not in schema.get("properties", {})
+    proof = proof_type.model_validate(_no_fill_proof())
+    payload = payload_type.model_validate(
+        {
+            "schema_version": 1,
+            "kind": "RECONCILIATION",
+            "identity": _reconciliation_event(
+                _initial(),
+                "event-t005-schema-provenance",
+                outcome="CONSISTENT_NO_FILL",
+            ).payload.identity.model_dump(mode="json"),
+            "outcome": "CONSISTENT_NO_FILL",
+            "evidence_state": "PROVEN_NO_FILL",
+            "proven_no_fill": proof.model_dump(mode="json"),
+        }
+    )
+    assert "legacy_without_evidence_state" not in payload.model_dump(mode="json")
 
 
 @pytest.mark.parametrize("outcome", ("UNKNOWN", "NOT_FOUND"))
@@ -600,6 +646,75 @@ def test_t005_zero_fill_terminal_status_requires_proof_and_keeps_late_fill_open(
         manager.engine.dispose()
 
 
+@pytest.mark.parametrize("outcome", ("CANCELED", "EXPIRED", "REJECTED"))
+def test_t005_partial_fill_terminal_reconciliation_requires_exact_cumulative(outcome: str, tmp_path: Path):
+    manager = _open_manager(tmp_path / f"exact-terminal-{outcome.lower()}.sqlite")
+    try:
+        repository = LeveragedEtfJournalRepository(manager)
+        initial = _initial()
+        repository.create_executor(initial)
+        current = _prepare_unknown(repository, initial, event_prefix=f"t005-exact-{outcome.lower()}")
+        exchange_order_id = f"exchange-t005-exact-{outcome.lower()}"
+        current = _append_fact(
+            repository,
+            current,
+            _reconciliation_event(
+                initial,
+                f"event-t005-exact-{outcome.lower()}-unknown",
+                outcome="UNKNOWN",
+                exchange_order_id=exchange_order_id,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.FILL,
+                f"event-t005-exact-{outcome.lower()}-partial",
+                logical_quantity="2",
+                intent_id="intent-t005-unknown",
+                client_order_id="client-t005-unknown",
+                exchange_order_id=exchange_order_id,
+                exchange_trade_id=f"trade-t005-exact-{outcome.lower()}",
+                fill_quantity="0.5",
+                order_cumulative_filled_quantity="0.5",
+                leg_cumulative_filled_quantity="0.5",
+                outcome="PARTIAL",
+                created_at_utc="2026-07-17T14:01:08.000000Z",
+            ),
+        )
+
+        for index, wrong_cumulative in enumerate(("0.4", "0.6"), start=1):
+            _assert_fact_rejected_atomically(
+                repository,
+                initial.executor_id,
+                _reconciliation_event(
+                    initial,
+                    f"event-t005-exact-{outcome.lower()}-wrong-{index}",
+                    outcome=outcome,
+                    exchange_order_id=exchange_order_id,
+                    cumulative=wrong_cumulative,
+                    created_at_utc=f"2026-07-17T14:01:{8 + index:02d}.000000Z",
+                ),
+            )
+
+        exact = _reconciliation_event(
+            initial,
+            f"event-t005-exact-{outcome.lower()}-terminal",
+            outcome=outcome,
+            exchange_order_id=exchange_order_id,
+            cumulative="0.5",
+            created_at_utc="2026-07-17T14:01:11.000000Z",
+        )
+        current = _append_fact(repository, current, exact)
+        assert exact.payload.terminal is True
+        assert current.etf_filled_quantity == Decimal("0.5")
+        assert repository.incomplete_intents(initial.executor_id) == ()
+    finally:
+        manager.engine.dispose()
+
+
 def test_t005_proven_no_fill_rejects_sweeps_before_submit_uncertainty(tmp_path: Path):
     _require_reconciliation_contract()
     manager = _open_manager(tmp_path / "proof-before-uncertainty.sqlite")
@@ -621,6 +736,88 @@ def test_t005_proven_no_fill_rejects_sweeps_before_submit_uncertainty(tmp_path: 
 
         _assert_fact_rejected_atomically(repository, initial.executor_id, event)
         assert repository.load_snapshot(initial.executor_id) == current
+    finally:
+        manager.engine.dispose()
+
+
+def test_t005_cancel_confirmed_unknown_then_proven_no_fill_still_aborts(tmp_path: Path):
+    manager = _open_manager(tmp_path / "cancel-unknown-proven-no-fill.sqlite")
+    try:
+        repository = LeveragedEtfJournalRepository(manager)
+        initial = _initial()
+        repository.create_executor(initial)
+        current = _prepare_unknown(repository, initial)
+        cancel_identity = {
+            "logical_quantity": "2",
+            "action": "CANCEL",
+            "leg": "ETF",
+            "intent_id": "intent-t005-cancel-ordering",
+            "client_order_id": "client-t005-cancel-ordering",
+        }
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                "event-t005-cancel-ordering-prepared",
+                created_at_utc="2026-07-17T14:01:04.100000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.CANCEL_REQUESTED,
+                "event-t005-cancel-ordering-requested",
+                order_cumulative_filled_quantity="0",
+                target_intent_id="intent-t005-unknown",
+                target_client_order_id="client-t005-unknown",
+                created_at_utc="2026-07-17T14:01:04.200000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.CANCEL_CONFIRMED,
+                "event-t005-cancel-ordering-confirmed",
+                order_cumulative_filled_quantity="0",
+                target_intent_id="intent-t005-unknown",
+                target_client_order_id="client-t005-unknown",
+                created_at_utc="2026-07-17T14:01:04.300000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _reconciliation_event(
+                initial,
+                "event-t005-cancel-ordering-unknown",
+                outcome="UNKNOWN",
+                created_at_utc="2026-07-17T14:01:04.400000Z",
+            ),
+        )
+        assert current.state.value == "RECONCILING"
+
+        current = _append_fact(
+            repository,
+            current,
+            _reconciliation_event(
+                initial,
+                "event-t005-cancel-ordering-proven",
+                outcome="CONSISTENT_NO_FILL",
+                evidence_state="PROVEN_NO_FILL",
+                proven_no_fill=_no_fill_proof(proof_id="proof-t005-cancel-ordering"),
+            ),
+        )
+        assert current.state.value == "ABORTED_NO_FILL"
+        assert repository.incomplete_intents(initial.executor_id) == ()
     finally:
         manager.engine.dispose()
 
@@ -1041,6 +1238,19 @@ def test_t005_authoritative_fill_reopens_legacy_aborted_no_fill_and_replays(tmp_
         assert tuple(value.intent_id for value in reopened_repository.incomplete_intents(initial.executor_id)) == (
             "intent-t005-unknown",
         )
+        late_created = _fact_event(
+            initial,
+            JournalEventType.ORDER_CREATED,
+            "event-t005-legacy-aborted-late-created",
+            logical_quantity="2",
+            intent_id="intent-t005-unknown",
+            client_order_id="client-t005-unknown",
+            exchange_order_id="exchange-t005-legacy-aborted-late",
+            created_at_utc="2026-07-17T14:01:08.000000Z",
+        )
+        repaired = _append_fact(reopened_repository, current, late_created)
+        assert repaired.state.value == "MAKER_WORKING"
+        assert repaired.close_reason is None
         late_fill = _fact_event(
             initial,
             JournalEventType.FILL,
@@ -1054,7 +1264,78 @@ def test_t005_authoritative_fill_reopens_legacy_aborted_no_fill_and_replays(tmp_
             order_cumulative_filled_quantity="0.5",
             leg_cumulative_filled_quantity="0.5",
             outcome="PARTIAL",
+            created_at_utc="2026-07-17T14:01:08.100000Z",
+        )
+        repaired = _append_fact(reopened_repository, repaired, late_fill)
+        assert repaired.state.value == "STOCK_HEDGE_PENDING"
+        assert repaired.close_reason is None
+    finally:
+        reopened.engine.dispose()
+
+    replayed = _open_manager(db_path)
+    try:
+        replayed_repository = LeveragedEtfJournalRepository(replayed)
+        assert replayed_repository.replay(initial.executor_id) == repaired
+        assert replayed_repository.load_snapshot(initial.executor_id) == repaired
+    finally:
+        replayed.engine.dispose()
+
+
+def test_t005_authoritative_fill_reopens_legacy_failed_safe_and_replays(tmp_path: Path):
+    db_path = tmp_path / "legacy-failed-safe-late-fill.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial()
+    repository.create_executor(initial)
+    current = _prepare_unknown(repository, initial)
+    legacy_event_id = "event-t005-legacy-failed-safe-no-fill"
+    current = _append_fact(
+        repository,
+        current,
+        _reconciliation_event(
+            initial,
+            legacy_event_id,
+            outcome="CONSISTENT_NO_FILL",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=_no_fill_proof(proof_id="proof-t005-legacy-failed-safe"),
+        ),
+    )
+    current = _append_fact(
+        repository,
+        current,
+        _state_transition_event(
+            "event-t005-legacy-failed-safe-terminal",
+            "FAILED_SAFE",
             created_at_utc="2026-07-17T14:01:08.000000Z",
+        ),
+    )
+    assert current.state.value == "FAILED_SAFE"
+    assert current.close_reason == "test recovery terminal"
+    manager.engine.dispose()
+
+    _downgrade_journal_to_20260721(db_path, {legacy_event_id})
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert tuple(value.intent_id for value in reopened_repository.incomplete_intents(initial.executor_id)) == (
+            "intent-t005-unknown",
+        )
+        late_fill = _fact_event(
+            initial,
+            JournalEventType.FILL,
+            "event-t005-legacy-failed-safe-late-fill",
+            logical_quantity="2",
+            intent_id="intent-t005-unknown",
+            client_order_id="client-t005-unknown",
+            exchange_order_id="exchange-t005-legacy-failed-safe-late",
+            exchange_trade_id="trade-t005-legacy-failed-safe-late",
+            fill_quantity="0.5",
+            order_cumulative_filled_quantity="0.5",
+            leg_cumulative_filled_quantity="0.5",
+            outcome="PARTIAL",
+            created_at_utc="2026-07-17T14:01:09.000000Z",
         )
         repaired = _append_fact(reopened_repository, current, late_fill)
         assert repaired.state.value == "STOCK_HEDGE_PENDING"
@@ -1066,7 +1347,6 @@ def test_t005_authoritative_fill_reopens_legacy_aborted_no_fill_and_replays(tmp_
     try:
         replayed_repository = LeveragedEtfJournalRepository(replayed)
         assert replayed_repository.replay(initial.executor_id) == repaired
-        assert replayed_repository.load_snapshot(initial.executor_id) == repaired
     finally:
         replayed.engine.dispose()
 
@@ -1203,6 +1483,45 @@ def test_t005_exposure_episode_is_append_only_restart_visible_and_snapshot_neutr
         )
         assert reopened_repository.compare_and_append_exposure_episode(next_episode, expected_revision=0) == next_episode
         assert reopened_repository.active_exposure_episode(initial.executor_id) == next_episode
+    finally:
+        reopened.engine.dispose()
+
+
+def test_t005_unfinished_exposure_episode_is_discovered_after_process_reopen(tmp_path: Path):
+    _, record_type = _require_episode_contract()
+    db_path = tmp_path / "unfinished-episode-reopen.sqlite"
+    manager = _open_manager(db_path)
+    repository = LeveragedEtfJournalRepository(manager)
+    initial = _initial()
+    repository.create_executor(initial)
+    started = _episode_record(record_type, initial, episode_id="episode-t005-unfinished-reopen")
+    progressed = _episode_record(
+        record_type,
+        initial,
+        episode_id=started.episode_id,
+        revision=2,
+        process_boot_id=started.process_boot_id,
+        latest_monotonic_elapsed_ms=37,
+        recorded_at_utc=EPISODE_PROGRESS_AT,
+    )
+    repository.compare_and_append_exposure_episode(started, expected_revision=0)
+    repository.compare_and_append_exposure_episode(progressed, expected_revision=1)
+    manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.active_exposure_episode(initial.executor_id) == progressed
+        assert reopened_repository.unfinished_exposure_episodes(initial.executor_id) == (progressed,)
+        assert reopened_repository.exposure_episode_records(initial.executor_id, started.episode_id) == (
+            started,
+            progressed,
+        )
+        assert progressed.t0_utc == started.t0_utc
+        assert progressed.hedge_phase_deadline_ms == started.hedge_phase_deadline_ms
+        assert progressed.rollback_phase_deadline_ms == started.rollback_phase_deadline_ms
+        assert progressed.unhedged_response_deadline_ms == started.unhedged_response_deadline_ms
+        assert progressed.latest_monotonic_elapsed_ms == 37
     finally:
         reopened.engine.dispose()
 
