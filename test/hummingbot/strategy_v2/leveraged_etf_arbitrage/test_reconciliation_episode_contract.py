@@ -212,6 +212,129 @@ def _downgrade_journal_to_20260721(db_path: Path, legacy_reconciliation_event_id
         connection.execute("UPDATE Metadata SET value = '20260721' WHERE key = 'local_db_version'")
 
 
+def _build_pre_v3_reverse_cancel_history(db_path: Path, *, unversioned_legacy: bool):
+    manager = _open_manager(db_path)
+    try:
+        repository = LeveragedEtfJournalRepository(manager)
+        initial = _initial()
+        repository.create_executor(initial)
+        current = _prepare_unknown(repository, initial, event_prefix="t005-pre-v3")
+        cancel_identity = {
+            "logical_quantity": "2",
+            "action": "CANCEL",
+            "leg": "ETF",
+            "intent_id": "intent-t005-pre-v3-cancel",
+            "client_order_id": "client-t005-pre-v3-cancel",
+        }
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                "event-t005-pre-v3-cancel-prepared",
+                created_at_utc="2026-07-17T14:01:04.100000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.CANCEL_REQUESTED,
+                "event-t005-pre-v3-cancel-requested",
+                order_cumulative_filled_quantity="0",
+                target_intent_id="intent-t005-unknown",
+                target_client_order_id="client-t005-unknown",
+                created_at_utc="2026-07-17T14:01:04.200000Z",
+                **cancel_identity,
+            ),
+        )
+        maker_terminal_id = "event-t005-pre-v3-maker-proven"
+        current = _append_fact(
+            repository,
+            current,
+            _reconciliation_event(
+                initial,
+                maker_terminal_id,
+                outcome="CONSISTENT_NO_FILL",
+                evidence_state="PROVEN_NO_FILL",
+                proven_no_fill=_no_fill_proof(proof_id="proof-t005-pre-v3"),
+            ),
+        )
+        transition_id = "event-t005-pre-v3-reconciling"
+        current = _append_fact(
+            repository,
+            current,
+            _state_transition_event(
+                transition_id,
+                "RECONCILING",
+                created_at_utc="2026-07-17T14:01:07.500000Z",
+            ),
+        )
+        cancel_terminal_id = "event-t005-pre-v3-cancel-confirmed"
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.CANCEL_CONFIRMED,
+                cancel_terminal_id,
+                order_cumulative_filled_quantity="0",
+                target_intent_id="intent-t005-unknown",
+                target_client_order_id="client-t005-unknown",
+                created_at_utc="2026-07-17T14:01:08.000000Z",
+                **cancel_identity,
+            ),
+        )
+        assert current.state.value == "ABORTED_NO_FILL"
+    finally:
+        manager.engine.dispose()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER lepf_journal_no_update")
+        rows = connection.execute(
+            "SELECT event_id, payload_json FROM LeveragedEtfJournalEvent ORDER BY sequence"
+        ).fetchall()
+        final_snapshot = None
+        for event_id, payload_json in rows:
+            mutation = json.loads(payload_json)
+            if unversioned_legacy:
+                mutation.pop("reducer_semantics_version", None)
+            else:
+                mutation["reducer_semantics_version"] = 2
+            if event_id == maker_terminal_id:
+                mutation["snapshot_after"].update({"state": "MAKER_WORKING", "close_reason": None})
+                if unversioned_legacy:
+                    mutation["event"]["payload"].pop("evidence_state")
+                    mutation["event"]["payload"].pop("proven_no_fill")
+            elif event_id == transition_id:
+                mutation["snapshot_before"].update({"state": "MAKER_WORKING", "close_reason": None})
+            elif event_id == cancel_terminal_id:
+                mutation["snapshot_after"].update({"state": "MAKER_CANCEL_PENDING", "close_reason": None})
+                final_snapshot = mutation["snapshot_after"]
+            _, mutation["snapshot_before_hash"] = _canonical_json_hash(mutation["snapshot_before"])
+            _, mutation["snapshot_after_hash"] = _canonical_json_hash(mutation["snapshot_after"])
+            rewritten_json, rewritten_hash = _canonical_json_hash(mutation)
+            connection.execute(
+                "UPDATE LeveragedEtfJournalEvent SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+                (rewritten_json, rewritten_hash, event_id),
+            )
+        assert final_snapshot is not None
+        snapshot_json, snapshot_hash = _canonical_json_hash(final_snapshot)
+        connection.execute(
+            """
+            UPDATE LeveragedEtfExecutorSnapshot
+            SET state = ?, snapshot_json = ?, snapshot_hash = ?
+            WHERE executor_id = ?
+            """,
+            ("MAKER_CANCEL_PENDING", snapshot_json, snapshot_hash, initial.executor_id),
+        )
+        connection.executescript(SQLITE_GUARD_DDL["lepf_journal_no_update"])
+    return initial, type(current).model_validate(final_snapshot)
+
+
 def _require_reconciliation_contract():
     evidence_type = getattr(durable_contract, "ReconciliationEvidenceState", None)
     proof_type = getattr(durable_contract, "ProvenNoFillEvidenceV1", None)
@@ -1372,6 +1495,26 @@ def test_t005_legacy_prefix_replays_a_later_same_quantity_intent(tmp_path: Path)
             "intent-t005-unknown",
             "intent-t005-legacy-prefix-next",
         )
+    finally:
+        reopened.engine.dispose()
+
+
+@pytest.mark.parametrize("unversioned_legacy", (False, True), ids=("v2", "unversioned-legacy"))
+def test_t005_pre_v3_reverse_cancel_history_replays_exact_snapshot(
+    tmp_path: Path,
+    unversioned_legacy: bool,
+):
+    db_path = tmp_path / f"pre-v3-reverse-cancel-{unversioned_legacy}.sqlite"
+    initial, expected = _build_pre_v3_reverse_cancel_history(
+        db_path,
+        unversioned_legacy=unversioned_legacy,
+    )
+
+    reopened = _open_manager(db_path)
+    try:
+        repository = LeveragedEtfJournalRepository(reopened)
+        assert repository.replay(initial.executor_id) == expected
+        assert repository.load_snapshot(initial.executor_id) == expected
     finally:
         reopened.engine.dispose()
 
