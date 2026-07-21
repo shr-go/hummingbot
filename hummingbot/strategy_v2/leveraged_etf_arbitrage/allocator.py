@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, localcontext
 from enum import Enum
 from typing import Any
@@ -42,6 +42,9 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.state import (
 LATTICE_DENOMINATOR = 1_000_000
 _BASIS_POINTS = Decimal("10000")
 _ZERO = Decimal("0")
+_DEFAULT_MAKER_FEE_BP = _ZERO
+_DEFAULT_TAKER_FEE_BP = Decimal("4")
+_DEFAULT_MAKER_SLIPPAGE_BP_PER_FILL = Decimal("2")
 
 
 class AllocationInputError(ValueError):
@@ -291,10 +294,43 @@ class AccountRiskSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenExecutionCosts:
+    """Validated F003 execution costs frozen with an allocation snapshot.
+
+    The defaults preserve the documented legacy allocator economics only when
+    the caller leaves this frozen input at its default value.
+    """
+
+    maker_fee_bp: Decimal = _DEFAULT_MAKER_FEE_BP
+    taker_fee_bp: Decimal = _DEFAULT_TAKER_FEE_BP
+    maker_slippage_bp_per_fill: Decimal = _DEFAULT_MAKER_SLIPPAGE_BP_PER_FILL
+
+    def __post_init__(self) -> None:
+        _decimal(self.maker_fee_bp, "maker fee bp", nonnegative=True)
+        _decimal(self.taker_fee_bp, "taker fee bp", nonnegative=True)
+        _decimal(self.maker_slippage_bp_per_fill, "maker slippage bp per fill", nonnegative=True)
+
+    @classmethod
+    def from_strategy_config(cls, source: object) -> "FrozenExecutionCosts":
+        """Freeze the already-validated F003 ``StrategyConfig`` costs."""
+
+        from hummingbot.strategy_v2.leveraged_etf_arbitrage.config import StrategyConfig
+
+        if not isinstance(source, StrategyConfig):
+            raise AllocationInputError("source must be StrategyConfig")
+        return cls(
+            maker_fee_bp=source.maker_fee_bp,
+            taker_fee_bp=source.taker_fee_bp,
+            maker_slippage_bp_per_fill=source.maker_slippage_bp_per_fill,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenAllocationSnapshot:
     account: AccountRiskSnapshot
     pairs: tuple[FrozenPair, ...]
     max_total_notional_ratio: Decimal
+    execution_costs: FrozenExecutionCosts = field(default_factory=FrozenExecutionCosts)
     stale: bool = False
 
     def __post_init__(self) -> None:
@@ -308,6 +344,8 @@ class FrozenAllocationSnapshot:
         if len(set(pair_ids)) != len(pair_ids):
             raise AllocationInputError("allocation snapshot contains duplicate pair ids")
         _decimal(self.max_total_notional_ratio, "maximum total notional ratio", positive=True)
+        if not isinstance(self.execution_costs, FrozenExecutionCosts):
+            raise AllocationInputError("allocation snapshot execution costs must be frozen")
         if type(self.stale) is not bool:
             raise AllocationInputError("allocation snapshot stale must be a bool")
 
@@ -524,7 +562,7 @@ class PortfolioAllocator:
             if requested <= current[pair.pair_id]:
                 caps[pair.pair_id] = requested
                 continue
-            probe = self._probe_net_bp(pair, requested, current[pair.pair_id])
+            probe = self._probe_net_bp(pair, requested, current[pair.pair_id], snapshot.execution_costs)
             caps[pair.pair_id] = self._supported_cap(
                 pair,
                 probe,
@@ -554,13 +592,19 @@ class PortfolioAllocator:
         supported = max(candidates) * equity
         return max(current, min(upper, supported))
 
-    def _probe_net_bp(self, pair: FrozenPair, requested: Decimal, current: Decimal) -> Decimal | None:
+    def _probe_net_bp(
+        self,
+        pair: FrozenPair,
+        requested: Decimal,
+        current: Decimal,
+        execution_costs: FrozenExecutionCosts,
+    ) -> Decimal | None:
         target = self._target_for_gross(pair, requested)
         etf_delta = max(_ZERO, abs(target[0]) - abs(pair.etf.current_quantity))
         stock_delta = max(_ZERO, abs(target[1]) - abs(pair.stock.current_quantity))
         if requested <= current or etf_delta == 0 or stock_delta == 0:
             return None
-        probe = self._minimum_slice(pair, etf_delta, stock_delta)
+        probe = self._minimum_slice(pair, etf_delta, stock_delta, execution_costs)
         if probe is None:
             return None
         return probe[2]
@@ -580,7 +624,12 @@ class PortfolioAllocator:
             pair_id = pair.pair_id
             if caps[pair_id] <= current[pair_id] or pair_id in skipped:
                 continue
-            prepared = self._prepare_pair_candidate(pair, caps[pair_id], current[pair_id])
+            prepared = self._prepare_pair_candidate(
+                pair,
+                caps[pair_id],
+                current[pair_id],
+                snapshot.execution_costs,
+            )
             if not prepared.exposure_increasing or prepared.canonical_slice is None:
                 continue
             try:
@@ -699,7 +748,9 @@ class PortfolioAllocator:
                 if cap > current[pair.pair_id]
                 else cap
             )
-            pair_candidates.append(self._evaluate_pair(pair, target, current[pair.pair_id]))
+            pair_candidates.append(
+                self._evaluate_pair(pair, target, current[pair.pair_id], snapshot.execution_costs)
+            )
 
         im_unmodeled, mm_unmodeled = self._unmodeled_residuals(snapshot, pairs)
         max_modeled_im = sum((pair.max_state_initial_margin for pair in pair_candidates), _ZERO)
@@ -887,6 +938,7 @@ class PortfolioAllocator:
         pair: FrozenPair,
         etf_delta: Decimal,
         stock_delta: Decimal,
+        execution_costs: FrozenExecutionCosts,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
         """Return the smallest legal probe as ETF qty, stock qty, g, and VWAP."""
 
@@ -924,17 +976,18 @@ class PortfolioAllocator:
             else:
                 low = mid + 1
         quantity = Decimal(low) * pair.etf.quantity_step
-        return self._slice_details(pair, quantity, etf_delta, stock_delta)
+        return self._slice_details(pair, quantity, etf_delta, stock_delta, execution_costs)
 
     def _canonical_slice(
         self,
         pair: FrozenPair,
         etf_delta: Decimal,
         stock_delta: Decimal,
+        execution_costs: FrozenExecutionCosts,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
         """Find the unique greatest legal ETF quantity step for this candidate."""
 
-        minimum = self._minimum_slice(pair, etf_delta, stock_delta)
+        minimum = self._minimum_slice(pair, etf_delta, stock_delta, execution_costs)
         if minimum is None:
             return None
         minimum_etf = minimum[0]
@@ -947,14 +1000,20 @@ class PortfolioAllocator:
         while low < high:
             mid = (low + high + 1) // 2
             quantity = Decimal(mid) * pair.etf.quantity_step
-            details = self._slice_details(pair, quantity, etf_delta, stock_delta)
+            details = self._slice_details(pair, quantity, etf_delta, stock_delta, execution_costs)
             if details is None:
                 high = mid - 1
             else:
                 low = mid
                 best = details
         if best[0] != Decimal(low) * pair.etf.quantity_step:
-            details = self._slice_details(pair, Decimal(low) * pair.etf.quantity_step, etf_delta, stock_delta)
+            details = self._slice_details(
+                pair,
+                Decimal(low) * pair.etf.quantity_step,
+                etf_delta,
+                stock_delta,
+                execution_costs,
+            )
             if details is None:
                 raise AllocationInputError("canonical slice binary search lost its legal lower bound")
             best = details
@@ -966,6 +1025,7 @@ class PortfolioAllocator:
         etf_quantity: Decimal,
         etf_delta: Decimal,
         stock_delta: Decimal,
+        execution_costs: FrozenExecutionCosts,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
         """Return ``(ETF qty, stock qty, net bp, VWAP)`` when a slice is legal."""
 
@@ -1005,9 +1065,9 @@ class PortfolioAllocator:
                 stock_quantity=stock_quantity,
                 stock_contract_multiplier=pair.stock.contract_multiplier,
                 etf_contract_multiplier=pair.etf.contract_multiplier,
-                maker_fee_bp=_ZERO,
-                taker_fee_bp=Decimal("4"),
-                maker_slippage_bp_per_fill=Decimal("2"),
+                maker_fee_bp=execution_costs.maker_fee_bp,
+                taker_fee_bp=execution_costs.taker_fee_bp,
+                maker_slippage_bp_per_fill=execution_costs.maker_slippage_bp_per_fill,
             )
         except ValueError:
             return etf_quantity, stock_quantity, Decimal("-1"), stock_vwap
@@ -1083,6 +1143,7 @@ class PortfolioAllocator:
         pair: FrozenPair,
         requested_gross: Decimal,
         current_gross: Decimal,
+        execution_costs: FrozenExecutionCosts,
     ) -> _PreparedPairCandidate:
         """Freeze the executable target and canonical slice for one candidate."""
 
@@ -1105,15 +1166,21 @@ class PortfolioAllocator:
 
         canonical = None
         if increasing and etf_delta > 0 and stock_delta > 0:
-            canonical = self._canonical_slice(pair, etf_delta, stock_delta)
+            canonical = self._canonical_slice(pair, etf_delta, stock_delta, execution_costs)
         if increasing and canonical is None:
             # A candidate with no legal next maker slice is exactly the current
             # fully hedged target; it cannot reserve a fictitious small order.
             return _PreparedPairCandidate(current_etf, current_stock, current_gross, False, None)
         return _PreparedPairCandidate(target_etf, target_stock, actual_gross, increasing, canonical)
 
-    def _evaluate_pair(self, pair: FrozenPair, requested_gross: Decimal, current_gross: Decimal) -> PairCandidate:
-        prepared = self._prepare_pair_candidate(pair, requested_gross, current_gross)
+    def _evaluate_pair(
+        self,
+        pair: FrozenPair,
+        requested_gross: Decimal,
+        current_gross: Decimal,
+        execution_costs: FrozenExecutionCosts,
+    ) -> PairCandidate:
+        prepared = self._prepare_pair_candidate(pair, requested_gross, current_gross, execution_costs)
         target_etf = prepared.target_etf_quantity
         target_stock = prepared.target_stock_quantity
         actual_gross = prepared.target_gross_notional
