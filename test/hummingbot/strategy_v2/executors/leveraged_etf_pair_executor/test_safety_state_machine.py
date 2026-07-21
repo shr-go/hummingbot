@@ -5,10 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from hummingbot.client.config.client_config_map import ClientConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.event.events import MarketEvent, OrderCancelledEvent
-from hummingbot.model.leveraged_etf_repository import JournalEventType
+from hummingbot.model.leveraged_etf_repository import JournalEventType, LeveragedEtfJournalRepository
+from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.data_types import LeveragedEtfPairState
 from hummingbot.strategy_v2.executors.leveraged_etf_pair_executor.leveraged_etf_pair_executor import (
     LeveragedEtfPairExecutor,
@@ -205,6 +208,40 @@ async def test_cancel_unknown_stays_reconciling_and_escalates_at_absolute_deadli
 
 
 @pytest.mark.asyncio
+async def test_cancel_unknown_resolved_as_filled_never_claims_cancel_confirmation():
+    executor, connector, repository, clock = _executor()
+    await _start_maker(executor, connector)
+    connector.cancel_error = RuntimeError("cancel transport ambiguity")
+
+    executor.update_maker_safety(direction_stable=False)
+    await executor.control_task()
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "filled-while-cancel-unknown",
+            "100",
+            timestamp=1.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+    connector.statuses[executor.maker_client_order_id] = SimpleNamespace(
+        status="FILLED",
+        executed_quantity=Decimal("100"),
+        exchange_order_id="10001",
+    )
+
+    clock.advance_ms(1)
+    await executor.control_task()
+
+    assert executor.state is LeveragedEtfPairState.RECOVERY_REQUIRED
+    assert JournalEventType.CANCEL_CONFIRMED not in [event.event_type for event in repository.events]
+    assert len(connector.orders) == 1
+
+
+@pytest.mark.asyncio
 async def test_divergence_requires_post_improvement_consecutive_confirmations_and_resets_when_interrupted():
     executor, connector, _, _ = _executor()
     await _start_maker(executor, connector)
@@ -350,3 +387,223 @@ async def test_contradictory_reconciliation_facts_fail_closed_without_guessing_a
 
     assert executor.state is LeveragedEtfPairState.RECOVERY_REQUIRED
     assert len(connector.orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_not_found_requires_two_stable_sweeps_after_grace_before_proving_no_fill():
+    executor, connector, repository, clock = _executor()
+    await _start_maker(executor, connector)
+    maker = executor.maker_client_order_id
+    connector.statuses[maker] = SimpleNamespace(
+        status="NOT_FOUND",
+        executed_quantity=Decimal("0"),
+        exchange_order_id=None,
+    )
+
+    executor.mark_intent_submission_unknown(maker, "test two-sweep no-fill proof")
+    clock.advance_ms(1)
+    await executor.control_task()
+    assert not any(
+        event.event_type is JournalEventType.RECONCILIATION
+        and event.payload.outcome.value == "CONSISTENT_NO_FILL"
+        for event in repository.events
+    )
+    assert len(connector.orders) == 1
+
+    clock.advance_ms(1)
+    await executor.control_task()
+    terminal = [
+        event
+        for event in repository.events
+        if event.event_type is JournalEventType.RECONCILIATION
+        and event.payload.outcome.value == "CONSISTENT_NO_FILL"
+    ]
+    assert len(terminal) == 1
+    assert len(connector.orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_target_removal_or_reprice_cancels_the_existing_maker_without_replacement():
+    for update in (
+        {"target_etf_quantity": Decimal("0")},
+        {"reprice_requested": True},
+    ):
+        executor, connector, _, _ = _executor()
+        await _start_maker(executor, connector)
+
+        executor.update_maker_safety(**update)
+        await executor.control_task()
+
+        assert connector.cancel_calls == [("SNXX-USDT", executor.maker_client_order_id)]
+        assert len(connector.orders) == 1
+        assert executor.state is LeveragedEtfPairState.MAKER_CANCEL_PENDING
+
+
+@pytest.mark.asyncio
+async def test_maker_age_limit_cancels_without_waiting_for_another_safety_revision():
+    executor, connector, _, clock = _executor(policy=_policy(maker_max_age_ms=1))
+    await _start_maker(executor, connector)
+
+    clock.advance_ms(1)
+    await executor.control_task()
+
+    assert connector.cancel_calls == [("SNXX-USDT", executor.maker_client_order_id)]
+    assert len(connector.orders) == 1
+    assert executor.state is LeveragedEtfPairState.MAKER_CANCEL_PENDING
+
+
+@pytest.mark.asyncio
+async def test_stock_depth_loss_after_an_etf_fill_cancels_maker_before_any_new_stock_order():
+    executor, connector, _, _ = _executor()
+    await _start_maker(executor, connector)
+    original_price_getter = connector.get_price_by_type
+
+    def price_getter(trading_pair, price_type):
+        if trading_pair == "SNDK-USDT":
+            raise RuntimeError("stock depth unavailable")
+        return original_price_getter(trading_pair, price_type)
+
+    connector.get_price_by_type = price_getter
+    executor.process_order_filled_event(
+        MarketEvent.OrderFilled.value,
+        connector,
+        _fill_event(
+            executor.maker_client_order_id,
+            "stock-depth-loss",
+            "10",
+            timestamp=1.0,
+            trading_pair="SNXX-USDT",
+            side=TradeType.SELL,
+        ),
+    )
+
+    assert connector.cancel_calls == [("SNXX-USDT", executor.maker_client_order_id)]
+    assert len(connector.orders) == 1
+    assert executor.state is LeveragedEtfPairState.MAKER_CANCEL_PENDING
+
+
+@pytest.mark.asyncio
+async def test_trade_backed_unknown_reconciliation_uses_the_real_f004_journal_before_hedging(tmp_path):
+    manager = SQLConnectionManager(
+        ClientConfigAdapter(ClientConfigMap()),
+        SQLConnectionType.TRADE_FILLS,
+        db_path=str(tmp_path / "stable-reconciliation.sqlite"),
+    )
+    try:
+        timeline = []
+        clock = FakeClock()
+        connector = SafetyFakeConnector(timeline)
+        repository = LeveragedEtfJournalRepository(manager)
+        strategy = SimpleNamespace(connectors={"binance_perpetual": connector}, current_timestamp=1721224862.0)
+        executor = LeveragedEtfPairExecutor(
+            strategy=strategy,
+            config=_config(),
+            journal_repository=repository,
+            update_interval=0.01,
+            safety_policy=_policy(),
+            monotonic_clock=clock,
+        )
+        await _start_maker(executor, connector)
+        maker = executor.maker_client_order_id
+        connector.statuses[maker] = SimpleNamespace(
+            status="CANCELED",
+            executed_quantity=Decimal("10"),
+            exchange_order_id="10001",
+        )
+        connector.trades[("SNXX-USDT", "10001")] = (
+            SimpleNamespace(
+                trade_id="reconciled-etf-fill",
+                exchange_order_id="10001",
+                quantity=Decimal("10"),
+                price=Decimal("30"),
+            ),
+        )
+
+        executor.mark_intent_submission_unknown(maker, "test stable trade-backed reconciliation")
+        clock.advance_ms(1)
+        await executor.control_task()
+
+        snapshot = LeveragedEtfJournalRepository(manager).replay(executor.config.id)
+        events = [committed.event.event_type for committed in LeveragedEtfJournalRepository(manager).events(executor.config.id)]
+        stock_orders = [order for order in connector.orders if order["trading_pair"] == "SNDK-USDT"]
+        assert snapshot.state is LeveragedEtfPairState.STOCK_HEDGE_PENDING
+        assert snapshot.etf_filled_quantity == Decimal("10")
+        assert executor.state is LeveragedEtfPairState.STOCK_HEDGE_PENDING
+        assert len(stock_orders) == 1
+        assert stock_orders[0]["amount"] == Decimal("9.6")
+        assert events[-5:] == [
+            JournalEventType.RECONCILIATION,
+            JournalEventType.FILL,
+            JournalEventType.PREPARED,
+            JournalEventType.HEDGE_REQUESTED,
+            JournalEventType.RECONCILIATION,
+        ]
+    finally:
+        manager.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_late_fill_uses_the_real_f004_reconciliation_bridge_before_exact_rollback(tmp_path):
+    manager = SQLConnectionManager(
+        ClientConfigAdapter(ClientConfigMap()),
+        SQLConnectionType.TRADE_FILLS,
+        db_path=str(tmp_path / "cancel-late-fill.sqlite"),
+    )
+    try:
+        timeline = []
+        connector = SafetyFakeConnector(timeline)
+        repository = LeveragedEtfJournalRepository(manager)
+        strategy = SimpleNamespace(connectors={"binance_perpetual": connector}, current_timestamp=1721224862.0)
+        executor = LeveragedEtfPairExecutor(
+            strategy=strategy,
+            config=_config(),
+            journal_repository=repository,
+            update_interval=0.01,
+            safety_policy=_policy(),
+            monotonic_clock=FakeClock(),
+        )
+        await _start_maker(executor, connector)
+
+        executor.update_maker_safety(net_bp=Decimal("0"))
+        await executor.control_task()
+        executor.process_order_filled_event(
+            MarketEvent.OrderFilled.value,
+            connector,
+            _fill_event(
+                executor.maker_client_order_id,
+                "real-journal-late-etf-fill",
+                "10",
+                timestamp=1.0,
+                trading_pair="SNXX-USDT",
+                side=TradeType.SELL,
+            ),
+        )
+        executor.process_order_canceled_event(
+            MarketEvent.OrderCancelled.value,
+            connector,
+            OrderCancelledEvent(
+                timestamp=1.1,
+                order_id=executor.maker_client_order_id,
+                exchange_order_id="10001",
+            ),
+        )
+        await executor.control_task()
+
+        snapshot = LeveragedEtfJournalRepository(manager).replay(executor.config.id)
+        rollback = connector.orders[-1]
+        events = [committed.event.event_type for committed in LeveragedEtfJournalRepository(manager).events(executor.config.id)]
+        assert snapshot.state is LeveragedEtfPairState.ETF_ROLLBACK_PENDING
+        assert executor.state is LeveragedEtfPairState.ETF_ROLLBACK_PENDING
+        assert rollback["trading_pair"] == "SNXX-USDT"
+        assert rollback["amount"] == Decimal("10")
+        assert rollback["position_action"] is PositionAction.CLOSE
+        assert events[-6:] == [
+            JournalEventType.FILL,
+            JournalEventType.STATE_TRANSITION,
+            JournalEventType.CANCEL_CONFIRMED,
+            JournalEventType.RECONCILIATION,
+            JournalEventType.PREPARED,
+            JournalEventType.ROLLBACK_REQUESTED,
+        ]
+    finally:
+        manager.engine.dispose()
