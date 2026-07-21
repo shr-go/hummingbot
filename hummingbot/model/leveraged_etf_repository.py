@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Annotated, Any, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 from sqlalchemy import text
@@ -89,14 +89,25 @@ def _validate_utc_text(value: str, field_name: str) -> str:
     return value
 
 
-def _verify_canonical_json(payload_json: str, payload_hash: str, label: str) -> Any:
+def _verify_canonical_json(
+    payload_json: str,
+    payload_hash: str,
+    label: str,
+    *,
+    parser_error_factory: Optional[Callable[[], ValueError]] = None,
+) -> Any:
     def reject_non_finite_constant(value: str):
         raise ValueError(f"{label} contains non-finite JSON constant {value}")
 
+    redacted_error = None
     try:
         value = json.loads(payload_json, parse_constant=reject_non_finite_constant)
     except (TypeError, ValueError, json.JSONDecodeError) as exception:
-        raise ValueError(f"{label} contains malformed JSON") from exception
+        if parser_error_factory is None:
+            raise ValueError(f"{label} contains malformed JSON") from exception
+        redacted_error = parser_error_factory()
+    if redacted_error is not None:
+        raise redacted_error
     if _canonical_json(value) != payload_json:
         raise ValueError(f"{label} JSON is not canonical")
     if _sha256_text(payload_json) != payload_hash:
@@ -125,6 +136,11 @@ class _OpaqueAnchorSecretFieldError(ValueError):
         super().__init__("secret-bearing fields are not permitted in opaque anchor payload")
 
 
+class _OpaqueAnchorParserError(ValueError):
+    def __init__(self):
+        super().__init__("opaque anchor payload contains malformed JSON")
+
+
 def _redacted_opaque_anchor_validation_error(error: ValidationError) -> ValidationError:
     sanitized_errors = []
     for line_error in error.errors(include_url=False, include_input=False):
@@ -132,6 +148,8 @@ def _redacted_opaque_anchor_validation_error(error: ValidationError) -> Validati
         context_error = context.get("error") if isinstance(context, Mapping) else None
         if isinstance(context_error, _OpaqueAnchorSecretFieldError):
             sanitized_context_error = _OpaqueAnchorSecretFieldError()
+        elif isinstance(context_error, _OpaqueAnchorParserError) or line_error.get("type") == "json_invalid":
+            sanitized_context_error = _OpaqueAnchorParserError()
         else:
             message = str(line_error.get("msg", "opaque anchor validation failed"))
             if message.startswith("Value error, "):
@@ -153,6 +171,31 @@ def _redacted_opaque_anchor_validation_error(error: ValidationError) -> Validati
 
 class _SecretSafeOpaqueAnchorModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: Optional[bool] = None,
+        extra: Optional[Literal["allow", "ignore", "forbid"]] = None,
+        context: Optional[Any] = None,
+        by_alias: Optional[bool] = None,
+        by_name: Optional[bool] = None,
+    ) -> Self:
+        redacted_error = None
+        try:
+            return super().model_validate_json(
+                json_data,
+                strict=strict,
+                extra=extra,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationError as error:
+            redacted_error = _redacted_opaque_anchor_validation_error(error)
+        raise redacted_error
 
 
 def _secret_safe_opaque_anchor_model_validation(value: Any, handler):
@@ -184,8 +227,32 @@ def _contains_opaque_anchor_secret_rejection(error: BaseException) -> bool:
     return False
 
 
+def _contains_opaque_anchor_parser_rejection(error: BaseException) -> bool:
+    pending = [error]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, _OpaqueAnchorParserError):
+            return True
+        if isinstance(candidate, ValidationError):
+            for line_error in candidate.errors(include_url=False, include_input=False):
+                context = line_error.get("ctx")
+                context_error = context.get("error") if isinstance(context, Mapping) else None
+                if isinstance(context_error, _OpaqueAnchorParserError):
+                    return True
+        pending.extend((candidate.__cause__, candidate.__context__))
+    return False
+
+
 def _redacted_anchor_integrity_error(label: str) -> AnchorIntegrityError:
     return AnchorIntegrityError(f"anchor {label} integrity failure: secret-bearing opaque payload rejected")
+
+
+def _redacted_anchor_parser_integrity_error(label: str) -> AnchorIntegrityError:
+    return AnchorIntegrityError(f"anchor {label} integrity failure: malformed opaque payload JSON rejected")
 
 
 class CanonicalOpaquePayload(BaseModel):
@@ -977,7 +1044,12 @@ def _validate_canonical_anchor_payload_v2(
         raise ValueError("opaque anchor payload JSON must be a string")
     if type(payload_hash) is not str or _SHA256_HEX_PATTERN.fullmatch(payload_hash) is None:
         raise ValueError("opaque anchor payload hash is invalid")
-    value = _verify_canonical_json(payload_json, payload_hash, f"{kind} payload")
+    value = _verify_canonical_json(
+        payload_json,
+        payload_hash,
+        f"{kind} payload",
+        parser_error_factory=_OpaqueAnchorParserError,
+    )
     if not isinstance(value, Mapping):
         raise ValueError("opaque anchor payload must be a JSON object")
     _reject_opaque_anchor_secret_bearing_fields(value)
@@ -3549,6 +3621,8 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except Exception as exception:
             if _contains_opaque_anchor_secret_rejection(exception):
                 redacted_error = _redacted_anchor_integrity_error(f"{label} envelope")
+            elif _contains_opaque_anchor_parser_rejection(exception):
+                redacted_error = _redacted_anchor_parser_integrity_error(f"{label} envelope")
             else:
                 raise AnchorIntegrityError(f"anchor {label} envelope integrity failure: {exception}") from exception
         raise redacted_error
@@ -3658,6 +3732,8 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except Exception as exception:
             if _contains_opaque_anchor_secret_rejection(exception):
                 redacted_error = _redacted_anchor_integrity_error("state decode")
+            elif _contains_opaque_anchor_parser_rejection(exception):
+                redacted_error = _redacted_anchor_parser_integrity_error("state decode")
             else:
                 raise AnchorIntegrityError(
                     f"anchor state hash, version, or payload integrity failure: {exception}"
@@ -3694,6 +3770,8 @@ class PairScopedAnchorRepository(_TransactionalRepository):
         except Exception as exception:
             if _contains_opaque_anchor_secret_rejection(exception):
                 redacted_error = _redacted_anchor_integrity_error("observation decode")
+            elif _contains_opaque_anchor_parser_rejection(exception):
+                redacted_error = _redacted_anchor_parser_integrity_error("observation decode")
             else:
                 raise AnchorIntegrityError(
                     f"anchor observation hash, version, or payload integrity failure: {exception}"
