@@ -42,9 +42,6 @@ from hummingbot.strategy_v2.leveraged_etf_arbitrage.state import (
 LATTICE_DENOMINATOR = 1_000_000
 _BASIS_POINTS = Decimal("10000")
 _ZERO = Decimal("0")
-_DEFAULT_MAKER_FEE_BP = _ZERO
-_DEFAULT_TAKER_FEE_BP = Decimal("4")
-_DEFAULT_MAKER_SLIPPAGE_BP_PER_FILL = Decimal("2")
 
 
 class AllocationInputError(ValueError):
@@ -295,15 +292,12 @@ class AccountRiskSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class FrozenExecutionCosts:
-    """Validated F003 execution costs frozen with an allocation snapshot.
+    """Immutable F003 execution costs frozen with an allocation snapshot."""
 
-    The defaults preserve the documented legacy allocator economics only when
-    the caller leaves this frozen input at its default value.
-    """
-
-    maker_fee_bp: Decimal = _DEFAULT_MAKER_FEE_BP
-    taker_fee_bp: Decimal = _DEFAULT_TAKER_FEE_BP
-    maker_slippage_bp_per_fill: Decimal = _DEFAULT_MAKER_SLIPPAGE_BP_PER_FILL
+    maker_fee_bp: Decimal
+    taker_fee_bp: Decimal
+    maker_slippage_bp_per_fill: Decimal
+    _strategy_config_bound: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _decimal(self.maker_fee_bp, "maker fee bp", nonnegative=True)
@@ -318,11 +312,19 @@ class FrozenExecutionCosts:
 
         if not isinstance(source, StrategyConfig):
             raise AllocationInputError("source must be StrategyConfig")
-        return cls(
+        frozen = cls(
             maker_fee_bp=source.maker_fee_bp,
             taker_fee_bp=source.taker_fee_bp,
             maker_slippage_bp_per_fill=source.maker_slippage_bp_per_fill,
         )
+        object.__setattr__(frozen, "_strategy_config_bound", True)
+        return frozen
+
+    @property
+    def is_strategy_config_bound(self) -> bool:
+        """Whether this immutable value was created by the F003 adapter."""
+
+        return self._strategy_config_bound
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +332,7 @@ class FrozenAllocationSnapshot:
     account: AccountRiskSnapshot
     pairs: tuple[FrozenPair, ...]
     max_total_notional_ratio: Decimal
-    execution_costs: FrozenExecutionCosts = field(default_factory=FrozenExecutionCosts)
+    execution_costs: FrozenExecutionCosts
     stale: bool = False
 
     def __post_init__(self) -> None:
@@ -344,8 +346,8 @@ class FrozenAllocationSnapshot:
         if len(set(pair_ids)) != len(pair_ids):
             raise AllocationInputError("allocation snapshot contains duplicate pair ids")
         _decimal(self.max_total_notional_ratio, "maximum total notional ratio", positive=True)
-        if not isinstance(self.execution_costs, FrozenExecutionCosts):
-            raise AllocationInputError("allocation snapshot execution costs must be frozen")
+        if not isinstance(self.execution_costs, FrozenExecutionCosts) or not self.execution_costs.is_strategy_config_bound:
+            raise AllocationInputError("allocation snapshot execution costs must be frozen from StrategyConfig")
         if type(self.stale) is not bool:
             raise AllocationInputError("allocation snapshot stale must be a bool")
 
