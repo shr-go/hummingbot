@@ -892,15 +892,20 @@ class PortfolioAllocator:
 
         hedge = calculate_hedge_ratio(pair.stock_anchor, pair.etf_anchor, pair.etf_daily_multiplier)
         etf_price = self._entry_etf_price(pair)
-        stock_best = pair.stock_asks[0].price if self._stock_side(pair) is BookSide.BUY else pair.stock_bids[0].price
         etf_needed = max(
             pair.etf.min_quantity,
             pair.etf.min_notional / (etf_price * pair.etf.contract_multiplier),
         )
-        stock_needed = max(
-            pair.stock.min_quantity,
-            pair.stock.min_notional / (stock_best * pair.stock.contract_multiplier),
-        )
+        stock_needed = pair.stock.min_quantity
+        if self._stock_side(pair) is BookSide.SELL:
+            # A SELL VWAP cannot exceed the best bid, making this a safe
+            # lower bound on the quantity required for the actual VWAP minimum.
+            stock_needed = max(
+                stock_needed,
+                pair.stock.min_notional / (pair.stock_bids[0].price * pair.stock.contract_multiplier),
+            )
+        # A BUY VWAP can exceed the best ask, so that quote provides only an
+        # upper bound on required quantity; validate each candidate VWAP below.
         needed_for_stock = stock_needed * pair.stock.contract_multiplier / (pair.etf.contract_multiplier * hedge)
         minimum_etf = _ceil_to_step(max(etf_needed, needed_for_stock), pair.etf.quantity_step)
         maximum_etf = self._maximum_slice_etf_quantity(pair, etf_delta, stock_delta)
