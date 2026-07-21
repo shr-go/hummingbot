@@ -1,18 +1,20 @@
 """Native Strategy V2 executor for a leveraged ETF / stock perpetual pair.
 
-The executor deliberately owns only the entry path.  It persists every order
-intent before calling a connector, keeps the maker leg singular, and converts
-each accepted ETF fill into the smallest legal incremental stock hedge.  Exit,
-cancel, recovery, and restart orchestration are separate feature work.
+The executor persists every side effect before calling a connector, keeps the
+maker leg singular, and converts each accepted ETF fill into the smallest legal
+cumulative stock hedge.  It also owns the entry-safety cancellation, deadline,
+and exact rollback path; normal close/stop behavior remains separate work.
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
-from typing import Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
@@ -20,11 +22,13 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, PriceTyp
 from hummingbot.core.event.events import (
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
+    OrderCancelledEvent,
     OrderFilledEvent,
     SellOrderCreatedEvent,
 )
 from hummingbot.model.leveraged_etf_repository import (
     AcknowledgedJournalPayloadV1,
+    CancelJournalPayloadV1,
     FillJournalPayloadV1,
     HedgeJournalPayloadV1,
     JournalEventType,
@@ -35,6 +39,7 @@ from hummingbot.model.leveraged_etf_repository import (
     ReconciliationJournalPayloadV1,
     ReconciliationOutcome,
     RejectedJournalPayloadV1,
+    RollbackJournalPayloadV1,
     SideEffectIdentityV1,
     StateTransitionJournalPayloadV1,
     SubmitUnknownJournalPayloadV1,
@@ -76,10 +81,114 @@ class _OrderIntent:
     submitted: bool = False
     acknowledged: bool = False
     submission_unknown: bool = False
+    terminal: bool = False
+    unknown_since_monotonic: Optional[float] = None
+    reconciliation_sweeps: int = 0
+    last_sweep_monotonic: Optional[float] = None
+    last_sweep_signature: Optional[Tuple] = None
 
     @property
     def remaining_quantity(self) -> Decimal:
         return max(_ZERO, self.identity.order_quantity - self.filled_quantity)
+
+    @property
+    def pending_quantity(self) -> Decimal:
+        return _ZERO if self.terminal else self.remaining_quantity
+
+
+@dataclass
+class _CancelIntent:
+    identity: SideEffectIdentityV1
+    target: _OrderIntent
+    requested_at_monotonic: float
+    submission_unknown: bool = False
+    unknown_since_monotonic: Optional[float] = None
+    confirmed: bool = False
+    reconciliation_sweeps: int = 0
+    last_sweep_monotonic: Optional[float] = None
+    last_sweep_signature: Optional[Tuple] = None
+
+
+@dataclass
+class _MakerSafetyObservation:
+    net_bp: Decimal
+    direction_stable: bool
+    model_valid: bool
+    target_etf_quantity: Decimal
+    entry_permitted: bool
+    residual_bp: Optional[Decimal] = None
+    reprice_requested: bool = False
+    revision: int = 0
+
+
+@dataclass(frozen=True)
+class LeveragedEtfPairSafetyPolicy:
+    """Runtime-only safety inputs kept outside the frozen F004 executor DTO.
+
+    F004 deliberately persists only immutable execution facts.  These values are
+    supplied by the Strategy/Controller runtime and can therefore be exercised
+    with a deterministic monotonic clock without widening the wire contract.
+    """
+
+    executor_safety_interval_ms: int = 250
+    divergence_cancel_bp: Decimal = Decimal("3")
+    divergence_confirmations: int = 3
+    maker_max_age_ms: Optional[int] = None
+    unhedged_response_deadline_ms: int = 20_000
+    hedge_phase_deadline_ms: int = 10_000
+    hedge_submit_timeout_ms: int = 1_000
+    hedge_reconcile_timeout_ms: int = 5_000
+    hedge_max_attempts: int = 3
+    hedge_retry_backoff_ms: Tuple[int, ...] = (100, 250, 500)
+    rollback_submit_timeout_ms: int = 1_000
+    rollback_reconcile_timeout_ms: int = 5_000
+    rollback_phase_deadline_ms: int = 10_000
+    rollback_max_attempts: int = 3
+    rollback_retry_backoff_ms: Tuple[int, ...] = (100, 250, 500)
+    order_eventual_consistency_grace_ms: int = 2_000
+
+    def __post_init__(self):
+        positive_values = {
+            "executor_safety_interval_ms": self.executor_safety_interval_ms,
+            "unhedged_response_deadline_ms": self.unhedged_response_deadline_ms,
+            "hedge_phase_deadline_ms": self.hedge_phase_deadline_ms,
+            "hedge_submit_timeout_ms": self.hedge_submit_timeout_ms,
+            "hedge_reconcile_timeout_ms": self.hedge_reconcile_timeout_ms,
+            "hedge_max_attempts": self.hedge_max_attempts,
+            "rollback_submit_timeout_ms": self.rollback_submit_timeout_ms,
+            "rollback_reconcile_timeout_ms": self.rollback_reconcile_timeout_ms,
+            "rollback_phase_deadline_ms": self.rollback_phase_deadline_ms,
+            "rollback_max_attempts": self.rollback_max_attempts,
+            "order_eventual_consistency_grace_ms": self.order_eventual_consistency_grace_ms,
+        }
+        if self.maker_max_age_ms is not None:
+            positive_values["maker_max_age_ms"] = self.maker_max_age_ms
+        if any(not isinstance(value, int) or value <= 0 for value in positive_values.values()):
+            raise ValueError("executor safety durations and attempt limits must be positive integers")
+        if not isinstance(self.divergence_confirmations, int) or self.divergence_confirmations <= 0:
+            raise ValueError("divergence_confirmations must be a positive integer")
+        if not isinstance(self.divergence_cancel_bp, Decimal) or not self.divergence_cancel_bp.is_finite():
+            raise ValueError("divergence_cancel_bp must be a finite Decimal")
+        if self.divergence_cancel_bp < _ZERO:
+            raise ValueError("divergence_cancel_bp must be non-negative")
+        if self.hedge_phase_deadline_ms + self.rollback_phase_deadline_ms > self.unhedged_response_deadline_ms:
+            raise ValueError("hedge and rollback phases exceed the absolute unhedged deadline")
+        if self.hedge_phase_deadline_ms < (
+            self.hedge_submit_timeout_ms + self.order_eventual_consistency_grace_ms
+        ):
+            raise ValueError("hedge phase cannot contain one submit timeout and consistency grace")
+        if self.rollback_phase_deadline_ms < (
+            self.rollback_submit_timeout_ms + self.order_eventual_consistency_grace_ms
+        ):
+            raise ValueError("rollback phase cannot contain one submit timeout and consistency grace")
+        if len(self.hedge_retry_backoff_ms) < self.hedge_max_attempts - 1:
+            raise ValueError("hedge retry backoff does not cover all attempts")
+        if len(self.rollback_retry_backoff_ms) < self.rollback_max_attempts - 1:
+            raise ValueError("rollback retry backoff does not cover all attempts")
+        if any(not isinstance(value, int) or value <= 0 for value in self.hedge_retry_backoff_ms):
+            raise ValueError("hedge retry backoff values must be positive integers")
+        if any(not isinstance(value, int) or value <= 0 for value in self.rollback_retry_backoff_ms):
+            raise ValueError("rollback retry backoff values must be positive integers")
 
 
 class LeveragedEtfPairExecutor(ExecutorBase):
@@ -97,6 +206,8 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         update_interval: float = 1.0,
         max_retries: int = 10,
         journal_repository=None,
+        safety_policy: Optional[LeveragedEtfPairSafetyPolicy] = None,
+        monotonic_clock: Optional[Callable[[], float]] = None,
     ):
         connector_names = tuple(dict.fromkeys(config.connector_names))
         super().__init__(
@@ -119,17 +230,44 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         self._preflight_completed = False
         self._submission_halted = False
         self._maker_submission_started = False
+        self._safety_policy = safety_policy or LeveragedEtfPairSafetyPolicy()
+        self._monotonic_clock = monotonic_clock or time.monotonic
 
         self._contract_multipliers: Dict[Tuple[str, str], Decimal] = {}
         self._maker_intent: Optional[_OrderIntent] = None
         self._stock_intents: Dict[str, _OrderIntent] = {}
+        self._rollback_intents: Dict[str, _OrderIntent] = {}
+        self._cancel_intent: Optional[_CancelIntent] = None
         self._seen_trades: set[Tuple[str, str]] = set()
 
         self._etf_filled_quantity = _ZERO
         self._stock_filled_quantity = _ZERO
+        self._rollback_filled_quantity = _ZERO
         self._stock_hedge_target_quantity = _ZERO
         self._hedge_dust_quantity = _ZERO
         self._close_reason: Optional[str] = None
+        self._maker_terminal = False
+        self._maker_started_at_monotonic: Optional[float] = None
+        self._exposure_started_at_monotonic: Optional[float] = None
+        self._hedge_deadline_at_monotonic: Optional[float] = None
+        self._absolute_deadline_at_monotonic: Optional[float] = None
+        self._rollback_started_at_monotonic: Optional[float] = None
+        self._rollback_deadline_at_monotonic: Optional[float] = None
+        self._rollback_required = False
+        self._next_hedge_attempt_not_before = 0.0
+        self._next_rollback_attempt_not_before = 0.0
+        self._maker_safety = _MakerSafetyObservation(
+            net_bp=config.created_net_bp,
+            direction_stable=True,
+            model_valid=True,
+            target_etf_quantity=config.etf_target_quantity,
+            entry_permitted=True,
+        )
+        self._last_monitored_safety_revision = -1
+        self._initial_abs_residual_bp: Optional[Decimal] = None
+        self._best_abs_residual_bp: Optional[Decimal] = None
+        self._current_abs_residual_bp: Optional[Decimal] = None
+        self._divergence_consecutive_count = 0
 
     @property
     def state(self) -> LeveragedEtfPairState:
@@ -153,11 +291,24 @@ class LeveragedEtfPairExecutor(ExecutorBase):
 
     @property
     def stock_pending_quantity(self) -> Decimal:
-        return sum((intent.remaining_quantity for intent in self._stock_intents.values()), _ZERO)
+        return sum((intent.pending_quantity for intent in self._stock_intents.values()), _ZERO)
 
     @property
     def hedge_dust_quantity(self) -> Decimal:
         return self._hedge_dust_quantity
+
+    @property
+    def exposure_started_at(self) -> Optional[float]:
+        """The monotonic t0 for the current unhedged ETF exposure episode."""
+        return self._exposure_started_at_monotonic
+
+    @property
+    def hedge_deadline_at(self) -> Optional[float]:
+        return self._hedge_deadline_at_monotonic
+
+    @property
+    def absolute_deadline_at(self) -> Optional[float]:
+        return self._absolute_deadline_at_monotonic
 
     @property
     def filled_amount_quote(self) -> Decimal:
@@ -181,9 +332,64 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         self._submission_halted = True
         self._close_reason = "early stop requested; cancellation is outside the entry executor scope"
 
+    def update_maker_safety(
+        self,
+        *,
+        net_bp: Optional[Decimal] = None,
+        direction_stable: Optional[bool] = None,
+        model_valid: Optional[bool] = None,
+        target_etf_quantity: Optional[Decimal] = None,
+        entry_permitted: Optional[bool] = None,
+        residual_bp: Optional[Decimal] = None,
+        reprice_requested: Optional[bool] = None,
+    ) -> None:
+        """Accept the latest Controller-derived maker safety facts.
+
+        The Controller remains the source of opportunity, target, model, and
+        session facts.  This executor merely consumes one immutable observation
+        at a time and never invents a replacement maker after cancellation.
+        """
+        current = self._maker_safety
+        if net_bp is not None:
+            net_bp = Decimal(net_bp)
+            if not net_bp.is_finite():
+                raise ValueError("net_bp must be finite")
+        if target_etf_quantity is not None:
+            target_etf_quantity = Decimal(target_etf_quantity)
+            if not target_etf_quantity.is_finite() or target_etf_quantity < _ZERO:
+                raise ValueError("target_etf_quantity must be a finite non-negative Decimal")
+        if residual_bp is not None:
+            residual_bp = Decimal(residual_bp)
+            if not residual_bp.is_finite():
+                raise ValueError("residual_bp must be finite")
+        self._maker_safety = _MakerSafetyObservation(
+            net_bp=current.net_bp if net_bp is None else net_bp,
+            direction_stable=current.direction_stable if direction_stable is None else bool(direction_stable),
+            model_valid=current.model_valid if model_valid is None else bool(model_valid),
+            target_etf_quantity=(
+                current.target_etf_quantity if target_etf_quantity is None else target_etf_quantity
+            ),
+            entry_permitted=current.entry_permitted if entry_permitted is None else bool(entry_permitted),
+            residual_bp=current.residual_bp if residual_bp is None else residual_bp,
+            reprice_requested=current.reprice_requested if reprice_requested is None else bool(reprice_requested),
+            revision=current.revision + 1,
+        )
+
+    def mark_intent_submission_unknown(self, client_order_id: str, reason: str) -> None:
+        """Expose an explicit fail-closed test/runtime hook for F002 ambiguity."""
+        intent = self._intent_for_client_order_id(client_order_id)
+        if intent is None:
+            raise ValueError("cannot mark an unknown client order id as ambiguous")
+        self._mark_submission_unknown(intent=intent, reason=reason)
+
     async def control_task(self):
         self._consume_submission_unknowns()
-        if self._submission_halted or self._maker_submission_started:
+        if self._submission_halted:
+            await self._reconcile_submission_unknowns()
+            self._enforce_absolute_deadline()
+            return
+        if self._maker_submission_started:
+            await self._advance_safety_state_machine()
             return
         self._ensure_journal_snapshot()
         if not self._entry_operation_is_supported():
@@ -233,7 +439,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         self._acknowledge_intent(intent)
         if not was_acknowledged:
             self._apply_acknowledged_state(intent)
-            if intent.identity.leg == "STOCK" and not self._submission_halted:
+            if intent.identity.action is JournalSideEffect.STOCK_HEDGE and not self._submission_halted:
                 try:
                     # ETF fills that arrived while the native stock submission
                     # was unconfirmed were deliberately held.  An authoritative
@@ -244,98 +450,49 @@ class LeveragedEtfPairExecutor(ExecutorBase):
                     self._close_reason = "stock hedge setup or submission failed"
                     self._transition_to_recovery_required("stock hedge setup or submission failed")
 
+    def process_order_canceled_event(self, _: int, market, event: OrderCancelledEvent):
+        """Treat a maker cancel event as terminal only after persisting it.
+
+        A late ETF fill remains admissible until this event or a terminal REST
+        reconciliation is durably recorded.  We deliberately retain the maker
+        intent and its exchange ID for later F007 recovery/audit work.
+        """
+        if self._maker_intent is None or event.order_id != self._maker_intent.identity.client_order_id:
+            return
+        if self._cancel_intent is None or self._cancel_intent.confirmed:
+            return
+        maker = self._maker_intent
+        exchange_order_id = str(event.exchange_order_id or maker.exchange_order_id or "") or None
+        if maker.exchange_order_id is not None and exchange_order_id != maker.exchange_order_id:
+            self._transition_to_recovery_required("maker cancel event exchange order id disagreed with maker identity")
+            return
+        if exchange_order_id is not None:
+            maker.exchange_order_id = exchange_order_id
+        try:
+            self._confirm_maker_cancel()
+        except Exception:
+            # Never infer terminal cancellation if its durable fact cannot be
+            # accepted.  F007 can reconcile the retained maker/cancel IDs.
+            self._submission_halted = True
+            self._close_reason = "unable to persist maker cancellation confirmation"
+            self._transition_to_recovery_required(self._close_reason)
+
     def process_order_filled_event(self, _: int, market, event: OrderFilledEvent):
         intent = self._intent_for_client_order_id(event.order_id)
         if intent is None:
             return
         if intent.submission_unknown:
             return
-        leg = "ETF" if intent.identity.leg == "ETF" else "STOCK"
         trade_id = str(event.exchange_trade_id or "")
         exchange_order_id = str(event.exchange_order_id or intent.exchange_order_id or "")
         quantity = Decimal(event.amount)
-        if not trade_id or not exchange_order_id or quantity <= _ZERO:
-            self._transition_to_recovery_required("fill event lacked a positive exchange trade/order identity")
-            return
-        trade_key = (leg, trade_id)
-        if trade_key in self._seen_trades:
-            return
-        if intent.exchange_order_id is not None and intent.exchange_order_id != exchange_order_id:
-            self._transition_to_recovery_required("fill event exchange order id disagreed with order identity")
-            return
-        if quantity > intent.remaining_quantity:
-            self._transition_to_recovery_required("fill exceeded prepared order quantity")
-            return
-
-        # A fill is also an authoritative connector confirmation.  It may be
-        # delivered before OrderCreated, so it is the earliest safe point to
-        # persist ACKNOWLEDGED for this intent.
-        self._acknowledge_intent(intent)
-        order_cumulative = intent.filled_quantity + quantity
-        leg_cumulative = (
-            self._etf_filled_quantity + quantity
-            if leg == "ETF"
-            else self._stock_filled_quantity + quantity
-        )
-        outcome = "FILLED" if order_cumulative == intent.identity.order_quantity else "PARTIAL"
-        self._append_identity_event(
-            event_type=JournalEventType.FILL,
-            payload=FillJournalPayloadV1(
-                identity=intent.identity,
-                exchange_order_id=exchange_order_id,
-                exchange_trade_id=trade_id,
-                price=Decimal(event.price),
-                fill_quantity=quantity,
-                order_cumulative_filled_quantity=order_cumulative,
-                leg_cumulative_filled_quantity=leg_cumulative,
-                outcome=outcome,
-            ),
-            identity=intent.identity,
+        self._record_authoritative_fill(
+            intent=intent,
             exchange_order_id=exchange_order_id,
             exchange_trade_id=trade_id,
+            price=Decimal(event.price),
+            quantity=quantity,
         )
-        intent.exchange_order_id = exchange_order_id
-        intent.filled_quantity = order_cumulative
-        self._seen_trades.add(trade_key)
-
-        if leg == "ETF":
-            self._etf_filled_quantity = leg_cumulative
-            self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
-            try:
-                self._submit_incremental_stock_hedge()
-            except Exception:
-                self._submission_halted = True
-                self._close_reason = "stock hedge setup or submission failed"
-                self._transition_to_recovery_required("stock hedge setup or submission failed")
-        else:
-            self._stock_filled_quantity = leg_cumulative
-            self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
-            if outcome == "FILLED":
-                self._append_identity_event(
-                    event_type=JournalEventType.HEDGE_CONFIRMED,
-                    payload=HedgeJournalPayloadV1(identity=intent.identity, phase="CONFIRMED"),
-                    identity=intent.identity,
-                )
-                if self.stock_pending_quantity == _ZERO and self._exposure_is_balanced():
-                    self._state = (
-                        LeveragedEtfPairState.COMPLETED
-                        if (
-                            self._etf_filled_quantity == self.config.etf_target_quantity
-                            and self._stock_filled_quantity == self.config.stock_target_quantity
-                        )
-                        else LeveragedEtfPairState.MAKER_WORKING
-                    )
-            if not self._submission_halted:
-                try:
-                    # A native stock fill can arrive before OrderCreated.  It
-                    # authoritatively acknowledges that intent, so this is the
-                    # safe point to release any ETF hedge delta that was held
-                    # while the prior stock submission was unconfirmed.
-                    self._submit_incremental_stock_hedge()
-                except Exception:
-                    self._submission_halted = True
-                    self._close_reason = "stock hedge setup or submission failed"
-                    self._transition_to_recovery_required("stock hedge setup or submission failed")
 
     def process_order_failed_event(self, _: int, market, event: MarketOrderFailureEvent):
         if self._submission_halted:
@@ -358,8 +515,17 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             identity=intent.identity,
             exchange_order_id=intent.exchange_order_id,
         )
+        intent.terminal = True
+        if intent.identity.action is JournalSideEffect.ETF_MAKER:
+            self._submission_halted = True
+            self._transition_to_reconciling("connector reported order failure after client id allocation")
+            return
+        if intent.identity.action is JournalSideEffect.STOCK_HEDGE:
+            self._rollback_required = True
+            self._schedule_next_hedge_attempt()
+            return
         self._submission_halted = True
-        self._transition_to_reconciling("connector reported order failure after client id allocation")
+        self._transition_to_reconciling("connector reported rollback order failure after client id allocation")
 
     def get_custom_info(self) -> Dict:
         state = LeveragedEtfPairExecutorStateV1(
@@ -508,6 +674,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             self._transition_to_recovery_required(self._close_reason)
             return
         self._maker_submission_started = True
+        self._maker_started_at_monotonic = self._now_monotonic()
         identity = self._new_identity(
             action=JournalSideEffect.ETF_MAKER,
             leg="ETF",
@@ -542,12 +709,26 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         self._consume_submission_unknowns()
 
     def _submit_incremental_stock_hedge(self):
-        if self._submission_halted:
+        if self._submission_halted or self._rollback_required:
             return
         if not self._entry_operation_is_supported():
             self._halt_unsupported_operation()
             return
         if self._consume_submission_unknowns() or self._has_unacknowledged_stock_submission():
+            return
+        if not self._post_fill_hedge_is_permitted():
+            self._rollback_required = True
+            self._request_maker_cancel("post-fill opportunity or direction check failed")
+            return
+        if self._hedge_backoff_is_active():
+            return
+        if not self._can_start_hedge_attempt():
+            self._rollback_required = True
+            self._request_maker_cancel("hedge phase has insufficient remaining time")
+            return
+        if self._hedge_attempt_count() >= self._safety_policy.hedge_max_attempts:
+            self._rollback_required = True
+            self._request_maker_cancel("hedge attempt budget exhausted")
             return
         etf_multiplier = self._contract_multiplier(self.config.etf_connector_name, self.config.etf_trading_pair)
         stock_multiplier = self._contract_multiplier(self.config.stock_connector_name, self.config.stock_trading_pair)
@@ -574,7 +755,12 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         incremental_quantity = quantized_target - covered_quantity
         if incremental_quantity <= _ZERO:
             return
-        stock_price = self._current_executable_stock_price()
+        try:
+            stock_price = self._current_executable_stock_price()
+        except Exception:
+            self._rollback_required = True
+            self._request_maker_cancel("stock executable depth or price became unavailable")
+            return
         legal_increment = self._quantize_order_quantity_at_price(
             self.config.stock_connector_name,
             self.config.stock_trading_pair,
@@ -590,6 +776,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             leg="STOCK",
             logical_quantity=quantized_target,
             order_quantity=legal_increment,
+            attempt=self._hedge_attempt_count() + 1,
         )
         intent = _OrderIntent(identity=identity)
         self._stock_intents[identity.client_order_id] = intent
@@ -622,6 +809,830 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         intent.submitted = True
         self._consume_submission_unknowns()
 
+    def _record_authoritative_fill(
+        self,
+        *,
+        intent: _OrderIntent,
+        exchange_order_id: str,
+        exchange_trade_id: str,
+        price: Decimal,
+        quantity: Decimal,
+    ) -> None:
+        """Persist and apply one idempotent fill for maker, hedge, or rollback."""
+        action = intent.identity.action
+        if action is JournalSideEffect.ETF_MAKER:
+            trade_key = ("ETF_MAKER", exchange_trade_id)
+            leg_cumulative = self._etf_filled_quantity + quantity
+        elif action is JournalSideEffect.STOCK_HEDGE:
+            trade_key = ("STOCK_HEDGE", exchange_trade_id)
+            leg_cumulative = self._stock_filled_quantity + quantity
+        elif action is JournalSideEffect.ETF_ROLLBACK:
+            trade_key = ("ETF_ROLLBACK", exchange_trade_id)
+            leg_cumulative = self._rollback_filled_quantity + quantity
+        else:
+            self._transition_to_recovery_required("fill event referenced a non-order side effect")
+            return
+        if not exchange_trade_id or not exchange_order_id or quantity <= _ZERO or not price.is_finite() or price <= _ZERO:
+            self._transition_to_recovery_required("fill event lacked a positive exchange trade/order identity")
+            return
+        if trade_key in self._seen_trades:
+            return
+        if intent.exchange_order_id is not None and intent.exchange_order_id != exchange_order_id:
+            self._transition_to_recovery_required("fill event exchange order id disagreed with order identity")
+            return
+        if quantity > intent.remaining_quantity:
+            self._transition_to_recovery_required("fill exceeded prepared order quantity")
+            return
+
+        # A fill is an authoritative confirmation even when it races ahead of
+        # OrderCreated.  It must be durably acknowledged before its exposure is
+        # allowed to affect hedge or rollback decisions.
+        self._acknowledge_intent(intent)
+        order_cumulative = intent.filled_quantity + quantity
+        outcome = "FILLED" if order_cumulative == intent.identity.order_quantity else "PARTIAL"
+        self._append_identity_event(
+            event_type=JournalEventType.FILL,
+            payload=FillJournalPayloadV1(
+                identity=intent.identity,
+                exchange_order_id=exchange_order_id,
+                exchange_trade_id=exchange_trade_id,
+                price=price,
+                fill_quantity=quantity,
+                order_cumulative_filled_quantity=order_cumulative,
+                leg_cumulative_filled_quantity=leg_cumulative,
+                outcome=outcome,
+            ),
+            identity=intent.identity,
+            exchange_order_id=exchange_order_id,
+            exchange_trade_id=exchange_trade_id,
+        )
+        intent.exchange_order_id = exchange_order_id
+        intent.filled_quantity = order_cumulative
+        intent.terminal = outcome == "FILLED"
+        self._seen_trades.add(trade_key)
+
+        if action is JournalSideEffect.ETF_MAKER:
+            self._etf_filled_quantity = leg_cumulative
+            if intent.terminal:
+                self._maker_terminal = True
+            self._refresh_exposure_episode()
+            self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+            if not self._post_fill_hedge_is_permitted():
+                self._rollback_required = True
+                self._request_maker_cancel("post-fill opportunity or direction check failed")
+                return
+            try:
+                self._submit_incremental_stock_hedge()
+            except Exception:
+                self._submission_halted = True
+                self._close_reason = "stock hedge setup or submission failed"
+                self._transition_to_recovery_required("stock hedge setup or submission failed")
+            return
+
+        if action is JournalSideEffect.STOCK_HEDGE:
+            self._stock_filled_quantity = leg_cumulative
+            self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+            if intent.terminal:
+                self._append_identity_event(
+                    event_type=JournalEventType.HEDGE_CONFIRMED,
+                    payload=HedgeJournalPayloadV1(identity=intent.identity, phase="CONFIRMED"),
+                    identity=intent.identity,
+                )
+            self._refresh_exposure_episode()
+            if self._exposure_is_balanced() and self.stock_pending_quantity == _ZERO:
+                self._state = (
+                    LeveragedEtfPairState.COMPLETED
+                    if (
+                        self._etf_filled_quantity == self.config.etf_target_quantity
+                        and self._stock_filled_quantity == self.config.stock_target_quantity
+                        and self._rollback_filled_quantity == _ZERO
+                    )
+                    else LeveragedEtfPairState.MAKER_WORKING
+                )
+            if not self._submission_halted and not self._rollback_required:
+                try:
+                    # A native stock fill can arrive before OrderCreated.  It
+                    # authoritatively releases exactly the deferred cumulative
+                    # hedge delta, never a duplicate order.
+                    self._submit_incremental_stock_hedge()
+                except Exception:
+                    self._submission_halted = True
+                    self._close_reason = "stock hedge setup or submission failed"
+                    self._transition_to_recovery_required("stock hedge setup or submission failed")
+            return
+
+        self._rollback_filled_quantity = leg_cumulative
+        self._state = LeveragedEtfPairState.ETF_ROLLBACK_PENDING
+        self._refresh_exposure_episode()
+        if intent.terminal:
+            self._append_identity_event(
+                event_type=JournalEventType.ROLLBACK_CONFIRMED,
+                payload=RollbackJournalPayloadV1(identity=intent.identity, phase="CONFIRMED"),
+                identity=intent.identity,
+            )
+            if self._unhedged_etf_quantity() == _ZERO:
+                self._state = LeveragedEtfPairState.FAILED_SAFE
+            else:
+                self._transition_to_recovery_required("completed rollback did not clear exact unhedged ETF exposure")
+
+    def _now_monotonic(self) -> float:
+        now = float(self._monotonic_clock())
+        if now < 0:
+            raise RuntimeError("monotonic clock returned a negative value")
+        return now
+
+    def _milliseconds(self, value: int) -> float:
+        return value / 1000
+
+    def _hedged_etf_equivalent_quantity(self) -> Decimal:
+        if self.config.stock_target_quantity <= _ZERO:
+            return _ZERO
+        return self._stock_filled_quantity * self.config.etf_target_quantity / self.config.stock_target_quantity
+
+    def _unhedged_etf_quantity(self) -> Decimal:
+        return max(
+            _ZERO,
+            self._etf_filled_quantity - self._rollback_filled_quantity - self._hedged_etf_equivalent_quantity(),
+        )
+
+    def _refresh_exposure_episode(self) -> None:
+        outstanding = self._unhedged_etf_quantity()
+        if outstanding > _ZERO and self._exposure_started_at_monotonic is None:
+            start = self._now_monotonic()
+            self._exposure_started_at_monotonic = start
+            self._hedge_deadline_at_monotonic = start + self._milliseconds(
+                self._safety_policy.hedge_phase_deadline_ms
+            )
+            self._absolute_deadline_at_monotonic = start + self._milliseconds(
+                self._safety_policy.unhedged_response_deadline_ms
+            )
+            return
+        if outstanding == _ZERO and self._exposure_started_at_monotonic is not None:
+            self._exposure_started_at_monotonic = None
+            self._hedge_deadline_at_monotonic = None
+            self._absolute_deadline_at_monotonic = None
+            self._rollback_started_at_monotonic = None
+            self._rollback_deadline_at_monotonic = None
+            self._hedge_dust_quantity = _ZERO
+
+    def _post_fill_hedge_is_permitted(self) -> bool:
+        observation = self._maker_safety
+        return (
+            observation.net_bp > _ZERO
+            and observation.direction_stable
+            and observation.model_valid
+            and observation.entry_permitted
+            and observation.target_etf_quantity > self._hedged_etf_equivalent_quantity()
+        )
+
+    def _hedge_attempt_count(self) -> int:
+        return len(self._stock_intents)
+
+    def _rollback_attempt_count(self) -> int:
+        return len(self._rollback_intents)
+
+    def _can_start_hedge_attempt(self) -> bool:
+        if self._exposure_started_at_monotonic is None:
+            return True
+        now = self._now_monotonic()
+        if now < self._next_hedge_attempt_not_before:
+            return False
+        deadline = min(
+            self._hedge_deadline_at_monotonic or now,
+            self._absolute_deadline_at_monotonic or now,
+        )
+        return now + self._milliseconds(
+            self._safety_policy.hedge_submit_timeout_ms + self._safety_policy.order_eventual_consistency_grace_ms
+        ) <= deadline
+
+    def _hedge_backoff_is_active(self) -> bool:
+        return self._now_monotonic() < self._next_hedge_attempt_not_before
+
+    def _can_start_rollback_attempt(self) -> bool:
+        now = self._now_monotonic()
+        if now < self._next_rollback_attempt_not_before:
+            return False
+        deadline = min(
+            self._rollback_deadline_at_monotonic or now,
+            self._absolute_deadline_at_monotonic or now,
+        )
+        return now + self._milliseconds(
+            self._safety_policy.rollback_submit_timeout_ms + self._safety_policy.order_eventual_consistency_grace_ms
+        ) <= deadline
+
+    def _schedule_next_hedge_attempt(self) -> None:
+        attempt = self._hedge_attempt_count()
+        if attempt < self._safety_policy.hedge_max_attempts:
+            self._next_hedge_attempt_not_before = self._now_monotonic() + self._milliseconds(
+                self._safety_policy.hedge_retry_backoff_ms[attempt - 1]
+            )
+
+    def _schedule_next_rollback_attempt(self) -> None:
+        attempt = self._rollback_attempt_count()
+        if attempt < self._safety_policy.rollback_max_attempts:
+            self._next_rollback_attempt_not_before = self._now_monotonic() + self._milliseconds(
+                self._safety_policy.rollback_retry_backoff_ms[attempt - 1]
+            )
+
+    async def _advance_safety_state_machine(self) -> None:
+        """Run one non-blocking safety tick; all elapsed checks use monotonic time."""
+        self._enforce_absolute_deadline()
+        if self._submission_halted:
+            await self._reconcile_submission_unknowns()
+            self._enforce_absolute_deadline()
+            return
+
+        self._monitor_maker_safety()
+        self._enforce_absolute_deadline()
+        if self._submission_halted or self._exposure_started_at_monotonic is None:
+            return
+
+        now = self._now_monotonic()
+        if (
+            self._hedge_deadline_at_monotonic is not None
+            and now >= self._hedge_deadline_at_monotonic
+        ):
+            self._rollback_required = True
+            self._request_maker_cancel("hedge phase deadline reached")
+        if self._hedge_attempt_count() >= self._safety_policy.hedge_max_attempts:
+            self._rollback_required = True
+            self._request_maker_cancel("hedge attempt budget exhausted")
+
+        if self._rollback_required:
+            if not self._maker_terminal:
+                self._request_maker_cancel("unhedged exposure requires exact rollback")
+                return
+            self._start_or_continue_rollback()
+            return
+
+        if self.stock_pending_quantity == _ZERO:
+            try:
+                self._submit_incremental_stock_hedge()
+            except Exception:
+                self._submission_halted = True
+                self._close_reason = "stock hedge setup or submission failed"
+                self._transition_to_recovery_required("stock hedge setup or submission failed")
+
+    def _monitor_maker_safety(self) -> None:
+        maker = self._maker_intent
+        if maker is None or self._maker_terminal or self._cancel_intent is not None:
+            return
+        now = self._now_monotonic()
+        if (
+            self._safety_policy.maker_max_age_ms is not None
+            and self._maker_started_at_monotonic is not None
+            and now - self._maker_started_at_monotonic >= self._milliseconds(self._safety_policy.maker_max_age_ms)
+        ):
+            self._request_maker_cancel("maker maximum age reached")
+            return
+
+        observation = self._maker_safety
+        reason = None
+        if observation.net_bp <= _ZERO:
+            reason = "maker opportunity is nonpositive"
+        elif not observation.direction_stable:
+            reason = "maker direction flipped"
+        elif not observation.model_valid:
+            reason = "maker model or anchor became invalid"
+        elif not observation.entry_permitted:
+            reason = "maker entry time is no longer permitted"
+        elif observation.target_etf_quantity <= self._hedged_etf_equivalent_quantity():
+            reason = "maker target was removed or already hedged"
+        elif observation.reprice_requested:
+            reason = "maker reprice requested"
+        if reason is not None:
+            self._request_maker_cancel(reason)
+            return
+
+        if observation.revision == self._last_monitored_safety_revision:
+            return
+        self._last_monitored_safety_revision = observation.revision
+        if observation.residual_bp is None:
+            return
+        current = abs(observation.residual_bp)
+        if self._initial_abs_residual_bp is None:
+            self._initial_abs_residual_bp = current
+            self._best_abs_residual_bp = current
+            self._current_abs_residual_bp = current
+            self._divergence_consecutive_count = 0
+            return
+        self._current_abs_residual_bp = current
+        assert self._best_abs_residual_bp is not None
+        assert self._initial_abs_residual_bp is not None
+        if current < self._best_abs_residual_bp:
+            self._best_abs_residual_bp = current
+            self._divergence_consecutive_count = 0
+            return
+        has_improved = self._best_abs_residual_bp < self._initial_abs_residual_bp
+        is_diverging = (
+            has_improved
+            and current - self._best_abs_residual_bp >= self._safety_policy.divergence_cancel_bp
+        )
+        self._divergence_consecutive_count = (
+            self._divergence_consecutive_count + 1 if is_diverging else 0
+        )
+        if self._divergence_consecutive_count >= self._safety_policy.divergence_confirmations:
+            self._request_maker_cancel("maker residual diverged after convergence")
+
+    def _request_maker_cancel(self, reason: str) -> None:
+        maker = self._maker_intent
+        if maker is None or self._maker_terminal or self._cancel_intent is not None:
+            return
+        remaining = maker.remaining_quantity
+        if remaining <= _ZERO:
+            self._maker_terminal = True
+            maker.terminal = True
+            return
+        identity = self._new_identity(
+            action=JournalSideEffect.CANCEL,
+            leg="ETF",
+            logical_quantity=maker.identity.order_quantity,
+            order_quantity=remaining,
+            attempt=1,
+        )
+        cancel = _CancelIntent(
+            identity=identity,
+            target=maker,
+            requested_at_monotonic=self._now_monotonic(),
+        )
+        self._cancel_intent = cancel
+        self._append_identity_event(
+            event_type=JournalEventType.PREPARED,
+            payload=PreparedJournalPayloadV1(identity=identity),
+            identity=identity,
+        )
+        self._append_identity_event(
+            event_type=JournalEventType.CANCEL_REQUESTED,
+            payload=CancelJournalPayloadV1(
+                identity=identity,
+                phase="REQUESTED",
+                target_intent_id=maker.identity.intent_id,
+                target_client_order_id=maker.identity.client_order_id,
+                target_exchange_order_id=maker.exchange_order_id,
+                final_order_cumulative_filled_quantity=maker.filled_quantity,
+            ),
+            identity=identity,
+        )
+        self._state = LeveragedEtfPairState.MAKER_CANCEL_PENDING
+        try:
+            order_id = self.connectors[maker.identity.connector_name].cancel(
+                maker.identity.trading_pair,
+                maker.identity.client_order_id,
+            )
+        except Exception:
+            self._mark_cancel_unknown(reason)
+            return
+        if order_id != maker.identity.client_order_id:
+            self._mark_cancel_unknown("connector did not retain maker cancellation client id")
+
+    def _mark_cancel_unknown(self, reason: str) -> None:
+        cancel = self._cancel_intent
+        if cancel is None or cancel.submission_unknown:
+            return
+        cancel.submission_unknown = True
+        cancel.unknown_since_monotonic = self._now_monotonic()
+        self._append_identity_event(
+            event_type=JournalEventType.SUBMIT_UNKNOWN,
+            payload=SubmitUnknownJournalPayloadV1(
+                identity=cancel.identity,
+                uncertainty_started_at_utc=self._event_clock,
+            ),
+            identity=cancel.identity,
+        )
+        self._submission_halted = True
+        self._close_reason = reason
+        self._state = LeveragedEtfPairState.RECONCILING
+
+    def _confirm_maker_cancel(self) -> None:
+        cancel = self._cancel_intent
+        if cancel is None or cancel.confirmed:
+            return
+        maker = cancel.target
+        self._append_identity_event(
+            event_type=JournalEventType.CANCEL_CONFIRMED,
+            payload=CancelJournalPayloadV1(
+                identity=cancel.identity,
+                phase="CONFIRMED",
+                target_intent_id=maker.identity.intent_id,
+                target_client_order_id=maker.identity.client_order_id,
+                target_exchange_order_id=maker.exchange_order_id,
+                final_order_cumulative_filled_quantity=maker.filled_quantity,
+            ),
+            identity=cancel.identity,
+        )
+        cancel.confirmed = True
+        maker.terminal = True
+        self._maker_terminal = True
+        self._append_identity_event(
+            event_type=JournalEventType.RECONCILIATION,
+            payload=ReconciliationJournalPayloadV1(
+                identity=maker.identity,
+                outcome=ReconciliationOutcome.CANCELED,
+                exchange_order_id=maker.exchange_order_id,
+                order_cumulative_filled_quantity=maker.filled_quantity,
+            ),
+            identity=maker.identity,
+            exchange_order_id=maker.exchange_order_id,
+        )
+        if self._unhedged_etf_quantity() == _ZERO:
+            self._state = LeveragedEtfPairState.ABORTED_NO_FILL
+        else:
+            self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+
+    def _all_stock_intents_known_terminal(self) -> bool:
+        return all(intent.terminal and not intent.submission_unknown for intent in self._stock_intents.values())
+
+    def _start_or_continue_rollback(self) -> None:
+        outstanding = self._unhedged_etf_quantity()
+        if outstanding == _ZERO:
+            self._refresh_exposure_episode()
+            return
+        if not self._all_stock_intents_known_terminal():
+            if self._absolute_deadline_reached():
+                self._submission_halted = True
+                self._transition_to_recovery_required("stock intent remains non-terminal; rollback could create reverse exposure")
+            return
+        now = self._now_monotonic()
+        if self._rollback_started_at_monotonic is None:
+            self._rollback_started_at_monotonic = now
+            self._rollback_deadline_at_monotonic = min(
+                now + self._milliseconds(self._safety_policy.rollback_phase_deadline_ms),
+                self._absolute_deadline_at_monotonic or now,
+            )
+        if any(not intent.terminal for intent in self._rollback_intents.values()):
+            return
+        if self._rollback_attempt_count() >= self._safety_policy.rollback_max_attempts:
+            self._submission_halted = True
+            self._transition_to_recovery_required("rollback attempt budget exhausted")
+            return
+        if not self._can_start_rollback_attempt():
+            if self._rollback_deadline_reached() or self._absolute_deadline_reached():
+                self._submission_halted = True
+                self._transition_to_recovery_required("rollback phase has insufficient remaining time")
+            return
+        rollback_side = TradeType.BUY if self._etf_trade_side() is TradeType.SELL else TradeType.SELL
+        rollback_price_type = PriceType.BestAsk if rollback_side is TradeType.BUY else PriceType.BestBid
+        try:
+            rollback_price = Decimal(
+                self.get_price(self.config.etf_connector_name, self.config.etf_trading_pair, rollback_price_type)
+            )
+            legal_quantity = self._quantize_order_quantity_at_price(
+                self.config.etf_connector_name,
+                self.config.etf_trading_pair,
+                outstanding,
+                rollback_price,
+            )
+        except Exception:
+            legal_quantity = _ZERO
+        # Rollback is exact reduce-only.  Quantizing down, oversizing, or joining
+        # another Executor's dust would turn a safety action into new exposure.
+        if legal_quantity != outstanding:
+            if self._rollback_deadline_reached() or self._absolute_deadline_reached():
+                self._submission_halted = True
+                self._transition_to_recovery_required("exact ETF rollback is below exchange minimum")
+            return
+        identity = self._new_identity(
+            action=JournalSideEffect.ETF_ROLLBACK,
+            leg="ETF",
+            logical_quantity=outstanding,
+            order_quantity=outstanding,
+            attempt=self._rollback_attempt_count() + 1,
+        )
+        intent = _OrderIntent(identity=identity)
+        self._rollback_intents[identity.client_order_id] = intent
+        self._append_identity_event(
+            event_type=JournalEventType.PREPARED,
+            payload=PreparedJournalPayloadV1(identity=identity),
+            identity=identity,
+        )
+        self._append_identity_event(
+            event_type=JournalEventType.ROLLBACK_REQUESTED,
+            payload=RollbackJournalPayloadV1(identity=identity, phase="REQUESTED"),
+            identity=identity,
+        )
+        self._state = LeveragedEtfPairState.ETF_ROLLBACK_PENDING
+        try:
+            order_id = self._native_submit(
+                connector_name=self.config.etf_connector_name,
+                trading_pair=self.config.etf_trading_pair,
+                side=rollback_side,
+                amount=outstanding,
+                order_type=OrderType.MARKET,
+                price=_NAN,
+                client_order_id=identity.client_order_id,
+                position_action=PositionAction.CLOSE,
+            )
+        except Exception as exc:
+            self._record_submission_exception(identity, exc, is_maker=False)
+            self._schedule_next_rollback_attempt()
+            return
+        if order_id != identity.client_order_id:
+            self._mark_submission_unknown(intent=intent, reason="connector did not retain rollback client id")
+            return
+        intent.submitted = True
+        self._consume_submission_unknowns()
+
+    def _absolute_deadline_reached(self) -> bool:
+        return (
+            self._absolute_deadline_at_monotonic is not None
+            and self._now_monotonic() >= self._absolute_deadline_at_monotonic
+        )
+
+    def _rollback_deadline_reached(self) -> bool:
+        return (
+            self._rollback_deadline_at_monotonic is not None
+            and self._now_monotonic() >= self._rollback_deadline_at_monotonic
+        )
+
+    def _enforce_absolute_deadline(self) -> None:
+        if self._absolute_deadline_reached() and self._unhedged_etf_quantity() > _ZERO:
+            self._submission_halted = True
+            self._close_reason = "unhedged response deadline exceeded"
+            self._transition_to_recovery_required(self._close_reason)
+            return
+        cancel = self._cancel_intent
+        if (
+            cancel is not None
+            and cancel.submission_unknown
+            and cancel.unknown_since_monotonic is not None
+            and self._now_monotonic() >= cancel.unknown_since_monotonic + self._milliseconds(
+                self._safety_policy.unhedged_response_deadline_ms
+            )
+        ):
+            self._submission_halted = True
+            self._close_reason = "maker cancellation remained unknown beyond reconciliation deadline"
+            self._transition_to_recovery_required(self._close_reason)
+
+    async def _reconcile_submission_unknowns(self) -> None:
+        unknown_intents = tuple(
+            intent
+            for intent in (self._maker_intent, *self._stock_intents.values(), *self._rollback_intents.values())
+            if intent is not None and intent.submission_unknown
+        )
+        cancel_unknown = self._cancel_intent is not None and self._cancel_intent.submission_unknown
+        if not unknown_intents and not cancel_unknown:
+            return
+        for intent in unknown_intents:
+            await self._reconcile_unknown_intent(intent)
+            if self._state is LeveragedEtfPairState.RECOVERY_REQUIRED:
+                return
+        if cancel_unknown:
+            await self._reconcile_unknown_cancel()
+            if self._state is LeveragedEtfPairState.RECOVERY_REQUIRED:
+                return
+        unresolved = any(intent.submission_unknown for intent in unknown_intents)
+        unresolved = unresolved or bool(self._cancel_intent is not None and self._cancel_intent.submission_unknown)
+        if not unresolved:
+            self._submission_halted = False
+
+    async def _reconcile_unknown_intent(self, intent: _OrderIntent) -> None:
+        if not self._unknown_sweep_is_due(intent.unknown_since_monotonic, intent.last_sweep_monotonic):
+            return
+        connector = self.connectors[intent.identity.connector_name]
+        status_getter = getattr(connector, "get_order_status_by_client_order_id", None)
+        trades_getter = getattr(connector, "get_account_trades", None)
+        positions_getter = getattr(connector, "get_position_risk_snapshots", None)
+        if not all(callable(method) for method in (status_getter, trades_getter, positions_getter)):
+            return
+        try:
+            status = await self._maybe_await(
+                status_getter(intent.identity.trading_pair, intent.identity.client_order_id)
+            )
+            exchange_order_id = self._reconciliation_exchange_order_id(status, intent)
+            trades = await self._maybe_await(
+                trades_getter(intent.identity.trading_pair, exchange_order_id)
+            )
+            positions = await self._maybe_await(positions_getter(intent.identity.trading_pair))
+        except Exception:
+            return
+        status_name = self._reconciliation_status_name(status)
+        if status_name is None:
+            self._transition_to_recovery_required("order reconciliation returned an unsupported status")
+            return
+        try:
+            executed_quantity = Decimal(getattr(status, "executed_quantity", _ZERO) or _ZERO)
+        except Exception:
+            self._transition_to_recovery_required("order reconciliation returned an invalid cumulative quantity")
+            return
+        if not executed_quantity.is_finite() or executed_quantity < _ZERO:
+            self._transition_to_recovery_required("order reconciliation returned an invalid cumulative quantity")
+            return
+        if executed_quantity != intent.filled_quantity:
+            # The journal cannot synthesize an un-attributed trade.  A status
+            # total higher than its known trade facts is contradictory until the
+            # connector supplies the missing stable trade identities.
+            self._transition_to_recovery_required("order status cumulative fill disagreed with durable trade facts")
+            return
+        signature = self._reconciliation_signature(status_name, executed_quantity, exchange_order_id, trades, positions)
+        intent.last_sweep_monotonic = self._now_monotonic()
+        if status_name == "NOT_FOUND":
+            if intent.filled_quantity != _ZERO or not self._positions_show_no_evidence(positions):
+                self._transition_to_recovery_required("not-found reconciliation contradicts known order or position facts")
+                return
+            if intent.last_sweep_signature == signature:
+                intent.reconciliation_sweeps += 1
+            else:
+                intent.last_sweep_signature = signature
+                intent.reconciliation_sweeps = 1
+            if intent.reconciliation_sweeps < 2:
+                return
+            self._append_reconciliation(
+                intent,
+                ReconciliationOutcome.CONSISTENT_NO_FILL,
+                exchange_order_id=None,
+            )
+            intent.submission_unknown = False
+            intent.terminal = True
+            return
+        if status_name in {"NEW", "PARTIALLY_FILLED"}:
+            outcome = (
+                ReconciliationOutcome.NEW
+                if status_name == "NEW"
+                else ReconciliationOutcome.PARTIALLY_FILLED
+            )
+            self._append_reconciliation(intent, outcome, exchange_order_id=exchange_order_id)
+            intent.submission_unknown = False
+            intent.acknowledged = True
+            return
+        outcomes = {
+            "FILLED": ReconciliationOutcome.FILLED,
+            "CANCELED": ReconciliationOutcome.CANCELED,
+            "EXPIRED": ReconciliationOutcome.EXPIRED,
+            "REJECTED": ReconciliationOutcome.REJECTED,
+        }
+        outcome = outcomes.get(status_name)
+        if outcome is None:
+            self._transition_to_recovery_required("order reconciliation returned an unsupported terminal status")
+            return
+        self._append_reconciliation(intent, outcome, exchange_order_id=exchange_order_id)
+        intent.submission_unknown = False
+        intent.terminal = True
+        if intent.identity.action is JournalSideEffect.STOCK_HEDGE:
+            self._schedule_next_hedge_attempt()
+            self._rollback_required = self._hedge_attempt_count() >= self._safety_policy.hedge_max_attempts
+        elif intent.identity.action is JournalSideEffect.ETF_ROLLBACK:
+            self._schedule_next_rollback_attempt()
+        elif intent.identity.action is JournalSideEffect.ETF_MAKER:
+            self._maker_terminal = True
+
+    async def _reconcile_unknown_cancel(self) -> None:
+        cancel = self._cancel_intent
+        if cancel is None or not cancel.submission_unknown:
+            return
+        if not self._unknown_sweep_is_due(cancel.unknown_since_monotonic, cancel.last_sweep_monotonic):
+            return
+        connector = self.connectors[cancel.target.identity.connector_name]
+        status_getter = getattr(connector, "get_order_status_by_client_order_id", None)
+        trades_getter = getattr(connector, "get_account_trades", None)
+        positions_getter = getattr(connector, "get_position_risk_snapshots", None)
+        if not all(callable(method) for method in (status_getter, trades_getter, positions_getter)):
+            return
+        try:
+            status = await self._maybe_await(
+                status_getter(cancel.target.identity.trading_pair, cancel.target.identity.client_order_id)
+            )
+            exchange_order_id = self._reconciliation_exchange_order_id(status, cancel.target)
+            trades = await self._maybe_await(
+                trades_getter(cancel.target.identity.trading_pair, exchange_order_id)
+            )
+            positions = await self._maybe_await(positions_getter(cancel.target.identity.trading_pair))
+        except Exception:
+            return
+        status_name = self._reconciliation_status_name(status)
+        if status_name is None:
+            self._transition_to_recovery_required("maker cancel reconciliation returned an unsupported status")
+            return
+        try:
+            executed_quantity = Decimal(getattr(status, "executed_quantity", _ZERO) or _ZERO)
+        except Exception:
+            self._transition_to_recovery_required("maker cancel reconciliation returned an invalid cumulative quantity")
+            return
+        if executed_quantity != cancel.target.filled_quantity:
+            self._transition_to_recovery_required("maker cancel status cumulative fill disagreed with durable trade facts")
+            return
+        if status_name in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}:
+            self._append_identity_event(
+                event_type=JournalEventType.RECONCILIATION,
+                payload=ReconciliationJournalPayloadV1(
+                    identity=cancel.identity,
+                    outcome=ReconciliationOutcome.CANCELED,
+                    exchange_order_id=None,
+                    order_cumulative_filled_quantity=_ZERO,
+                ),
+                identity=cancel.identity,
+            )
+            cancel.submission_unknown = False
+            self._confirm_maker_cancel()
+            return
+        if status_name != "NOT_FOUND":
+            cancel.last_sweep_monotonic = self._now_monotonic()
+            return
+        if cancel.target.filled_quantity != _ZERO or not self._positions_show_no_evidence(positions):
+            self._transition_to_recovery_required("maker cancel not-found result contradicts known trade or position facts")
+            return
+        signature = self._reconciliation_signature(status_name, executed_quantity, exchange_order_id, trades, positions)
+        cancel.last_sweep_monotonic = self._now_monotonic()
+        if cancel.last_sweep_signature == signature:
+            cancel.reconciliation_sweeps += 1
+        else:
+            cancel.last_sweep_signature = signature
+            cancel.reconciliation_sweeps = 1
+        if cancel.reconciliation_sweeps >= 2:
+            self._append_identity_event(
+                event_type=JournalEventType.RECONCILIATION,
+                payload=ReconciliationJournalPayloadV1(
+                    identity=cancel.identity,
+                    outcome=ReconciliationOutcome.CANCELED,
+                    exchange_order_id=None,
+                    order_cumulative_filled_quantity=_ZERO,
+                ),
+                identity=cancel.identity,
+            )
+            cancel.submission_unknown = False
+            self._confirm_maker_cancel()
+
+    def _unknown_sweep_is_due(self, unknown_since: Optional[float], last_sweep: Optional[float]) -> bool:
+        if unknown_since is None:
+            return False
+        now = self._now_monotonic()
+        if now < unknown_since + self._milliseconds(self._safety_policy.order_eventual_consistency_grace_ms):
+            return False
+        return last_sweep is None or now - last_sweep >= self._milliseconds(
+            self._safety_policy.executor_safety_interval_ms
+        )
+
+    @staticmethod
+    async def _maybe_await(value):
+        return await value if inspect.isawaitable(value) else value
+
+    @staticmethod
+    def _reconciliation_status_name(status) -> Optional[str]:
+        value = getattr(status, "status", None)
+        value = getattr(value, "value", value)
+        if not isinstance(value, str):
+            return None
+        normalized = "EXPIRED" if value == "EXPIRED_IN_MATCH" else value
+        return normalized if normalized in {
+            "NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED", "NOT_FOUND"
+        } else None
+
+    def _reconciliation_exchange_order_id(self, status, intent: _OrderIntent) -> Optional[str]:
+        observed = getattr(status, "exchange_order_id", None)
+        observed = None if observed is None else str(observed)
+        if intent.exchange_order_id is not None and observed is not None and observed != intent.exchange_order_id:
+            raise RuntimeError("reconciliation exchange order id disagreed with local identity")
+        return observed or intent.exchange_order_id
+
+    @staticmethod
+    def _reconciliation_signature(status_name: str, executed: Decimal, exchange_order_id, trades, positions) -> Tuple:
+        trade_signature = tuple(
+            sorted(
+                (
+                    str(getattr(trade, "trade_id", "")),
+                    str(getattr(trade, "exchange_order_id", "")),
+                    str(getattr(trade, "quantity", "")),
+                )
+                for trade in trades
+            )
+        )
+        position_signature = tuple(sorted(repr(position) for position in positions))
+        return status_name, _canonical_decimal(executed), exchange_order_id, trade_signature, position_signature
+
+    @staticmethod
+    def _positions_show_no_evidence(positions) -> bool:
+        # Position snapshots are a consistency check, never a mechanism for
+        # assigning a fill to this Executor.  Any non-zero position fact keeps a
+        # NOT_FOUND order unknown instead of licensing a guessed reverse order.
+        for position in positions:
+            for field_name in ("position_amount", "position_amt", "amount"):
+                value = getattr(position, field_name, None)
+                if value is not None:
+                    try:
+                        if Decimal(value) != _ZERO:
+                            return False
+                    except Exception:
+                        return False
+        return True
+
+    def _append_reconciliation(
+        self,
+        intent: _OrderIntent,
+        outcome: ReconciliationOutcome,
+        *,
+        exchange_order_id: Optional[str],
+    ) -> None:
+        self._append_identity_event(
+            event_type=JournalEventType.RECONCILIATION,
+            payload=ReconciliationJournalPayloadV1(
+                identity=intent.identity,
+                outcome=outcome,
+                exchange_order_id=exchange_order_id,
+                order_cumulative_filled_quantity=intent.filled_quantity,
+            ),
+            identity=intent.identity,
+            exchange_order_id=exchange_order_id,
+        )
+
     def _record_submission_exception(self, identity: SideEffectIdentityV1, exc: Exception, *, is_maker: bool):
         failure_kind = getattr(exc, "failure_kind", None)
         if getattr(failure_kind, "value", None) == "AUTHORITATIVE_REJECTION":
@@ -630,14 +1641,25 @@ class LeveragedEtfPairExecutor(ExecutorBase):
                 payload=RejectedJournalPayloadV1(identity=identity, reason="authoritative submission rejection"),
                 identity=identity,
             )
-            self._state = LeveragedEtfPairState.PREFLIGHT if is_maker else LeveragedEtfPairState.STOCK_HEDGE_PENDING
+            intent = self._intent_for_client_order_id(identity.client_order_id)
+            if intent is not None:
+                intent.terminal = True
+            if is_maker:
+                self._state = LeveragedEtfPairState.PREFLIGHT
+                self._submission_halted = True
+            elif identity.action is JournalSideEffect.STOCK_HEDGE:
+                self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+                self._rollback_required = self._hedge_attempt_count() >= self._safety_policy.hedge_max_attempts
+                self._schedule_next_hedge_attempt()
+            else:
+                self._state = LeveragedEtfPairState.ETF_ROLLBACK_PENDING
+                self._submission_halted = True
         else:
             intent = self._intent_for_client_order_id(identity.client_order_id)
             if intent is None:
                 raise RuntimeError("submission failure referenced an unknown local intent")
             self._mark_submission_unknown(intent=intent, reason="order submission failed")
             return
-        self._submission_halted = True
         self._close_reason = "order submission failed"
 
     def _acknowledge_intent(self, intent: _OrderIntent):
@@ -651,19 +1673,21 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         intent.acknowledged = True
 
     def _apply_acknowledged_state(self, intent: _OrderIntent):
-        if intent.identity.leg == "ETF":
+        if intent.identity.action is JournalSideEffect.ETF_MAKER:
             self._state = (
                 LeveragedEtfPairState.MAKER_WORKING
                 if self._etf_filled_quantity == _ZERO
                 else LeveragedEtfPairState.STOCK_HEDGE_PENDING
             )
-        else:
+        elif intent.identity.action is JournalSideEffect.STOCK_HEDGE:
             self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+        else:
+            self._state = LeveragedEtfPairState.ETF_ROLLBACK_PENDING
 
     def _consume_submission_unknowns(self) -> bool:
         intents = tuple(
             intent
-            for intent in (self._maker_intent, *self._stock_intents.values())
+            for intent in (self._maker_intent, *self._stock_intents.values(), *self._rollback_intents.values())
             if intent is not None and intent.submitted and not intent.acknowledged and not intent.submission_unknown
         )
         for intent in intents:
@@ -690,6 +1714,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         if intent.submission_unknown:
             return
         intent.submission_unknown = True
+        intent.unknown_since_monotonic = self._now_monotonic()
         self._append_identity_event(
             event_type=JournalEventType.SUBMIT_UNKNOWN,
             payload=SubmitUnknownJournalPayloadV1(
@@ -704,7 +1729,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
 
     def _has_unacknowledged_stock_submission(self) -> bool:
         return any(
-            intent.submitted and not intent.acknowledged and not intent.submission_unknown
+            intent.submitted and not intent.acknowledged and not intent.submission_unknown and not intent.terminal
             for intent in self._stock_intents.values()
         )
 
@@ -729,6 +1754,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         order_type: OrderType,
         price: Decimal,
         client_order_id: str,
+        position_action: PositionAction = PositionAction.OPEN,
     ) -> str:
         connector = self.connectors[connector_name]
         submit = connector.buy if side is TradeType.BUY else connector.sell
@@ -738,7 +1764,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             order_type=order_type,
             price=price,
             client_order_id=client_order_id,
-            position_action=PositionAction.OPEN,
+            position_action=position_action,
         )
 
     def _new_identity(
@@ -748,10 +1774,15 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         leg: str,
         logical_quantity: Decimal,
         order_quantity: Decimal,
+        attempt: int = 1,
     ) -> SideEffectIdentityV1:
         logical_text = _canonical_decimal(logical_quantity)
-        idempotency_key = f"{self.config.id}:{self.config.operation.value}:{leg}:{logical_text}:1"
-        digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        idempotency_key = f"{self.config.id}:{self.config.operation.value}:{leg}:{logical_text}:{attempt}"
+        # The F004 idempotency-key grammar intentionally omits action.  Keep the
+        # key canonical while deriving distinct intent/client identities for a
+        # maker, its cancellation, and a rollback at the same logical amount.
+        identity_seed = f"{idempotency_key}:{action.value}"
+        digest = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()
         connector_name, trading_pair = (
             (self.config.etf_connector_name, self.config.etf_trading_pair)
             if leg == "ETF"
@@ -764,7 +1795,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             leg=leg,
             logical_quantity=logical_quantity,
             order_quantity=order_quantity,
-            attempt=1,
+            attempt=attempt,
             intent_id=f"lep-int-{digest[:24]}",
             idempotency_key=idempotency_key,
             connector_name=connector_name,
@@ -837,7 +1868,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
     def _intent_for_client_order_id(self, client_order_id: str) -> Optional[_OrderIntent]:
         if self._maker_intent is not None and client_order_id == self._maker_intent.identity.client_order_id:
             return self._maker_intent
-        return self._stock_intents.get(client_order_id)
+        return self._stock_intents.get(client_order_id) or self._rollback_intents.get(client_order_id)
 
     def _contract_multiplier(self, connector_name: str, trading_pair: str) -> Decimal:
         try:
