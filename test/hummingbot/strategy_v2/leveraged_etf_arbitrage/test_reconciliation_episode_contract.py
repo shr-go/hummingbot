@@ -84,6 +84,9 @@ def _reconciliation_event(
     event_id: str,
     *,
     outcome: str,
+    action: str = "ETF_MAKER",
+    leg: str = "ETF",
+    attempt: int = 1,
     logical_quantity: str = "2",
     intent_id: str = "intent-t005-unknown",
     client_order_id: str = "client-t005-unknown",
@@ -97,6 +100,9 @@ def _reconciliation_event(
         initial,
         JournalEventType.RECONCILIATION,
         event_id,
+        action=action,
+        leg=leg,
+        attempt=attempt,
         logical_quantity=logical_quantity,
         intent_id=intent_id,
         client_order_id=client_order_id,
@@ -741,7 +747,8 @@ def test_t005_proven_no_fill_rejects_sweeps_before_submit_uncertainty(tmp_path: 
 
 
 def test_t005_cancel_confirmed_unknown_then_proven_no_fill_still_aborts(tmp_path: Path):
-    manager = _open_manager(tmp_path / "cancel-unknown-proven-no-fill.sqlite")
+    db_path = tmp_path / "cancel-unknown-proven-no-fill.sqlite"
+    manager = _open_manager(db_path)
     try:
         repository = LeveragedEtfJournalRepository(manager)
         initial = _initial()
@@ -805,21 +812,231 @@ def test_t005_cancel_confirmed_unknown_then_proven_no_fill_still_aborts(tmp_path
         )
         assert current.state.value == "RECONCILING"
 
+        terminal_event = _reconciliation_event(
+            initial,
+            "event-t005-cancel-ordering-proven",
+            outcome="CONSISTENT_NO_FILL",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=_no_fill_proof(proof_id="proof-t005-cancel-ordering"),
+        )
+        current = _append_fact(repository, current, terminal_event)
+        assert current.state.value == "ABORTED_NO_FILL"
+        assert repository.incomplete_intents(initial.executor_id) == ()
+        event_count = len(repository.events(initial.executor_id))
+        duplicate = repository.append_and_reduce(initial.executor_id, terminal_event)
+        assert duplicate.event == terminal_event
+        assert len(repository.events(initial.executor_id)) == event_count
+        assert repository.replay(initial.executor_id) == current
+    finally:
+        manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.incomplete_intents(initial.executor_id) == ()
+    finally:
+        reopened.engine.dispose()
+
+
+def test_t005_proven_no_fill_then_cancel_confirmed_still_aborts(tmp_path: Path):
+    db_path = tmp_path / "proven-no-fill-cancel-confirmed.sqlite"
+    manager = _open_manager(db_path)
+    try:
+        repository = LeveragedEtfJournalRepository(manager)
+        initial = _initial()
+        repository.create_executor(initial)
+        current = _prepare_unknown(repository, initial)
+        cancel_identity = {
+            "logical_quantity": "2",
+            "action": "CANCEL",
+            "leg": "ETF",
+            "intent_id": "intent-t005-reverse-cancel-ordering",
+            "client_order_id": "client-t005-reverse-cancel-ordering",
+        }
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                "event-t005-reverse-cancel-ordering-prepared",
+                created_at_utc="2026-07-17T14:01:04.100000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.CANCEL_REQUESTED,
+                "event-t005-reverse-cancel-ordering-requested",
+                order_cumulative_filled_quantity="0",
+                target_intent_id="intent-t005-unknown",
+                target_client_order_id="client-t005-unknown",
+                created_at_utc="2026-07-17T14:01:04.200000Z",
+                **cancel_identity,
+            ),
+        )
         current = _append_fact(
             repository,
             current,
             _reconciliation_event(
                 initial,
-                "event-t005-cancel-ordering-proven",
+                "event-t005-reverse-cancel-ordering-proven",
                 outcome="CONSISTENT_NO_FILL",
                 evidence_state="PROVEN_NO_FILL",
-                proven_no_fill=_no_fill_proof(proof_id="proof-t005-cancel-ordering"),
+                proven_no_fill=_no_fill_proof(proof_id="proof-t005-reverse-cancel-ordering"),
             ),
         )
+        assert current.state.value == "MAKER_CANCEL_PENDING"
+        assert tuple(value.intent_id for value in repository.incomplete_intents(initial.executor_id)) == (
+            "intent-t005-reverse-cancel-ordering",
+        )
+        _assert_fact_rejected_atomically(
+            repository,
+            initial.executor_id,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                "event-t005-reverse-cancel-ordering-replacement",
+                logical_quantity="2",
+                attempt=2,
+                intent_id="intent-t005-reverse-cancel-ordering-replacement",
+                client_order_id="client-t005-reverse-cancel-ordering-replacement",
+                created_at_utc="2026-07-17T14:01:07.100000Z",
+            ),
+        )
+
+        terminal_event = _fact_event(
+            initial,
+            JournalEventType.CANCEL_CONFIRMED,
+            "event-t005-reverse-cancel-ordering-confirmed",
+            order_cumulative_filled_quantity="0",
+            target_intent_id="intent-t005-unknown",
+            target_client_order_id="client-t005-unknown",
+            created_at_utc="2026-07-17T14:01:08.000000Z",
+            **cancel_identity,
+        )
+        current = _append_fact(repository, current, terminal_event)
         assert current.state.value == "ABORTED_NO_FILL"
         assert repository.incomplete_intents(initial.executor_id) == ()
+        event_count = len(repository.events(initial.executor_id))
+        duplicate = repository.append_and_reduce(initial.executor_id, terminal_event)
+        assert duplicate.event == terminal_event
+        assert len(repository.events(initial.executor_id)) == event_count
+        assert repository.replay(initial.executor_id) == current
     finally:
         manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.incomplete_intents(initial.executor_id) == ()
+    finally:
+        reopened.engine.dispose()
+
+
+def test_t005_maker_and_cancel_proven_no_fill_terminalize_in_either_order(tmp_path: Path):
+    db_path = tmp_path / "maker-cancel-proven-no-fill.sqlite"
+    manager = _open_manager(db_path)
+    try:
+        repository = LeveragedEtfJournalRepository(manager)
+        initial = _initial()
+        repository.create_executor(initial)
+        current = _prepare_unknown(repository, initial)
+        cancel_identity = {
+            "logical_quantity": "2",
+            "action": "CANCEL",
+            "leg": "ETF",
+            "intent_id": "intent-t005-uncertain-cancel",
+            "client_order_id": "client-t005-uncertain-cancel",
+        }
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.PREPARED,
+                "event-t005-uncertain-cancel-prepared",
+                created_at_utc="2026-07-17T14:01:04.100000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.CANCEL_REQUESTED,
+                "event-t005-uncertain-cancel-requested",
+                order_cumulative_filled_quantity="0",
+                target_intent_id="intent-t005-unknown",
+                target_client_order_id="client-t005-unknown",
+                created_at_utc="2026-07-17T14:01:04.200000Z",
+                **cancel_identity,
+            ),
+        )
+        current = _append_fact(
+            repository,
+            current,
+            _fact_event(
+                initial,
+                JournalEventType.SUBMIT_UNKNOWN,
+                "event-t005-uncertain-cancel-submit-unknown",
+                created_at_utc="2026-07-17T14:01:04.300000Z",
+                **cancel_identity,
+            ),
+        )
+        assert current.state.value == "RECONCILING"
+
+        maker_terminal = _reconciliation_event(
+            initial,
+            "event-t005-uncertain-cancel-maker-proven",
+            outcome="CONSISTENT_NO_FILL",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=_no_fill_proof(proof_id="proof-t005-uncertain-cancel-maker"),
+        )
+        current = _append_fact(repository, current, maker_terminal)
+        assert current.state.value == "RECONCILING"
+        assert tuple(value.intent_id for value in repository.incomplete_intents(initial.executor_id)) == (
+            "intent-t005-uncertain-cancel",
+        )
+
+        cancel_proof = _no_fill_proof(proof_id="proof-t005-uncertain-cancel")
+        for index, sweep in enumerate(cancel_proof["sweeps"], start=1):
+            sweep["sweep_id"] = f"sweep-t005-uncertain-cancel-{index}"
+        cancel_terminal = _reconciliation_event(
+            initial,
+            "event-t005-uncertain-cancel-proven",
+            outcome="CONSISTENT_NO_FILL",
+            action="CANCEL",
+            intent_id="intent-t005-uncertain-cancel",
+            client_order_id="client-t005-uncertain-cancel",
+            evidence_state="PROVEN_NO_FILL",
+            proven_no_fill=cancel_proof,
+            created_at_utc="2026-07-17T14:01:08.000000Z",
+        )
+        current = _append_fact(repository, current, cancel_terminal)
+        assert current.state.value == "ABORTED_NO_FILL"
+        assert repository.incomplete_intents(initial.executor_id) == ()
+        event_count = len(repository.events(initial.executor_id))
+        duplicate = repository.append_and_reduce(initial.executor_id, cancel_terminal)
+        assert duplicate.event == cancel_terminal
+        assert len(repository.events(initial.executor_id)) == event_count
+        assert repository.replay(initial.executor_id) == current
+    finally:
+        manager.engine.dispose()
+
+    reopened = _open_manager(db_path)
+    try:
+        reopened_repository = LeveragedEtfJournalRepository(reopened)
+        assert reopened_repository.replay(initial.executor_id) == current
+        assert reopened_repository.incomplete_intents(initial.executor_id) == ()
+    finally:
+        reopened.engine.dispose()
 
 
 def test_t005_proof_and_sweep_ids_cannot_be_reused_across_owner_scope(tmp_path: Path):
