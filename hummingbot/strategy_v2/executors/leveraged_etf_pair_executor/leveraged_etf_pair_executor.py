@@ -1208,6 +1208,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         if cancel is None or cancel.confirmed:
             return
         maker = cancel.target
+        self._bridge_late_fill_cancel_to_reconciliation()
         self._append_identity_event(
             event_type=JournalEventType.CANCEL_CONFIRMED,
             payload=CancelJournalPayloadV1(
@@ -1238,6 +1239,20 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             self._state = LeveragedEtfPairState.ABORTED_NO_FILL
         else:
             self._state = LeveragedEtfPairState.STOCK_HEDGE_PENDING
+
+    def _bridge_late_fill_cancel_to_reconciliation(self) -> None:
+        """Use F004's legal reconciliation bridge for cancel/fill event races.
+
+        A maker fill received while cancellation is pending correctly changes the
+        durable snapshot to STOCK_HEDGE_PENDING.  F004 permits an explicit move
+        from that state to RECONCILING, from which the already-prepared cancel
+        side effect can be confirmed without discarding either factual event.
+        """
+        if self._state is LeveragedEtfPairState.STOCK_HEDGE_PENDING:
+            self._append_state_transition(
+                LeveragedEtfPairState.RECONCILING,
+                "reconciling maker cancellation after a late ETF fill",
+            )
 
     def _all_stock_intents_known_terminal(self) -> bool:
         return all(intent.terminal and not intent.submission_unknown for intent in self._stock_intents.values())
@@ -1417,12 +1432,18 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         if not executed_quantity.is_finite() or executed_quantity < _ZERO:
             self._transition_to_recovery_required("order reconciliation returned an invalid cumulative quantity")
             return
-        if executed_quantity != intent.filled_quantity:
-            # The journal cannot synthesize an un-attributed trade.  A status
-            # total higher than its known trade facts is contradictory until the
-            # connector supplies the missing stable trade identities.
+        if executed_quantity < intent.filled_quantity:
             self._transition_to_recovery_required("order status cumulative fill disagreed with durable trade facts")
             return
+        if executed_quantity > intent.filled_quantity:
+            if not self._record_missing_reconciled_fills(intent, exchange_order_id, executed_quantity, trades):
+                # The journal cannot synthesize an un-attributed trade.  A
+                # status total higher than its known trade facts remains a
+                # contradiction until F002 supplies stable trade identities.
+                self._transition_to_recovery_required("order status cumulative fill disagreed with durable trade facts")
+                return
+            if intent.terminal:
+                return
         signature = self._reconciliation_signature(status_name, executed_quantity, exchange_order_id, trades, positions)
         intent.last_sweep_monotonic = self._now_monotonic()
         if status_name == "NOT_FOUND":
@@ -1475,6 +1496,55 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         elif intent.identity.action is JournalSideEffect.ETF_MAKER:
             self._maker_terminal = True
 
+    def _record_missing_reconciled_fills(
+        self,
+        intent: _OrderIntent,
+        exchange_order_id: Optional[str],
+        executed_quantity: Decimal,
+        trades,
+    ) -> bool:
+        """Apply only trade-ID-backed fills discovered during F002 reconciliation."""
+        if exchange_order_id is None:
+            return False
+        action_key = intent.identity.action.value
+        missing = []
+        try:
+            for trade in trades:
+                trade_id = str(getattr(trade, "trade_id", "") or "")
+                trade_order_id = str(getattr(trade, "exchange_order_id", "") or "")
+                quantity = Decimal(getattr(trade, "quantity", _ZERO))
+                price = Decimal(getattr(trade, "price", _ZERO))
+                if trade_order_id != exchange_order_id or not trade_id or quantity <= _ZERO or price <= _ZERO:
+                    return False
+                if (action_key, trade_id) not in self._seen_trades:
+                    missing.append((trade_id, quantity, price))
+        except Exception:
+            return False
+        if intent.filled_quantity + sum((quantity for _, quantity, _ in missing), _ZERO) != executed_quantity:
+            return False
+        # F004 requires a reconciliation fact after SUBMIT_UNKNOWN before any
+        # subsequent fill.  UNKNOWN records the prior zero/partial cumulative
+        # fact without claiming terminality; the following trade IDs establish
+        # the actual fills and may restore the ordinary hedge/rollback path.
+        self._append_reconciliation(intent, ReconciliationOutcome.UNKNOWN, exchange_order_id=exchange_order_id)
+        intent.submission_unknown = False
+        intent.acknowledged = True
+        if not any(
+            candidate.submission_unknown
+            for candidate in (self._maker_intent, *self._stock_intents.values(), *self._rollback_intents.values())
+            if candidate is not None
+        ):
+            self._submission_halted = False
+        for trade_id, quantity, price in missing:
+            self._record_authoritative_fill(
+                intent=intent,
+                exchange_order_id=exchange_order_id,
+                exchange_trade_id=trade_id,
+                price=price,
+                quantity=quantity,
+            )
+        return intent.filled_quantity == executed_quantity
+
     async def _reconcile_unknown_cancel(self) -> None:
         cancel = self._cancel_intent
         if cancel is None or not cancel.submission_unknown:
@@ -1510,7 +1580,17 @@ class LeveragedEtfPairExecutor(ExecutorBase):
         if executed_quantity != cancel.target.filled_quantity:
             self._transition_to_recovery_required("maker cancel status cumulative fill disagreed with durable trade facts")
             return
-        if status_name in {"CANCELED", "EXPIRED", "REJECTED", "FILLED"}:
+        if status_name == "FILLED":
+            # A filled maker order proves that the cancel request did not
+            # become a cancellation confirmation.  Do not write a misleading
+            # CANCEL_CONFIRMED fact; the additive F004 three-state contract
+            # will provide the authoritative terminal-resolution surface.
+            self._transition_to_recovery_required(
+                "maker cancellation reconciliation reported a filled maker order"
+            )
+            return
+        if status_name in {"CANCELED", "EXPIRED", "REJECTED"}:
+            self._bridge_late_fill_cancel_to_reconciliation()
             self._append_identity_event(
                 event_type=JournalEventType.RECONCILIATION,
                 payload=ReconciliationJournalPayloadV1(
@@ -1538,6 +1618,7 @@ class LeveragedEtfPairExecutor(ExecutorBase):
             cancel.last_sweep_signature = signature
             cancel.reconciliation_sweeps = 1
         if cancel.reconciliation_sweeps >= 2:
+            self._bridge_late_fill_cancel_to_reconciliation()
             self._append_identity_event(
                 event_type=JournalEventType.RECONCILIATION,
                 payload=ReconciliationJournalPayloadV1(
