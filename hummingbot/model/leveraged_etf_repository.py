@@ -38,6 +38,28 @@ _ANCHOR_PAIR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _ANCHOR_CYCLE_ID_PATTERN = re.compile(r"^xnys-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _ANCHOR_PAYLOAD_KIND_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_OPAQUE_ANCHOR_SECRET_FIELD_NAMES = frozenset(
+    {
+        "apikey",
+        "apikeys",
+        "credential",
+        "credentials",
+        "passphrase",
+        "passphrases",
+        "password",
+        "passwords",
+        "pem",
+        "pkcs8",
+        "privatekey",
+        "privatekeys",
+        "secret",
+        "secretkey",
+        "secretkeys",
+        "secrets",
+        "token",
+        "tokens",
+    }
+)
 _CURRENT_REDUCER_SEMANTICS_VERSION = 3
 _SUPPORTED_REDUCER_SEMANTICS_VERSIONS = frozenset({1, 2, 3})
 _TERMINAL_EXECUTOR_STATES = frozenset(
@@ -834,6 +856,34 @@ def _validate_checkpoint_payload_revision(kind: str, value: Any) -> None:
         raise ValueError("opaque anchor checkpoint payload revision must be an exact built-in integer")
 
 
+def _normalized_opaque_anchor_field_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def _reject_opaque_anchor_secret_bearing_fields(value: Any) -> None:
+    pending = [value]
+    visited_containers: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if isinstance(candidate, Mapping):
+            if id(candidate) in visited_containers:
+                continue
+            visited_containers.add(id(candidate))
+            for key, nested_value in candidate.items():
+                normalized_key = _normalized_opaque_anchor_field_name(key)
+                if any(
+                    normalized_key.endswith(secret_name)
+                    for secret_name in _OPAQUE_ANCHOR_SECRET_FIELD_NAMES
+                ):
+                    raise ValueError(f"secret-bearing field is not permitted in opaque anchor payload: {key}")
+                pending.append(nested_value)
+        elif isinstance(candidate, (list, tuple)):
+            if id(candidate) in visited_containers:
+                continue
+            visited_containers.add(id(candidate))
+            pending.extend(candidate)
+
+
 def _validate_canonical_anchor_payload_v2(
     *,
     schema_version: int,
@@ -862,6 +912,7 @@ def _validate_canonical_anchor_payload_v2(
     value = _verify_canonical_json(payload_json, payload_hash, f"{kind} payload")
     if not isinstance(value, Mapping):
         raise ValueError("opaque anchor payload must be a JSON object")
+    _reject_opaque_anchor_secret_bearing_fields(value)
     _validate_checkpoint_payload_revision(kind, value)
     declared_version = value.get(contract_version_field)
     if type(declared_version) is not int or declared_version != contract_version:

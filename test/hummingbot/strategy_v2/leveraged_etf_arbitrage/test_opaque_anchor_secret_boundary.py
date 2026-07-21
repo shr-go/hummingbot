@@ -11,6 +11,7 @@ from hummingbot.model.leveraged_etf_repository import (
     AnchorIntegrityError,
     CanonicalOpaqueAnchorPayloadV2,
     PairScopedAnchorRepository,
+    _reject_opaque_anchor_secret_bearing_fields,
 )
 
 from .test_journal_repository import (
@@ -127,15 +128,20 @@ def test_t007_normalized_secret_key_vocabulary_is_rejected():
     _, checkpoint = _surface("checkpoint")
     secret_keys = (
         "exchangeApiKey",
+        "exchange_api_keys",
         "credential",
         "user_credentials",
         "access-token",
         "refreshTokens",
         "client_secret",
+        "signing_secret_keys",
         "sharedSecrets",
         "db.password",
+        "backup_passwords",
         "walletPassphrase",
+        "wallet_passphrases",
         "signing-private-key",
+        "signing_private_keys",
         "private_key_pem",
         "pkcs8",
     )
@@ -148,6 +154,22 @@ def test_t007_normalized_secret_key_vocabulary_is_rejected():
                 contract_version=checkpoint.payload.contract_version,
                 value=_secret_value(checkpoint, secret_key, nested=True),
             )
+
+
+def test_t007_secret_key_walk_is_cycle_safe():
+    value = {"provider_state": {}}
+    value["provider_state"]["self"] = value
+
+    _reject_opaque_anchor_secret_bearing_fields(value)
+
+
+def test_t007_secret_key_walk_rejects_secret_on_a_cycle_sibling():
+    value = {"provider_state": {}}
+    value["provider_state"]["self"] = value
+    value["provider_state"]["nested"] = {"API.Keys": "must-not-persist"}
+
+    with pytest.raises(ValueError, match="secret"):
+        _reject_opaque_anchor_secret_bearing_fields(value)
 
 
 @pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
@@ -247,20 +269,31 @@ def _inject_hash_valid_secret(db_path: Path, surface: str, pair_id: str, cycle_i
     with sqlite3.connect(db_path) as connection:
         if trigger_name is not None:
             connection.execute(f'DROP TRIGGER "{trigger_name}"')
-        payload_json = connection.execute(
-            f'SELECT payload_json FROM "{table_name}" WHERE pair_id = ? AND cycle_id = ?',
+        select_fields = (
+            "payload_json, evidence_hash, observed_at_utc"
+            if surface == "observation"
+            else "payload_json, evidence_hash, NULL"
+        )
+        row = connection.execute(
+            f'SELECT {select_fields} FROM "{table_name}" WHERE pair_id = ? AND cycle_id = ?',
             (pair_id, cycle_id),
-        ).fetchone()[0]
+        ).fetchone()
+        payload_json = row[0]
         value = json.loads(payload_json)
         value["provider_state"] = {"nested": [{"legacy-private-key": "must-fail-closed"}]}
         rewritten_json, rewritten_hash = _canonical_json_hash(value)
+        identity_sql = "pair_id = ? AND cycle_id = ?"
+        identity_parameters = [pair_id, cycle_id]
+        if surface == "observation":
+            identity_sql += " AND evidence_hash = ? AND observed_at_utc = ?"
+            identity_parameters.extend((row[1], row[2]))
         connection.execute(
             f'UPDATE "{table_name}" SET payload_json = ?, payload_hash = ? '
-            "WHERE pair_id = ? AND cycle_id = ?",
-            (rewritten_json, rewritten_hash, pair_id, cycle_id),
+            f"WHERE {identity_sql}",
+            (rewritten_json, rewritten_hash, *identity_parameters),
         )
         if trigger_name is not None:
-            connection.executescript(SQLITE_GUARD_DDL[trigger_name])
+            connection.execute(SQLITE_GUARD_DDL[trigger_name])
 
 
 @pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
