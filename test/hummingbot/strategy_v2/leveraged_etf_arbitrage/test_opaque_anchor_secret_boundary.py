@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,9 @@ from hummingbot.model.leveraged_etf_persistence import SQLITE_GUARD_DDL
 from hummingbot.model.leveraged_etf_repository import (
     AnchorIntegrityError,
     CanonicalOpaqueAnchorPayloadV2,
+    OpaqueAnchorCheckpointV2,
+    OpaqueAnchorFinalizedV2,
+    OpaqueAnchorRevisionObservationV2,
     PairScopedAnchorRepository,
     _reject_opaque_anchor_secret_bearing_fields,
 )
@@ -677,5 +681,347 @@ def test_t008_hash_valid_legacy_secret_reopen_error_is_redacted(tmp_path: Path, 
             operation = lambda: repository.load_opaque(key)
         error = _t008_capture_secret_rejection(operation)
         _t008_assert_secret_safe(error, payload_json)
+    finally:
+        reopened.engine.dispose()
+
+
+_T009_INNER_API_KEY_FIELD = "T009-INNER-API-KEY-FIELD-C742-api_key"
+_T009_INNER_API_KEY_VALUE = "T009-INNER-API-KEY-VALUE-148A3"
+_T009_INNER_PKCS8_FIELD = "T009-INNER-PKCS8-FIELD-21D9-private_key_pem"
+_T009_INNER_PKCS8_MARKER = "T009-INNER-PKCS8-VALUE-71B2E"
+_T009_INNER_PKCS8_VALUE = (
+    "-----BEGIN PRIVATE KEY-----\n"
+    f"{_T009_INNER_PKCS8_MARKER}\n"
+    "-----END PRIVATE KEY-----"
+)
+_T009_OUTER_API_KEY_FIELD = "T009-OUTER-API-KEY-FIELD-A196-api_key"
+_T009_OUTER_API_KEY_VALUE = "T009-OUTER-API-KEY-VALUE-E8F43"
+_T009_OUTER_PKCS8_FIELD = "T009-OUTER-PKCS8-FIELD-D04A-private_key_pem"
+_T009_OUTER_PKCS8_MARKER = "T009-OUTER-PKCS8-VALUE-F591C"
+_T009_OUTER_PKCS8_VALUE = (
+    "-----BEGIN PRIVATE KEY-----\n"
+    f"{_T009_OUTER_PKCS8_MARKER}\n"
+    "-----END PRIVATE KEY-----"
+)
+_T009_SECRET_SENTINELS = (
+    _T009_INNER_API_KEY_FIELD,
+    _T009_INNER_API_KEY_VALUE,
+    _T009_INNER_PKCS8_FIELD,
+    _T009_INNER_PKCS8_MARKER,
+    _T009_INNER_PKCS8_VALUE,
+    _T009_OUTER_API_KEY_FIELD,
+    _T009_OUTER_API_KEY_VALUE,
+    _T009_OUTER_PKCS8_FIELD,
+    _T009_OUTER_PKCS8_MARKER,
+    _T009_OUTER_PKCS8_VALUE,
+    "-----BEGIN PRIVATE KEY-----",
+    "-----END PRIVATE KEY-----",
+)
+
+
+def _t009_malformed_inner_value(value: dict) -> tuple[str, str]:
+    value["provider_state"] = {
+        "history": [
+            {
+                _T009_INNER_API_KEY_FIELD: _T009_INNER_API_KEY_VALUE,
+                _T009_INNER_PKCS8_FIELD: _T009_INNER_PKCS8_VALUE,
+            }
+        ]
+    }
+    payload_json = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )[:-1]
+    return payload_json, hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _t009_malformed_inner(envelope) -> tuple[str, str]:
+    return _t009_malformed_inner_value(envelope.payload.value())
+
+
+def _t009_forged_payload(envelope) -> CanonicalOpaqueAnchorPayloadV2:
+    payload_json, payload_hash = _t009_malformed_inner(envelope)
+    return CanonicalOpaqueAnchorPayloadV2.model_construct(
+        schema_version=2,
+        kind=envelope.payload.kind,
+        contract_version_field=envelope.payload.contract_version_field,
+        contract_version=envelope.payload.contract_version,
+        payload_json=payload_json,
+        payload_hash=payload_hash,
+    )
+
+
+def _t009_forged_envelope(surface: str):
+    key, envelope = _surface(surface)
+    return key, envelope.model_copy(update={"payload": _t009_forged_payload(envelope)})
+
+
+def _t009_malformed_outer(model: object) -> str:
+    value = model.model_dump(mode="json", round_trip=True, warnings="error")
+    value[_T009_OUTER_API_KEY_FIELD] = _T009_OUTER_API_KEY_VALUE
+    value[_T009_OUTER_PKCS8_FIELD] = _T009_OUTER_PKCS8_VALUE
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )[:-1]
+
+
+def _t009_capture_parser_rejection(operation, expected_type: type[BaseException]) -> BaseException:
+    try:
+        operation()
+    except expected_type as error:
+        assert any(token in str(error).lower() for token in ("json", "malformed", "integrity"))
+        return error
+    pytest.fail("malformed opaque anchor JSON was accepted")
+
+
+def _t009_assert_parser_error_safe(error: BaseException, *raw_documents: str) -> None:
+    forbidden = list(_T009_SECRET_SENTINELS)
+    for document in raw_documents:
+        forbidden.extend(
+            (
+                document,
+                repr(document),
+                json.dumps(document, ensure_ascii=False),
+            )
+        )
+
+    pending = [error]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        renderings = []
+        if isinstance(candidate, BaseException):
+            if isinstance(candidate, json.JSONDecodeError):
+                pytest.fail("opaque anchor error chain retained a JSON decoder exception")
+            renderings.extend(
+                (
+                    str(candidate),
+                    repr(candidate),
+                    repr(candidate.args),
+                    json.dumps(candidate.args, default=repr, ensure_ascii=False),
+                )
+            )
+            document = getattr(candidate, "doc", None)
+            if document is not None:
+                renderings.extend((str(document), repr(document)))
+            pending.extend(candidate.args)
+            pending.extend((candidate.__cause__, candidate.__context__))
+            if isinstance(candidate, ValidationError):
+                structured = candidate.errors(
+                    include_url=True,
+                    include_context=True,
+                    include_input=True,
+                )
+                renderings.extend(
+                    (
+                        repr(structured),
+                        json.dumps(structured, default=repr, ensure_ascii=False),
+                        candidate.json(
+                            include_url=True,
+                            include_context=True,
+                            include_input=True,
+                        ),
+                    )
+                )
+                pending.append(structured)
+        elif isinstance(candidate, dict):
+            pending.extend(candidate.keys())
+            pending.extend(candidate.values())
+        elif isinstance(candidate, (list, tuple, set)):
+            pending.extend(candidate)
+        else:
+            renderings.extend((str(candidate), repr(candidate)))
+        if any(secret in rendering for secret in forbidden for rendering in renderings):
+            pytest.fail("opaque anchor parser error surface exposed a T009 secret sentinel")
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "from_canonical_json", "value"))
+def test_t009_malformed_inner_payload_errors_are_redacted(entry_point: str):
+    _, checkpoint = _surface("checkpoint")
+    payload_json, payload_hash = _t009_malformed_inner(checkpoint)
+    payload_kwargs = {
+        "kind": checkpoint.payload.kind,
+        "contract_version_field": checkpoint.payload.contract_version_field,
+        "contract_version": checkpoint.payload.contract_version,
+        "payload_json": payload_json,
+        "payload_hash": payload_hash,
+    }
+    if entry_point == "constructor":
+        operation = lambda: CanonicalOpaqueAnchorPayloadV2(schema_version=2, **payload_kwargs)
+        expected_type = ValidationError
+    elif entry_point == "from_canonical_json":
+        operation = lambda: CanonicalOpaqueAnchorPayloadV2.from_canonical_json(**payload_kwargs)
+        expected_type = ValidationError
+    else:
+        forged = CanonicalOpaqueAnchorPayloadV2.model_construct(schema_version=2, **payload_kwargs)
+        operation = forged.value
+        expected_type = ValueError
+
+    error = _t009_capture_parser_rejection(operation, expected_type)
+
+    _t009_assert_parser_error_safe(error, payload_json)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    (
+        CanonicalOpaqueAnchorPayloadV2,
+        OpaqueAnchorCheckpointV2,
+        OpaqueAnchorFinalizedV2,
+        OpaqueAnchorRevisionObservationV2,
+    ),
+)
+def test_t009_malformed_outer_model_json_errors_are_redacted(model_type):
+    model_by_type = {
+        CanonicalOpaqueAnchorPayloadV2: _surface("checkpoint")[1].payload,
+        OpaqueAnchorCheckpointV2: _surface("checkpoint")[1],
+        OpaqueAnchorFinalizedV2: _surface("finalized")[1],
+        OpaqueAnchorRevisionObservationV2: _surface("observation")[1],
+    }
+    payload_json = _t009_malformed_outer(model_by_type[model_type])
+
+    error = _t009_capture_parser_rejection(
+        lambda: model_type.model_validate_json(payload_json),
+        ValidationError,
+    )
+
+    _t009_assert_parser_error_safe(error, payload_json)
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_t009_malformed_inner_envelope_revalidation_errors_are_redacted(surface: str):
+    _, envelope = _t009_forged_envelope(surface)
+
+    error = _t009_capture_parser_rejection(
+        lambda: PairScopedAnchorRepository._revalidate_opaque_write_envelope(
+            envelope,
+            type(envelope),
+            surface,
+        ),
+        AnchorIntegrityError,
+    )
+
+    _t009_assert_parser_error_safe(error, envelope.payload.payload_json)
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_t009_malformed_inner_write_errors_are_redacted_and_preserve_storage(
+    tmp_path: Path,
+    surface: str,
+):
+    manager = _open_manager(tmp_path / f"redacted-parser-write-{surface}.sqlite")
+    try:
+        repository = PairScopedAnchorRepository(manager)
+        key, checkpoint = _surface("checkpoint")
+        if surface == "checkpoint":
+            _, candidate = _t009_forged_envelope(surface)
+            operation = lambda: repository.compare_and_set_opaque_checkpoint(
+                key,
+                candidate,
+                expected_revision=0,
+            )
+            expected_state = None
+        else:
+            repository.compare_and_set_opaque_checkpoint(key, checkpoint, expected_revision=0)
+            _, finalized = _surface("finalized")
+            if surface == "finalized":
+                candidate = finalized.model_copy(update={"payload": _t009_forged_payload(finalized)})
+                operation = lambda: repository.finalize_opaque_if_absent(
+                    key,
+                    candidate,
+                    expected_revision=1,
+                )
+                expected_state = checkpoint
+            else:
+                repository.finalize_opaque_if_absent(key, finalized, expected_revision=1)
+                _, candidate = _t009_forged_envelope(surface)
+                operation = lambda: repository.append_opaque_revision_observation(key, candidate)
+                expected_state = finalized
+
+        error = _t009_capture_parser_rejection(operation, AnchorIntegrityError)
+
+        _t009_assert_parser_error_safe(error, candidate.payload.payload_json)
+        assert repository.load_opaque(key) == expected_state
+        assert _row_count(manager, "LeveragedEtfAnchorState") == (0 if expected_state is None else 1)
+        assert _row_count(manager, "LeveragedEtfAnchorRevisionObservation") == 0
+        assert repository.opaque_revision_observations(key) == ()
+    finally:
+        manager.engine.dispose()
+
+
+def _t009_inject_hash_valid_malformed_json(
+    db_path: Path,
+    surface: str,
+    pair_id: str,
+    cycle_id: str,
+) -> str:
+    table_name = (
+        "LeveragedEtfAnchorRevisionObservation"
+        if surface == "observation"
+        else "LeveragedEtfAnchorState"
+    )
+    trigger_name = {
+        "checkpoint": None,
+        "finalized": "lepf_anchor_finalized_no_update",
+        "observation": "lepf_anchor_observation_no_update",
+    }[surface]
+    with sqlite3.connect(db_path) as connection:
+        if trigger_name is not None:
+            connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        select_fields = (
+            "payload_json, evidence_hash, observed_at_utc"
+            if surface == "observation"
+            else "payload_json, evidence_hash, NULL"
+        )
+        row = connection.execute(
+            f'SELECT {select_fields} FROM "{table_name}" WHERE pair_id = ? AND cycle_id = ?',
+            (pair_id, cycle_id),
+        ).fetchone()
+        payload_json, payload_hash = _t009_malformed_inner_value(json.loads(row[0]))
+        identity_sql = "pair_id = ? AND cycle_id = ?"
+        identity_parameters = [pair_id, cycle_id]
+        if surface == "observation":
+            identity_sql += " AND evidence_hash = ? AND observed_at_utc = ?"
+            identity_parameters.extend((row[1], row[2]))
+        connection.execute(
+            f'UPDATE "{table_name}" SET payload_json = ?, payload_hash = ? '
+            f"WHERE {identity_sql}",
+            (payload_json, payload_hash, *identity_parameters),
+        )
+        if trigger_name is not None:
+            connection.execute(SQLITE_GUARD_DDL[trigger_name])
+    return payload_json
+
+
+@pytest.mark.parametrize("surface", ("checkpoint", "finalized", "observation"))
+def test_t009_hash_valid_malformed_legacy_reopen_errors_are_redacted(tmp_path: Path, surface: str):
+    db_path = tmp_path / f"redacted-legacy-parser-{surface}.sqlite"
+    key = _seed_anchor_surface(db_path, surface)
+    payload_json = _t009_inject_hash_valid_malformed_json(
+        db_path,
+        surface,
+        key.pair_id,
+        key.cycle_id,
+    )
+
+    reopened = _open_manager(db_path)
+    try:
+        repository = PairScopedAnchorRepository(reopened)
+        if surface == "observation":
+            operation = lambda: repository.opaque_revision_observations(key)
+        else:
+            operation = lambda: repository.load_opaque(key)
+        error = _t009_capture_parser_rejection(operation, AnchorIntegrityError)
+        _t009_assert_parser_error_safe(error, payload_json)
     finally:
         reopened.engine.dispose()
